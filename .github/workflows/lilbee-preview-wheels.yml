@@ -1,0 +1,146 @@
+name: Lilbee Preview Wheels
+
+# Manual-only build of Python wheels for a local preview release. Stamps the
+# wheel version with a build-metadata suffix (PEP 440 local version segment)
+# so it never collides with a real PyPI release, builds the same platforms
+# and cibuildwheel settings as `publish.yaml`'s `python-wheels` job, and
+# attaches every wheel to a GitHub pre-release on this fork. No sdist, no
+# PyPI or other registry publish step.
+#
+# Dispatch this workflow from whatever ref should be built (branch or tag);
+# the checkout steps use that ref by default, so a later rebuild from a
+# newer commit needs only a different dispatch ref and `local_version`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      local_version:
+        description: >
+          Local version suffix to append after '+', e.g. lilbee.56d9989.
+          The wheel version becomes <pyproject version>+<local_version>.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  python-wheels:
+    name: Build Python wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same matrix as publish.yaml's python-wheels job: macos-latest is
+        # arm64, macos-15-intel is macOS x86_64, ubuntu-24.04-arm is Linux
+        # aarch64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # pyproject.toml's [project] version is not listed under `dynamic`, so
+      # it is what maturin writes into the wheel's METADATA; Cargo.toml's
+      # version is unrelated to the Python package version and is left
+      # alone. Proven locally: stamping only this file and leaving
+      # Cargo.toml at 1.8.0 produced a wheel named
+      # crawlberg-1.8.0+lilbee.56d9989-... whose METADATA read
+      # "Version: 1.8.0+lilbee.56d9989".
+      - name: Stamp the wheel version
+        shell: bash
+        env:
+          LOCAL_VERSION: ${{ inputs.local_version }}
+        run: |
+          set -euo pipefail
+          FILE="packages/python/pyproject.toml"
+          if [[ -z "${LOCAL_VERSION}" ]]; then
+            echo "::error::local_version input is empty" >&2
+            exit 1
+          fi
+          # A letters/digits/periods charset is both a valid PEP 440 local
+          # version label and safe to splice into the sed command below: it
+          # cannot contain '/' (breaks the delimiter) or '&' (sed replaces it
+          # with the whole match, silently corrupting the stamped version).
+          if [[ ! "${LOCAL_VERSION}" =~ ^[A-Za-z0-9.]+$ ]]; then
+            echo "::error::local_version must match ^[A-Za-z0-9.]+\$, got: ${LOCAL_VERSION}" >&2
+            exit 1
+          fi
+          MATCHES="$(grep -c '^version = "' "$FILE")"
+          if [[ "$MATCHES" != "1" ]]; then
+            echo "::error::expected exactly one top-level 'version = \"...\"' line in $FILE, found $MATCHES" >&2
+            exit 1
+          fi
+          BASE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$FILE")"
+          STAMPED="${BASE_VERSION}+${LOCAL_VERSION}"
+          sed -i.bak "s/^version = \"${BASE_VERSION}\"\$/version = \"${STAMPED}\"/" "$FILE"
+          rm -f "${FILE}.bak"
+          echo "Stamped ${FILE}: ${BASE_VERSION} -> ${STAMPED}"
+          grep '^version = "' "$FILE"
+
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: xberg-io/actions/free-disk-space-linux@v1
+
+      # Same action, same cibuildwheel settings and features as publish.yaml's
+      # python-wheels job (cp310-* / abi3, no artifact upload from inside the
+      # action so this job controls the artifact name below).
+      - name: Build wheels
+        uses: xberg-io/actions/build-python-wheels@v1
+        with:
+          python-version: "3.13"
+          package-dir: packages/python
+          cibw-build: "cp310-*"
+          upload-artifact: "false"
+          cibw-environment-macos: 'MATURIN_BUILD_ARGS="" CARGO_BUILD_LOCKED=true MACOSX_DEPLOYMENT_TARGET=11.0'
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          retention-days: 14
+
+  release:
+    name: Create preview pre-release
+    needs: python-wheels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute release tag
+        id: tag
+        shell: bash
+        env:
+          LOCAL_VERSION: ${{ inputs.local_version }}
+        run: |
+          set -euo pipefail
+          FILE="packages/python/pyproject.toml"
+          BASE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$FILE" | head -n1)"
+          if [[ -z "${BASE_VERSION}" ]]; then
+            echo "::error::could not read version from $FILE" >&2
+            exit 1
+          fi
+          TAG="v${BASE_VERSION}+${LOCAL_VERSION}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG}"
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: wheelhouse
+          pattern: python-wheels-*
+          merge-multiple: true
+
+      - name: Create pre-release with wheels
+        uses: xberg-io/actions/publish-github-release@v1
+        with:
+          tag: ${{ steps.tag.outputs.tag }}
+          title: ${{ steps.tag.outputs.tag }}
+          artifacts: wheelhouse/*.whl
+          draft: "false"
+          prerelease: "true"
+          target: ${{ github.sha }}
