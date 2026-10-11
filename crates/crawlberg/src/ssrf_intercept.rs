@@ -423,8 +423,9 @@ struct Registry {
     /// popups it opened. A target of an ended watch stays until Chrome destroys it, its
     /// requests refused, and interception stays on until then.
     targets: Vec<(TargetId, Arc<WatchedPage>)>,
-    /// ~keep Tabs contain pages and iframes belong to pages; closing either independently
-    /// ~keep can destroy a parked root. Keep their policy ownership without popup teardown.
+    /// ~keep An iframe target belongs to its page; closing it independently can destroy a
+    /// ~keep parked root. Keep its policy ownership without popup teardown. A tab is not here:
+    /// ~keep nothing is recorded for a tab.
     structural_targets: HashSet<TargetId>,
     /// Every live target no watched page owns: another client's page on an external browser,
     /// or a browser's own tab.
@@ -674,7 +675,7 @@ impl Registry {
             .retain(|(target, _)| self.context_targets.get(target) != Some(context));
         self.frames
             .retain(|_, frame| self.context_targets.get(&frame.source) != Some(context));
-        // ~keep No destroy event reaches the listener for a tab, so its entry ends with its context.
+        // ~keep An iframe target of the context ends with it, as the targets above do.
         self.structural_targets
             .retain(|target| self.context_targets.get(target) != Some(context));
         for (target, ownership) in &mut self.ownership {
@@ -2421,20 +2422,15 @@ where
                     return false;
                 }
                 if attached.target_info.r#type == "tab" {
-                    let _ = adopt_target(shared, &attached.target_info);
-                    let authorized = {
-                        let registry = lock(&shared.registry);
-                        child_policy_boundary_exists(&registry, &attached.target_info.target_id)
-                            || matches!(
-                                registry.ownership.get(&attached.target_info.target_id),
-                                Some(TargetOwnership::Other)
-                            )
-                    };
+                    // ~keep A tab is never recorded as a target: it holds no document and sends no
+                    // ~keep request, and `Target.closeTarget` on it closes its page, so a park that
+                    // ~keep owned the tab closed the page it was keeping. The tab resumes when a
+                    // ~keep child of it passes the policy boundary, which authorizes it then.
                     let structural = StructuralTarget {
                         target: attached.target_info.target_id,
                         session: attached.session_id.clone(),
                         waiting_for_debugger: attached.waiting_for_debugger,
-                        authorized,
+                        authorized: false,
                         arm_acknowledged: false,
                         child_boundary_acknowledged: false,
                         deadline: tokio::time::Instant::now() + command_timeout,
@@ -2976,9 +2972,16 @@ fn install_watch(registry: &mut Registry, page: &Arc<WatchedPage>) -> Result<(),
 /// ~keep A popup opened from inside that frame names the page's target as its opener and the
 /// ~keep frame only as `openerFrameId` (measured on Chrome 154), so the opener is found among
 /// ~keep the targets as before.
+///
+/// ~keep A browser's own `tab` target is refused: it holds no document and sends no request, and
+/// ~keep `Target.closeTarget` on it closes its page. Nothing is stored for it and it is never
+/// ~keep returned for closing.
 fn adopt_target(shared: &Shared, info: &TargetInfo) -> Option<TargetId> {
+    if info.r#type == "tab" {
+        return None;
+    }
     let mut registry = lock(&shared.registry);
-    if matches!(info.r#type.as_str(), "tab" | "iframe") {
+    if info.r#type == "iframe" {
         registry.structural_targets.insert(info.target_id.clone());
     }
     let (lineage_owner, frame_owner) = match (&info.opener_id, &info.parent_frame_id) {
@@ -3050,7 +3053,7 @@ fn adopt_target(shared: &Shared, info: &TargetInfo) -> Option<TargetId> {
     }
     let ending = owner.ending.load(Ordering::Acquire);
     registry.register_watched(info.target_id.clone(), owner);
-    (ending && !registry.structural_targets.contains(&info.target_id)).then(|| info.target_id.clone())
+    ending.then(|| info.target_id.clone())
 }
 
 /// A main-frame commit of a watched page: the page and the navigation event.
@@ -4598,6 +4601,15 @@ mod tests {
             .await
             .expect("stop child controller");
         assert!(controller.await.expect("child controller task"));
+        let registry = lock(&shared.registry);
+        assert!(
+            !registry.ownership.contains_key(&TargetId::new("TAB")),
+            "the tab must not be recorded as a target: a park closes every target its page owns"
+        );
+        assert!(
+            registry.targets.iter().all(|(id, _)| id.inner() != "TAB"),
+            "the tab must not be a target that the park of its page closes"
+        );
     }
 
     #[tokio::test]
@@ -4620,6 +4632,41 @@ mod tests {
                 .expect("child controller task"),
             "a structural target without an authoritative child boundary must fail closed"
         );
+    }
+
+    /// A tab is refused by the record of targets: nothing is stored for it, in a context of a
+    /// watched page, in a retired context and in a context of another client.
+    #[test]
+    fn a_tab_is_not_adopted_as_a_target() {
+        let page = watched("ROOT");
+        let shared = shared_with(&page, "OTHER");
+        let context = register_owned_context(&shared, &page);
+        let foreign = BrowserContextId::new("FOREIGN-CONTEXT");
+        let retired = BrowserContextId::new("RETIRED-CONTEXT");
+        lock(&shared.registry).retired_contexts.push_back(retired.clone());
+
+        for (id, context) in [("TAB", &context), ("FOREIGN-TAB", &foreign), ("RETIRED-TAB", &retired)] {
+            let event = in_context(target_created(id, "tab", None, None, None), context);
+            assert_eq!(
+                adopt_target(&shared, &event.target_info),
+                None,
+                "{id}: a tab is never a target to close"
+            );
+            let registry = lock(&shared.registry);
+            let target = TargetId::new(id);
+            assert!(
+                !registry.ownership.contains_key(&target),
+                "{id}: a tab must not be recorded as a target"
+            );
+            assert!(
+                !registry.context_targets.contains_key(&target),
+                "{id}: a tab must not be recorded in its context"
+            );
+            assert!(
+                registry.targets.iter().all(|(owned, _)| *owned != target),
+                "{id}: a tab must not be a target that the park of its page closes"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5244,12 +5291,19 @@ mod tests {
         }
         let mut registry = lock(&shared.registry);
         install_watch(&mut registry, &page).expect("install context policy");
-        for id in ["TAB", "FRAME", "POPUP"] {
+        for id in ["FRAME", "POPUP"] {
             let target = TargetId::new(id);
             assert!(Arc::ptr_eq(&registry.owner_of_target(id).expect("policy owner"), &page));
             assert_eq!(registry.context_targets.get(&target), Some(&context));
             assert!(registry.target_generations.contains_key(&target));
         }
+        let tab = TargetId::new("TAB");
+        assert!(registry.owner_of_target("TAB").is_none(), "a tab has no policy owner");
+        assert!(!registry.ownership.contains_key(&tab), "a tab must not be recorded");
+        assert!(!registry.context_targets.contains_key(&tab));
+        assert!(!registry.target_generations.contains_key(&tab));
+        assert!(!registry.structural_targets.contains(&tab));
+        assert!(registry.structural_targets.contains(&TargetId::new("FRAME")));
         let mut closed_targets = registry
             .targets
             .iter()
@@ -5257,12 +5311,13 @@ mod tests {
             .collect::<Vec<_>>();
         closed_targets.sort_unstable();
         assert_eq!(closed_targets, ["POPUP", "ROOT"]);
-        registry.remove_target(&TargetId::new("TAB"));
-        assert!(!registry.structural_targets.contains(&TargetId::new("TAB")));
+        registry.remove_target(&TargetId::new("FRAME"));
+        assert!(!registry.structural_targets.contains(&TargetId::new("FRAME")));
     }
 
     /// The listener closes what `reconcile_created` returns. A tab of an ending watch holds the
-    /// parked root, so it is never returned; a popup of the same watch is.
+    /// parked root, so it is never returned and nothing is recorded for it; a popup of the same
+    /// watch is returned.
     #[test]
     fn a_tab_of_an_ending_watch_is_not_returned_for_closing() {
         let page = watched("ROOT");
@@ -5278,25 +5333,29 @@ mod tests {
             Some(TargetId::new("POPUP"))
         );
         let registry = lock(&shared.registry);
-        assert!(Arc::ptr_eq(
-            &registry.owner_of_target("TAB").expect("policy owner"),
-            &page
-        ));
+        assert!(
+            !registry.ownership.contains_key(&TargetId::new("TAB")),
+            "a tab of an ending watch must not be recorded"
+        );
         assert!(!owned(&registry).contains(&"TAB"));
     }
 
-    /// The listener gets no destroy event for a tab. The end of its browser context removes it
-    /// from the structural targets; its ownership stays quarantined, as for every retired target.
+    /// Nothing is recorded for a tab, so the end of its browser context leaves no entry for it.
+    /// An iframe target of the same context leaves the structural targets; its ownership stays
+    /// quarantined, as for every retired target.
     #[test]
-    fn a_retired_context_takes_its_structural_tab_with_it() {
+    fn a_retired_context_leaves_no_structural_entry_for_its_tab_or_frame() {
         let page = watched("ROOT");
         let shared = shared_with(&page, "OTHER");
         let context = register_owned_context(&shared, &page);
         let tab = in_context(target_created("TAB", "tab", None, None, None), &context);
+        let frame = in_context(target_created("FRAME", "iframe", None, None, None), &context);
         assert_eq!(adopt_target(&shared, &tab.target_info), None);
+        assert_eq!(adopt_target(&shared, &frame.target_info), None);
 
         let mut registry = lock(&shared.registry);
-        assert!(registry.structural_targets.contains(&TargetId::new("TAB")));
+        assert!(!registry.structural_targets.contains(&TargetId::new("TAB")));
+        assert!(registry.structural_targets.contains(&TargetId::new("FRAME")));
         registry
             .contexts
             .get_mut(&context)
@@ -5304,13 +5363,18 @@ mod tests {
             .disposal_acknowledged = true;
         assert!(registry.retire_context(&context));
         assert!(
-            !registry.structural_targets.contains(&TargetId::new("TAB")),
-            "a tab of a retired context must leave the structural targets"
+            !registry.structural_targets.contains(&TargetId::new("FRAME")),
+            "an iframe target of a retired context must leave the structural targets"
         );
         assert!(matches!(
-            registry.ownership.get(&TargetId::new("TAB")),
+            registry.ownership.get(&TargetId::new("FRAME")),
             Some(TargetOwnership::Quarantined)
         ));
+        assert!(!registry.structural_targets.contains(&TargetId::new("TAB")));
+        assert!(
+            !registry.ownership.contains_key(&TargetId::new("TAB")),
+            "a retired context must leave no entry for its tab"
+        );
     }
 
     #[test]
