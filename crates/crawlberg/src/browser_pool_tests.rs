@@ -3512,6 +3512,105 @@ async fn kill_browser_releases_a_browser_it_cannot_kill_and_removes_the_profile(
     assert!(removed, "the profile must be removed after the fallback release");
 }
 
+/// The profile check of a Chrome on the private pipe confirms the directory that Chrome opened.
+/// It refuses another directory and stops the Chrome that it refuses.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn the_profile_check_of_a_pipe_launch_refuses_a_directory_chrome_did_not_open() {
+    const TEST_NAME: &str = "the_profile_check_of_a_pipe_launch_refuses_a_directory_chrome_did_not_open";
+    let user_data_dir = std::env::temp_dir().join(format!("crawlberg-pipe-profile-check-{}", std::process::id()));
+    let other_dir = std::env::temp_dir().join(format!("crawlberg-pipe-profile-other-{}", std::process::id()));
+    let pool_config = BrowserPoolConfig {
+        private_pipe: true,
+        ..BrowserPoolConfig::default()
+    };
+    let launched = match build_pool_launch_builder(&user_data_dir, &pool_config)
+        .expect("the pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut browser, handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    let handler_task = spawn_handler(handler);
+    std::fs::create_dir_all(&other_dir).expect("the other directory must be created");
+
+    let transport = browser.websocket_address().clone();
+    let confirmed = confirm_profile_in_use(&mut browser, &user_data_dir).await;
+    let refused = confirm_profile_in_use(&mut browser, &other_dir).await;
+    let stopped = matches!(browser.try_wait(), Ok(Some(_)));
+
+    let _ = browser.kill().await;
+    handler_task.abort();
+    let _ = std::fs::remove_dir_all(&user_data_dir);
+    let _ = std::fs::remove_dir_all(&other_dir);
+
+    assert_eq!(
+        transport, "pipe",
+        "a pool with the key on must launch on the private pipe"
+    );
+    confirmed.expect("the check must confirm the directory that Chrome opened");
+    let refusal = refused
+        .expect_err("the check must refuse a directory that Chrome did not open")
+        .to_string();
+    assert!(refusal.contains("a different profile"), "{refusal}");
+    assert!(stopped, "the Chrome that the check refuses must be stopped");
+}
+
+/// The handler of a Chrome on the private pipe ends when that Chrome is killed, and it records
+/// that the pipe closed. A page request reads that cause for its error.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn the_handler_of_a_killed_pipe_chrome_ends_with_the_cause_that_the_pipe_closed() {
+    const TEST_NAME: &str = "the_handler_of_a_killed_pipe_chrome_ends_with_the_cause_that_the_pipe_closed";
+    let user_data_dir = std::env::temp_dir().join(format!("crawlberg-pipe-handler-end-{}", std::process::id()));
+    let pool_config = BrowserPoolConfig {
+        private_pipe: true,
+        ..BrowserPoolConfig::default()
+    };
+    let launched = match build_pool_launch_builder(&user_data_dir, &pool_config)
+        .expect("the pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut browser, handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    let transport = browser.websocket_address().clone();
+    let (handler_task, handler_end) = spawn_watched_handler(handler);
+
+    let _ = browser.kill().await;
+    let ended = tokio::time::timeout(Duration::from_secs(15), handler_task)
+        .await
+        .is_ok();
+    let cause = handler_end.cause().map(str::to_owned);
+    let _ = std::fs::remove_dir_all(&user_data_dir);
+
+    assert_eq!(
+        transport, "pipe",
+        "a pool with the key on must launch on the private pipe"
+    );
+    assert!(ended, "the handler of a killed Chrome must end within 15 s");
+    assert!(
+        cause
+            .as_deref()
+            .is_some_and(|cause| cause.contains("CDP pipe connection closed")),
+        "the handler must record that the pipe closed: {cause:?}"
+    );
+}
+
 /// A launched browser opens no tab of its own, so nothing loads before crawlberg asks.
 #[tokio::test]
 #[allow(
@@ -3614,6 +3713,48 @@ fn the_pool_launch_builder_uses_the_configured_chrome_path_and_args() {
             },
         )
     });
+}
+
+#[test]
+fn the_pool_launch_builder_chooses_the_transport_by_the_private_pipe_key() {
+    assert!(
+        !BrowserPoolConfig::default().private_pipe,
+        "a default pool must launch on the debugging port"
+    );
+    assert_private_pipe_chooses_the_transport(|private_pipe| {
+        build_pool_launch_builder(
+            std::path::Path::new("/tmp/pool-test-profile"),
+            &BrowserPoolConfig {
+                private_pipe,
+                ..BrowserPoolConfig::default()
+            },
+        )
+    });
+}
+
+/// A pool serves a fetch from its own launch only when the key of the fetch is the pool's.
+#[test]
+fn a_pool_does_not_claim_the_launch_options_of_a_config_with_another_private_pipe_key() {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let same = crate::types::BrowserConfig::default();
+    let other = crate::types::BrowserConfig {
+        private_pipe: true,
+        ..Default::default()
+    };
+    assert!(pool.uses_launch_options(&same));
+    assert!(!pool.uses_launch_options(&other));
+}
+
+#[test]
+fn the_debug_text_of_a_pool_config_shows_the_private_pipe_key() {
+    let text = format!(
+        "{:?}",
+        BrowserPoolConfig {
+            private_pipe: true,
+            ..BrowserPoolConfig::default()
+        }
+    );
+    assert!(text.contains("private_pipe: true"), "{text}");
 }
 
 #[test]
