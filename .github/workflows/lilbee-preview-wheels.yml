@@ -20,6 +20,12 @@ on:
           The wheel version becomes <pyproject version>+<local_version>.
         required: true
         type: string
+      source_commit:
+        description: >
+          The upstream commit this branch carries. The release notes name it.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -135,12 +141,26 @@ jobs:
           pattern: python-wheels-*
           merge-multiple: true
 
+      # `gh release create` makes the tag itself. The shared release action needs a tag
+      # that is already on the remote, and this workflow pushes none.
       - name: Create pre-release with wheels
-        uses: xberg-io/actions/publish-github-release@v1
-        with:
-          tag: ${{ steps.tag.outputs.tag }}
-          title: ${{ steps.tag.outputs.tag }}
-          artifacts: wheelhouse/*.whl
-          draft: "false"
-          prerelease: "true"
-          target: ${{ github.sha }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SOURCE_COMMIT}" && ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::source_commit must be a commit hash, got: ${SOURCE_COMMIT}" >&2
+            exit 1
+          fi
+          (cd wheelhouse && sha256sum *.whl > SHA256SUMS && cat SHA256SUMS)
+          NOTES="Preview wheels of crawlberg at ${SOURCE_COMMIT:-${{ github.sha }}}. Built by lilbee-preview-wheels.yml run ${{ github.run_id }}. Temporary."
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release upload "$TAG" wheelhouse/*.whl wheelhouse/SHA256SUMS --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$TAG" wheelhouse/*.whl wheelhouse/SHA256SUMS --prerelease \
+              --target "${{ github.sha }}" --title "$TAG" --notes "$NOTES" \
+              --repo "${{ github.repository }}"
+          fi
