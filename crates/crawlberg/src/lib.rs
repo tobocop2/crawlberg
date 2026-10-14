@@ -1,4 +1,11 @@
 //! crawlberg -- A Rust crawling engine for turning websites into structured data.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests send requests to a local mock server and need no cookie store"
+    )
+)]
 
 #[cfg(feature = "api")]
 pub(crate) mod api;
@@ -18,7 +25,14 @@ pub mod browser_session_pool;
 pub mod budget;
 #[cfg(feature = "browser-chromiumoxide")]
 mod chrome_args;
+#[cfg(feature = "browser-chromiumoxide")]
+mod chrome_frame;
 pub(crate) mod citations;
+// ~keep Gated on `browser-chromiumoxide`, not `browser`: see the module's own `~keep` header
+// ~keep for why nesting it under `browser` would break a `browser-chromiumoxide`-only build
+// ~keep (xberg-io/crawlberg#74).
+#[cfg(feature = "browser-chromiumoxide")]
+mod ssrf_intercept;
 // ~keep Gated on `browser-chromiumoxide`, not `browser`, to match its callers: the interact
 // ~keep launcher (interact/chromiumoxide.rs) is gated on the narrower feature and calls
 // ~keep apply_stealth_patches, so a `browser-chromiumoxide`-only build compiled this module out
@@ -54,6 +68,8 @@ pub mod sitemap;
 pub mod telemetry;
 pub(crate) mod time;
 pub(crate) mod tower;
+#[cfg(test)]
+mod tracing_capture;
 pub mod traits;
 mod types;
 pub(crate) mod waf;
@@ -64,7 +80,7 @@ pub(crate) mod warc;
 pub use api::serve_with_config as serve_api;
 pub use bindings::{
     BatchCrawlResult, BatchCrawlResults, BatchScrapeResult, BatchScrapeResults, CrawlEngineHandle, batch_crawl,
-    batch_scrape, crawl, create_engine, interact, map_urls, scrape,
+    batch_scrape, crawl, create_engine, interact, map_urls, scrape, shutdown_engine,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use bindings::{batch_crawl_stream, crawl_stream};
@@ -106,15 +122,15 @@ pub use telemetry::{current_traceparent, with_traceparent};
 pub use types::antibot::{AntibotError, AntibotStrategy, Decision, DefaultAntibotStrategy, DynAntibotStrategy};
 pub use types::{
     ActionResult, ArticleMetadata, AssetCategory, AttemptOutcome, AuthConfig, BrowserBackend, BrowserConfig,
-    BrowserExtras, BrowserMode, BrowserWait, BudgetExhausted, BypassProvider, BypassResponse, CachedPage,
+    BrowserExtras, BrowserMode, BrowserWait, BudgetExhausted, BypassBody, BypassProvider, BypassResponse, CachedPage,
     ContentConfig, ContentFilterKind, CookieInfo, CrawlConfig, CrawlConfigBuilder, CrawlPageResult, CrawlResult,
     CrawlStrategyKind, DispatchProfile, DispatchProfileBuilder, DocumentContentEncoding, DomainObservation,
     DomainRecommendation, DomainStatePort, DownloadedAsset, DownloadedDocument, DynBypassProvider, DynDomainStatePort,
     DynEscalationBudget, DynRetryPolicy, DynWafClassifier, EscalationBudget, EscalationReason, EscalationStrategy,
     ExtractionMeta, FaviconInfo, FeedInfo, FeedType, HeadingInfo, HreflangEntry, ImageInfo, ImageSource,
     InteractionResult, JsonLdEntry, LinkInfo, LinkType, MapResult, MarkdownResult, ObservedOutcome, PageMetadata,
-    ProxyConfig, ResponseMeta, RetryDirective, RetryPolicy, ScrapeResult, SitemapUrl, Tier, WafClassifier,
-    WafClassifyError, WafSignal,
+    ProxyConfig, ResponseMeta, RetryDirective, RetryPolicy, ScrapeResult, SitemapUrl, Tier,
+    UNTRUSTED_CALLER_FORBIDDEN_FIELDS, WafClassifier, WafClassifyError, WafSignal, reject_untrusted_fields,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use types::{BatchCrawlStreamRequest, CrawlEvent, CrawlStreamRequest};

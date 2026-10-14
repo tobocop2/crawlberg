@@ -183,6 +183,9 @@ impl CrawlbergMcp {
         if let Some(stay) = params.stay_on_domain {
             config.stay_on_domain = stay;
         }
+        if let Some(respect_robots_txt) = params.respect_robots_txt {
+            config.respect_robots_txt = respect_robots_txt;
+        }
 
         let engine = self.build_engine(config)?;
         let result = match engine.crawl(&params.url).await {
@@ -435,7 +438,7 @@ impl CrawlbergMcp {
             }
         } else {
             super::outputs::DownloadOutput {
-                url: params.url.clone(),
+                url: crate::net::userinfo::parse(&params.url).map_or_else(|| result.final_url.clone(), String::from),
                 content_type: Some(result.content_type.clone()),
                 status_code: Some(result.status_code),
                 body_size: Some(result.body_size),
@@ -721,6 +724,35 @@ mod tests {
         }
     }
 
+    /// An MCP caller cannot choose an `include_paths`/`exclude_paths` pattern: no tool declares
+    /// one, and the tool parameters refuse unknown fields. A look-around pattern reaches an MCP
+    /// crawl only from the server's own config.
+    #[test]
+    fn no_tool_accepts_a_path_pattern_from_the_caller() {
+        let tools = CrawlbergMcp::new().tool_router.list_all();
+        for tool in &tools {
+            let properties = tool.input_schema.get("properties").and_then(|p| p.as_object());
+            for key in properties.into_iter().flat_map(|p| p.keys()) {
+                assert!(
+                    !key.to_ascii_lowercase().contains("path") && !key.to_ascii_lowercase().contains("pattern"),
+                    "tool `{}` must not take a path pattern from the caller, found `{key}`",
+                    tool.name
+                );
+            }
+        }
+        for field in ["include_paths", "exclude_paths", "includePaths", "excludePaths"] {
+            let args = serde_json::json!({ "url": "https://example.com", field: ["^/(?!private/)"] });
+            assert!(
+                serde_json::from_value::<crate::mcp::params::CrawlParams>(args.clone()).is_err(),
+                "crawl must refuse {field}"
+            );
+            assert!(
+                serde_json::from_value::<crate::mcp::params::MapParams>(args).is_err(),
+                "map must refuse {field}"
+            );
+        }
+    }
+
     /// The advertised `outputSchema` for each tool must not drift from the
     /// `structuredContent` the tool actually emits: every serialized field must
     /// be a declared schema property, and every required property must appear in
@@ -953,5 +985,139 @@ mod tests {
             );
             assert!(ann.title.is_some(), "tool `{name}` is missing a title annotation");
         }
+    }
+
+    #[tokio::test]
+    async fn download_of_an_html_page_reports_the_url_without_its_password() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw("<html><body>page</body></html>", "text/html"),
+            )
+            .mount(&mock)
+            .await;
+        let server = CrawlbergMcp::with_config(CrawlConfig::builder().allow_private_networks(true).build());
+        let url = format!("{}/doc", mock.uri().replacen("http://", "http://user:MCP-PW-55@", 1));
+
+        let result = server
+            .download(Parameters(super::super::params::DownloadParams { url, max_size: None }))
+            .await
+            .expect("the tool call must succeed");
+
+        let output = result.structured_content.expect("the output is structured");
+        assert_eq!(
+            output["url"],
+            format!("{}/doc", mock.uri()),
+            "the HTML branch reports the URL without its userinfo: {output}"
+        );
+        assert!(
+            !output.to_string().contains("MCP-PW-55"),
+            "the output must not carry the password: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_of_a_seed_robots_txt_disallows_is_a_forbidden_tool_error() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/robots.txt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw("User-agent: *\nDisallow: /private\n", "text/plain"),
+            )
+            .mount(&mock)
+            .await;
+        let server = CrawlbergMcp::with_config(CrawlConfig::builder().allow_private_networks(true).build());
+
+        let result = server
+            .map(Parameters(super::super::params::MapParams {
+                url: format!("{}/private", mock.uri()),
+                limit: None,
+                search: None,
+                respect_robots_txt: Some(true),
+            }))
+            .await
+            .expect("a refusal is a tool error, not a protocol error");
+
+        assert_eq!(result.is_error, Some(true), "the refusal must be a tool error");
+        let text = result
+            .content
+            .iter()
+            .find_map(|block| block.as_text().map(|content| content.text.clone()))
+            .unwrap_or_default();
+        assert_eq!(text, "forbidden: robots.txt disallows /private");
+    }
+
+    #[tokio::test]
+    async fn crawl_can_override_the_server_robots_policy_without_fetching_robots() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/robots.txt"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw("User-agent: *\nDisallow: /private\n", "text/plain"),
+            )
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/private"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_raw("<html><body>page</body></html>", "text/html"),
+            )
+            .mount(&mock)
+            .await;
+        let config = CrawlConfig {
+            respect_robots_txt: true,
+            ..CrawlConfig::builder().allow_private_networks(true).max_depth(0).build()
+        };
+        let server = CrawlbergMcp::with_config(config);
+
+        let refused = server
+            .crawl(Parameters(super::super::params::CrawlParams {
+                url: format!("{}/private", mock.uri()),
+                max_depth: None,
+                max_pages: None,
+                format: None,
+                stay_on_domain: None,
+                respect_robots_txt: None,
+            }))
+            .await
+            .expect("robots refusal is returned as a structured crawl result");
+        assert_eq!(refused.is_error, Some(false));
+        let refused_result = refused.structured_content.as_ref().expect("structured crawl result");
+        assert_eq!(refused_result["was_skipped"], true);
+        assert_eq!(refused_result["error"], "robots.txt disallows /private");
+
+        let allowed = server
+            .crawl(Parameters(super::super::params::CrawlParams {
+                url: format!("{}/private", mock.uri()),
+                max_depth: None,
+                max_pages: None,
+                format: None,
+                stay_on_domain: None,
+                respect_robots_txt: Some(false),
+            }))
+            .await
+            .expect("the robots override permits the crawl");
+
+        assert_eq!(allowed.is_error, Some(false));
+        let allowed_result = allowed.structured_content.as_ref().expect("structured crawl result");
+        assert_eq!(allowed_result["was_skipped"], false);
+        assert_eq!(allowed_result["error"], serde_json::Value::Null);
+        let requests = mock.received_requests().await.expect("wiremock records requests");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/robots.txt")
+                .count(),
+            1,
+            "only the control crawl may request robots.txt"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/private")
+                .count(),
+            1,
+            "only the robots-disabled crawl may fetch the disallowed page"
+        );
     }
 }

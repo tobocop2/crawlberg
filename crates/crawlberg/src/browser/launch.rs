@@ -10,30 +10,40 @@
 use chromiumoxide::Handler;
 use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig, BrowserConfigBuilder};
 
+use crate::browser_pool::ScratchProfileDir;
 use crate::error::CrawlError;
 use crate::types::CrawlConfig;
 
-/// The Chrome `--user-data-dir` to launch with, and what to do with it once the
-/// browser session ends.
-struct UserDataDir {
-    path: std::path::PathBuf,
-    /// When `true`, the directory is deleted after the session (ephemeral launch,
-    /// or a scratch copy of a named profile whose changes should not be saved).
-    /// When `false`, the directory is left in place so its contents persist
-    /// (a named profile launched with `save_browser_profile: true`).
-    cleanup_on_exit: bool,
+/// The Chrome `--user-data-dir` a one-shot launch uses.
+///
+/// ~keep A scratch directory is removed when this value drops, on every
+/// ~keep exit path: a failed launch, a cancelled launch or fetch (xberg-io/crawlberg#131), and a
+/// ~keep teardown task that the runtime drops before it finishes, which is how every one-shot
+/// ~keep fetch at the end of a `#[tokio::test]` leaked its directory (xberg-io/crawlberg#415).
+#[derive(Debug)]
+pub(super) enum UserDataDir {
+    /// A named profile launched with `save_browser_profile: true`, used in place and kept.
+    Persistent(std::path::PathBuf),
+    /// An ephemeral directory, or a scratch copy of a named profile, removed on drop.
+    Scratch(ScratchProfileDir),
 }
 
-/// Unique-per-launch temp directory name, avoiding Chrome `SingletonLock` collisions
-/// when multiple browsers launch concurrently or a previous instance crashed uncleanly.
-fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static LAUNCH_COUNTER: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        LAUNCH_COUNTER.fetch_add(1, AtomicOrdering::Relaxed),
-    ))
+impl UserDataDir {
+    /// Write the WebRTC preference into the directory. A scratch directory refuses it once the
+    /// process is exiting.
+    fn disable_non_proxied_udp(&self) -> Result<(), CrawlError> {
+        match self {
+            Self::Persistent(path) => crate::browser_pool::disable_non_proxied_udp(path),
+            Self::Scratch(dir) => dir.disable_non_proxied_udp(),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Persistent(path) => path,
+            Self::Scratch(dir) => dir.path(),
+        }
+    }
 }
 
 /// Resolve the `--user-data-dir` for a one-shot Chrome launch from `config`.
@@ -47,10 +57,10 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
 ///   the session are discarded rather than written back.
 fn resolve_user_data_dir(config: &CrawlConfig) -> Result<UserDataDir, CrawlError> {
     let Some(name) = config.browser_profile.as_deref() else {
-        return Ok(UserDataDir {
-            path: unique_temp_dir("crawlberg-browser"),
-            cleanup_on_exit: true,
-        });
+        return Ok(UserDataDir::Scratch(ScratchProfileDir::create(
+            "crawlberg-browser-",
+            config.browser.chrome_path.as_deref(),
+        )?));
     };
 
     let profile = crate::browser_profile::BrowserProfile::new(name)?;
@@ -59,17 +69,78 @@ fn resolve_user_data_dir(config: &CrawlConfig) -> Result<UserDataDir, CrawlError
     }
 
     if config.save_browser_profile {
-        Ok(UserDataDir {
-            path: profile.user_data_dir,
-            cleanup_on_exit: false,
-        })
+        check_snap_can_open_profile(&profile.user_data_dir, config.browser.chrome_path.as_deref())?;
+        Ok(UserDataDir::Persistent(profile.user_data_dir))
     } else {
-        let scratch = unique_temp_dir(&format!("crawlberg-profile-{name}"));
-        copy_dir_recursive(&profile.user_data_dir, &scratch)?;
-        Ok(UserDataDir {
-            path: scratch,
-            cleanup_on_exit: true,
-        })
+        let scratch = ScratchProfileDir::create(
+            &format!("crawlberg-profile-{name}-"),
+            config.browser.chrome_path.as_deref(),
+        )?;
+        copy_dir_recursive(&profile.user_data_dir, scratch.path())?;
+        Ok(UserDataDir::Scratch(scratch))
+    }
+}
+
+/// A saved profile session's hold on its profile directory. The session keeps it until its
+/// Chrome has been reaped, so no other session in this process copies the directory or launches
+/// on it while that Chrome can still write to it.
+pub(super) type ProfileHold = tokio::sync::OwnedRwLockWriteGuard<()>;
+
+/// What names one profile directory in [`PROFILE_LOCKS`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum ProfileKey {
+    /// The directory's file identity, which every name of it shares.
+    File(same_file::Handle),
+    /// The path as given, when the directory cannot be opened.
+    Path(std::path::PathBuf),
+}
+
+/// The key of the profile directory `dir`.
+///
+/// ~keep A symlink, a bind mount or a case-folding file system gives one directory several
+/// ~keep names, and every name must share one lock (xberg-io/crawlberg#524).
+fn profile_key(dir: &std::path::Path) -> ProfileKey {
+    same_file::Handle::from_path(dir).map_or_else(|_| ProfileKey::Path(dir.to_path_buf()), ProfileKey::File)
+}
+
+type ProfileLocks = std::collections::HashMap<ProfileKey, std::sync::Arc<tokio::sync::RwLock<()>>>;
+
+/// One lock per profile directory used by a session in this process; see [`profile_lock`].
+static PROFILE_LOCKS: std::sync::LazyLock<std::sync::Mutex<ProfileLocks>> = std::sync::LazyLock::new(Default::default);
+
+/// The lock that orders every session on the profile directory `dir`: a saved session holds it
+/// for writing until its Chrome is reaped, an unsaved one for reading while it copies.
+///
+/// ~keep Chrome removes its `SingletonLock` before its last profile writes, so a copy that starts
+/// ~keep once the previous session has only been asked to close fails on a file Chrome renames
+/// ~keep meanwhile (xberg-io/crawlberg#524). Copies read the directory together; only a Chrome
+/// ~keep writing it needs the directory alone. An entry nothing holds is dropped at the next lookup.
+fn profile_lock(dir: &std::path::Path) -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    let mut locks = PROFILE_LOCKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+    std::sync::Arc::clone(locks.entry(profile_key(dir)).or_default())
+}
+
+/// Wait until this session may use `config.browser_profile`, then resolve its `--user-data-dir`.
+///
+/// A saved profile comes back with the session's hold on it. An unsaved profile is copied under a
+/// read hold that ends with the copy, since its Chrome writes only to the copy.
+async fn claim_user_data_dir(config: &CrawlConfig) -> Result<(UserDataDir, Option<ProfileHold>), CrawlError> {
+    let Some(name) = config.browser_profile.as_deref() else {
+        return Ok((resolve_user_data_dir(config)?, None));
+    };
+    let profile = crate::browser_profile::BrowserProfile::new(name)?;
+    if !profile.exists() {
+        profile.create()?;
+    }
+    // ~keep The create comes first: the lock is keyed on the directory's file identity.
+    let lock = profile_lock(&profile.user_data_dir);
+    if config.save_browser_profile {
+        let hold = lock.write_owned().await;
+        Ok((resolve_user_data_dir(config)?, Some(hold)))
+    } else {
+        let _copying = lock.read_owned().await;
+        Ok((resolve_user_data_dir(config)?, None))
     }
 }
 
@@ -89,18 +160,36 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         if file_type.is_dir() {
             copy_dir_recursive(&entry.path(), &dest_path)?;
         } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &dest_path)
-                .map_err(|e| CrawlError::other(format!("failed to copy profile file: {e}")))?;
+            std::fs::copy(entry.path(), &dest_path).map_err(|e| {
+                CrawlError::other(format!("failed to copy profile file {}: {e}", entry.path().display()))
+            })?;
         }
     }
     Ok(())
 }
 
+/// A browser [`launch_or_connect`] launched or connected to, with what the session keeps
+/// until it is gone.
+pub(super) type Launched = (
+    Browser,
+    Handler,
+    Option<UserDataDir>,
+    Option<crate::net::egress::Egress>,
+    Option<ProfileHold>,
+);
+
 /// Launch a new managed browser or connect to an external CDP endpoint.
-pub(super) async fn launch_or_connect(
-    config: &CrawlConfig,
-) -> Result<(Browser, Handler, Option<std::path::PathBuf>), CrawlError> {
+///
+/// A launch with `browser_profile` opens its page in the browser's own context, which has no
+/// proxy of its own, so under `deny_private` Chrome is launched through the SSRF proxy, handed
+/// back for the session to keep until the browser is gone. A launch on a saved profile also
+/// returns the session's hold on that profile, which the session keeps until its Chrome is reaped.
+pub(super) async fn launch_or_connect(config: &CrawlConfig) -> Result<Launched, CrawlError> {
     if let Some(ref endpoint) = config.browser.endpoint {
+        crate::types::warn_ignored_launch_options(
+            &config.browser,
+            "connecting to an external browser.endpoint, whose Chrome process is launched externally",
+        );
         if config.browser_profile.is_some() {
             tracing::warn!(
                 profile = config.browser_profile.as_deref().unwrap_or_default(),
@@ -108,27 +197,43 @@ pub(super) async fn launch_or_connect(
                  the remote Chrome process's profile is managed externally"
             );
         }
-        let (browser, handler) = Browser::connect(endpoint)
-            .await
-            .map_err(|e| CrawlError::browser_error(format!("failed to connect to {endpoint}: {e}")))?;
-        Ok((browser, handler, None))
+        let (browser, handler) = crate::browser_pool::connect_endpoint(endpoint).await?;
+        Ok((browser, handler, None, None, None))
     } else {
-        let user_data = resolve_user_data_dir(config)?;
+        let mut proxy = crate::proxy::chrome_proxy_for(config)?;
+        let egress = match config.browser_profile {
+            Some(_) => crate::net::egress::Egress::start(&config.ssrf, proxy.as_ref()).await?,
+            None => None,
+        };
+        if let Some(ref egress) = egress {
+            proxy = Some(egress.chrome_proxy());
+        }
+        // ~keep Inside the caller's launch deadline, so a wait for the profile ends with it.
+        let (user_data, hold) = claim_user_data_dir(config).await?;
+        if config.ssrf.enforces_ip_denials() {
+            user_data.disable_non_proxied_udp()?;
+        }
 
-        let builder = build_one_shot_launch_builder(&user_data.path);
-        let browser_config = builder
+        let browser_config = build_one_shot_launch_builder(user_data.path(), &config.browser, proxy.as_ref())?
             .build()
             .map_err(|e| CrawlError::browser_error(format!("invalid browser config: {e}")))?;
 
-        match Browser::launch(browser_config).await {
-            Ok((browser, handler)) => Ok((browser, handler, user_data.cleanup_on_exit.then_some(user_data.path))),
-            Err(e) => {
-                if user_data.cleanup_on_exit {
-                    let _ = std::fs::remove_dir_all(&user_data.path);
-                }
-                Err(CrawlError::browser_error(format!("failed to launch browser: {e}")))
-            }
+        // ~keep A failed or cancelled launch drops `user_data`, which removes a scratch directory.
+        let launched = match user_data {
+            UserDataDir::Scratch(dir) => dir
+                .launch(browser_config)
+                .await
+                .map(|(browser, handler, dir)| (browser, handler, UserDataDir::Scratch(dir))),
+            UserDataDir::Persistent(path) => Browser::launch_managed(browser_config)
+                .await
+                .map(|(browser, handler)| (browser, handler, UserDataDir::Persistent(path))),
+        };
+        let (mut browser, handler, user_data) =
+            launched.map_err(|e| CrawlError::browser_error(format!("failed to launch browser: {e}")))?;
+        if config.ssrf.enforces_ip_denials() {
+            crate::browser_pool::confirm_profile_in_use(&mut browser, user_data.path()).await?;
         }
+        Ok((browser, handler, Some(user_data), egress, hold))
     }
 }
 
@@ -137,17 +242,30 @@ pub(super) async fn launch_or_connect(
 ///
 /// ~keep Split out from `launch_or_connect` so a test can assert on the flags this
 /// ~keep path actually passes without spawning a real Chrome process.
-fn build_one_shot_launch_builder(user_data_dir: &std::path::Path) -> BrowserConfigBuilder {
+fn build_one_shot_launch_builder(
+    user_data_dir: &std::path::Path,
+    browser: &crate::types::BrowserConfig,
+    proxy: Option<&crate::proxy::ChromeProxy>,
+) -> Result<BrowserConfigBuilder, CrawlError> {
     let mut builder = ChromeBrowserConfig::builder()
         .no_sandbox()
         .new_headless_mode()
         .user_data_dir(user_data_dir)
+        .manage_child_targets(false)
         .disable_default_args();
     // ~keep Mirror browser_pool's fork-safety env vars so one-shot and pooled Chrome launch paths match.
     builder = builder
         .env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
         .env("OS_ACTIVITY_MODE", "disable");
-    crate::browser_pool::apply_default_args(builder)
+    builder = crate::browser_pool::apply_default_args(builder, &browser.chrome_args);
+    crate::browser_pool::apply_launch_overrides(
+        builder,
+        "browser",
+        browser.chrome_path.as_deref(),
+        &browser.chrome_args,
+        browser.private_pipe,
+        proxy,
+    )
 }
 
 /// Returns a modern Chrome user-agent string suitable for the runtime environment.
@@ -194,7 +312,7 @@ mod user_data_dir_tests {
         let config = CrawlConfig::default();
         let resolved = resolve_user_data_dir(&config).expect("resolve must succeed without a profile configured");
         assert!(
-            resolved.cleanup_on_exit,
+            matches!(resolved, UserDataDir::Scratch(_)),
             "ephemeral (no browser_profile) launches must be cleaned up after the session"
         );
     }
@@ -206,23 +324,29 @@ mod user_data_dir_tests {
         assert!(!profile.exists(), "precondition: profile must not exist yet");
         let _guard = ProfileGuard(profile.clone());
 
-        let config = CrawlConfig {
+        // ~keep A Chrome that is not a snap: a snap found on the host cannot open the profile store.
+        let chrome = crate::types::executable_temp_file("create-save");
+        let mut config = CrawlConfig {
             browser_profile: Some(name.clone()),
             save_browser_profile: true,
             ..CrawlConfig::default()
         };
-        let resolved = resolve_user_data_dir(&config).expect("resolve must succeed");
+        config.browser.chrome_path = Some(chrome.clone());
+        let resolved = resolve_user_data_dir(&config);
+        let _ = std::fs::remove_file(&chrome);
+        let resolved = resolved.expect("resolve must succeed");
 
         assert!(
             profile.exists(),
             "resolve_user_data_dir must create the named profile directory when missing"
         );
         assert_eq!(
-            resolved.path, profile.user_data_dir,
+            resolved.path(),
+            profile.user_data_dir,
             "save_browser_profile: true must launch directly against the profile's own directory"
         );
         assert!(
-            !resolved.cleanup_on_exit,
+            matches!(resolved, UserDataDir::Persistent(_)),
             "save_browser_profile: true must not mark the profile directory for cleanup"
         );
     }
@@ -243,20 +367,21 @@ mod user_data_dir_tests {
         let resolved = resolve_user_data_dir(&config).expect("resolve must succeed");
 
         assert_ne!(
-            resolved.path, profile.user_data_dir,
+            resolved.path(),
+            profile.user_data_dir,
             "save_browser_profile: false must launch from a scratch copy, never the profile dir itself"
         );
         assert!(
-            resolved.cleanup_on_exit,
+            matches!(resolved, UserDataDir::Scratch(_)),
             "the scratch copy must be marked for cleanup after the session"
         );
         assert_eq!(
-            std::fs::read(resolved.path.join("marker.txt")).expect("scratch copy must contain the marker file"),
+            std::fs::read(resolved.path().join("marker.txt")).expect("scratch copy must contain the marker file"),
             b"original",
             "the scratch copy must start from the existing profile state"
         );
 
-        std::fs::write(resolved.path.join("marker.txt"), b"mutated-in-session")
+        std::fs::write(resolved.path().join("marker.txt"), b"mutated-in-session")
             .expect("writing into the scratch copy must succeed");
         assert_eq!(
             std::fs::read(profile.user_data_dir.join("marker.txt")).expect("original marker file must still exist"),
@@ -264,7 +389,48 @@ mod user_data_dir_tests {
             "writes into the scratch copy must never be reflected back into the saved profile"
         );
 
-        let _ = std::fs::remove_dir_all(&resolved.path);
+        let scratch = resolved.path().to_path_buf();
+        drop(resolved);
+        assert!(
+            crate::browser_pool::tests::wait_for_removal(&scratch),
+            "the scratch copy must be removed when it is dropped"
+        );
+    }
+
+    /// The error of a profile copy that fails names the file it could not copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_profile_copy_names_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let name = unique_profile_name("copy-error");
+        let profile = BrowserProfile::new(&name).expect("profile name must be valid");
+        profile.create().expect("profile directory must be creatable");
+        let _guard = ProfileGuard(profile.clone());
+        let unreadable = profile.user_data_dir.join("unreadable-marker");
+        std::fs::write(&unreadable, b"x").expect("marker file must be writable");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("permissions must be settable");
+        if std::fs::read(&unreadable).is_ok() {
+            // ~keep Root reads a mode 000 file, so the copy cannot fail here.
+            return;
+        }
+
+        let config = CrawlConfig {
+            browser_profile: Some(name),
+            save_browser_profile: false,
+            ..CrawlConfig::default()
+        };
+        let error = resolve_user_data_dir(&config)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600));
+
+        assert!(
+            error.contains("unreadable-marker") && error.contains("failed to copy profile file"),
+            "the copy error must name the file: {error:?}"
+        );
     }
 
     #[test]
@@ -293,11 +459,186 @@ mod user_data_dir_tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn one_profile_directory_has_one_lock_until_nothing_holds_it() {
+        let held_dir = std::env::temp_dir().join(unique_profile_name("lock-held"));
+        let other_dir = std::env::temp_dir().join(unique_profile_name("lock-other"));
+        let is_listed = |dir: &std::path::Path| {
+            PROFILE_LOCKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&profile_key(dir))
+        };
+
+        let held = profile_lock(&held_dir);
+        assert!(
+            std::sync::Arc::ptr_eq(&held, &profile_lock(&held_dir)),
+            "every session on one profile directory must share one lock"
+        );
+        drop(profile_lock(&other_dir));
+        assert!(is_listed(&held_dir), "a lock a session holds must stay listed");
+
+        drop(held);
+        drop(profile_lock(&other_dir));
+        assert!(
+            !is_listed(&held_dir),
+            "a lock nothing holds must be dropped at the next lookup"
+        );
+    }
+
+    /// Every name of one directory gets its lock, and another directory gets its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_and_a_symlink_to_it_share_one_lock() {
+        let real = std::env::temp_dir().join(unique_profile_name("lock-real"));
+        let alias = std::env::temp_dir().join(unique_profile_name("lock-alias"));
+        let other = std::env::temp_dir().join(unique_profile_name("lock-other-dir"));
+        std::fs::create_dir_all(&real).expect("the directory must be creatable");
+        std::fs::create_dir_all(&other).expect("the directory must be creatable");
+        std::os::unix::fs::symlink(&real, &alias).expect("the symlink must be creatable");
+
+        let held = profile_lock(&real);
+        let shares_lock = std::sync::Arc::ptr_eq(&held, &profile_lock(&alias));
+        let other_shares_lock = std::sync::Arc::ptr_eq(&held, &profile_lock(&other));
+
+        let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&other);
+        assert!(shares_lock, "a directory and a symlink to it must share one lock");
+        assert!(!other_shares_lock, "another directory must get its own lock");
+    }
+}
+
+/// Refuse the saved profile directory `dir` when the Chrome at `chrome_path` (`None` for the one
+/// found on the machine) is a snap that cannot open it. Chrome would exit at once on a
+/// `SingletonLock` it may not create, with an error that does not name the cause.
+fn check_snap_can_open_profile(dir: &std::path::Path, chrome_path: Option<&std::path::Path>) -> Result<(), CrawlError> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(());
+    };
+    let Some(common) = crate::browser_pool::chrome_executable(chrome_path)
+        .and_then(|executable| crate::browser_pool::snap_common_dir(&executable, &home))
+    else {
+        return Ok(());
+    };
+    if snap_can_open(dir, &common, &home) {
+        return Ok(());
+    }
+    Err(CrawlError::browser_error(format!(
+        "the browser is a snap, which cannot open the saved browser profile at {}: a snap opens only \
+         the folders in your home directory whose names do not start with a dot. Set XDG_DATA_HOME to \
+         such a folder to keep saved profiles there, set chrome_path to a Chrome that is not a snap, \
+         or turn off save_browser_profile",
+        dir.display()
+    )))
+}
+
+/// Whether the snap whose own directory is `common` (`home/snap/<name>/common`) can open `dir`.
+///
+/// ~keep The snap `home` interface grants `home/[^.]**` but not `home/snap/**`, where the snap
+/// ~keep sees only its own `home/snap/<name>`. Only the first name below `home` decides. A path
+/// ~keep outside `home` is not judged here: removable-media and other interfaces can grant it.
+fn snap_can_open(dir: &std::path::Path, common: &std::path::Path, home: &std::path::Path) -> bool {
+    let Ok(rest) = dir.strip_prefix(home) else {
+        return true;
+    };
+    match rest.components().next() {
+        Some(std::path::Component::Normal(first)) if first == "snap" => {
+            common.parent().is_some_and(|own| dir.starts_with(own))
+        }
+        Some(std::path::Component::Normal(first)) => !first.to_string_lossy().starts_with('.'),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deletes the saved profile when the test ends.
+    struct DeleteProfile(crate::browser_profile::BrowserProfile);
+
+    impl Drop for DeleteProfile {
+        fn drop(&mut self) {
+            let _ = self.0.delete();
+        }
+    }
+
+    /// The WebRTC IP handling policy in the preference file of the profile at `dir`.
+    fn webrtc_policy(dir: &std::path::Path) -> Option<String> {
+        let bytes = std::fs::read(dir.join("Default").join("Preferences")).ok()?;
+        let preferences = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+        Some(preferences.pointer("/webrtc/ip_handling_policy")?.as_str()?.to_owned())
+    }
+
+    /// A one-shot launch that denies private addresses writes the WebRTC preference into its
+    /// profile directory before it starts Chrome.
+    ///
+    /// ~keep No Chrome is needed: a `chrome_args` entry is refused after the write. The profile is
+    /// ~keep a saved one, which stays after the refusal, where a scratch directory is removed.
+    #[tokio::test]
+    async fn a_one_shot_launch_that_denies_private_addresses_writes_the_webrtc_preference() {
+        let name = format!("crawlberg-one-shot-webrtc-preference-{}", std::process::id());
+        let profile = crate::browser_profile::BrowserProfile::new(&name).expect("the profile name must be valid");
+        let _guard = DeleteProfile(profile.clone());
+        // ~keep A Chrome that is not a snap: a snap found on the host cannot open the profile store.
+        let chrome = crate::types::executable_temp_file("one-shot-webrtc");
+        let config = CrawlConfig {
+            browser_profile: Some(name),
+            save_browser_profile: true,
+            browser: crate::types::BrowserConfig {
+                chrome_path: Some(chrome.clone()),
+                chrome_args: vec!["--user-data-dir=/tmp/crawlberg-one-shot-elsewhere".to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let denies = config.ssrf.enforces_ip_denials();
+
+        let error = launch_or_connect(&config)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        let _ = std::fs::remove_file(&chrome);
+
+        assert!(
+            denies,
+            "the default policy must deny private addresses, or the launch writes nothing"
+        );
+        assert!(
+            error.contains("must not set --user-data-dir"),
+            "the launch must be refused after the write, got: {error:?}"
+        );
+        assert_eq!(
+            webrtc_policy(&profile.user_data_dir).as_deref(),
+            Some("disable_non_proxied_udp"),
+            "the launch must write the preference into its profile directory"
+        );
+    }
+
+    /// A scratch profile directory of a one-shot launch gets the preference through the same call.
+    #[test]
+    fn a_one_shot_scratch_profile_directory_gets_the_webrtc_preference() {
+        let resolved = resolve_user_data_dir(&CrawlConfig::default()).expect("resolve must succeed");
+        let path = resolved.path().to_path_buf();
+
+        let written = resolved.disable_non_proxied_udp();
+        let policy = webrtc_policy(&path);
+        drop(resolved);
+
+        assert!(written.is_ok(), "the preference must be written: {written:?}");
+        assert_eq!(
+            policy.as_deref(),
+            Some("disable_non_proxied_udp"),
+            "the scratch directory must hold the preference"
+        );
+        assert!(
+            crate::browser_pool::tests::wait_for_removal(&path),
+            "the scratch directory must be removed when it drops"
+        );
+    }
 
     #[test]
     fn the_one_shot_launch_builder_carries_no_double_dashed_flag_and_the_macos_keychain_flag() {
@@ -305,7 +646,613 @@ mod tests {
         // ~keep uses to build its `BrowserConfig`, so a path that stops calling
         // ~keep `apply_default_args` (even behind a comment claiming it still does) fails
         // ~keep here because the returned flags actually change.
-        let builder = build_one_shot_launch_builder(std::path::Path::new("/tmp/browser-rs-test-profile"));
+        let builder = build_one_shot_launch_builder(
+            std::path::Path::new("/tmp/browser-rs-test-profile"),
+            &crate::types::BrowserConfig::default(),
+            None,
+        )
+        .expect("the default browser config names no binary to check");
         crate::browser_pool::assert_launch_flags_are_normalized(&builder);
+    }
+
+    #[test]
+    fn the_one_shot_launch_routes_chrome_through_the_configured_proxy() {
+        let config = CrawlConfig {
+            browser: crate::types::BrowserConfig {
+                proxy: Some(crate::types::ProxyConfig {
+                    url: "127.0.0.1:3128".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let proxy = crate::proxy::chrome_proxy_for(&config).expect("a usable proxy");
+        let debug = format!(
+            "{:?}",
+            build_one_shot_launch_builder(
+                std::path::Path::new("/tmp/browser-rs-test-profile"),
+                &config.browser,
+                proxy.as_ref()
+            )
+            .expect("the config names no binary to check")
+        );
+        assert!(
+            debug.contains("key: \"proxy-server=http://127.0.0.1:3128\""),
+            "the render's Chrome must be launched through the proxy: {debug}"
+        );
+        assert!(
+            debug.contains("proxy-bypass-list=<-loopback>"),
+            "loopback requests must not bypass the proxy: {debug}"
+        );
+    }
+
+    #[test]
+    fn the_configured_proxy_replaces_a_caller_proxy_flag() {
+        let proxy = crate::proxy::chrome_proxy(&crate::types::ProxyConfig {
+            url: "http://127.0.0.1:9".into(),
+            ..Default::default()
+        })
+        .expect("an http proxy is a Chrome proxy");
+        for (caller_flag, caller_value) in [
+            ("--proxy-server=http://127.0.0.1:7", "127.0.0.1:7"),
+            ("--proxy-bypass-list=*.internal", "*.internal"),
+            ("--proxy-pac-url=http://127.0.0.1:7/p.pac", "127.0.0.1:7/p.pac"),
+            ("--no-proxy-server", "no-proxy-server"),
+            ("--proxy-auto-detect", "proxy-auto-detect"),
+        ] {
+            let browser = crate::types::BrowserConfig {
+                chrome_args: vec![caller_flag.to_owned()],
+                ..Default::default()
+            };
+            let (built, fields) = crate::tracing_capture::capture_events(|| {
+                build_one_shot_launch_builder(
+                    std::path::Path::new("/tmp/browser-rs-test-profile"),
+                    &browser,
+                    Some(&proxy),
+                )
+            });
+            let debug = format!("{:?}", built.expect("the config names no binary to check"));
+            for configured in ["proxy-server=http://127.0.0.1:9", "proxy-bypass-list=<-loopback>"] {
+                assert!(
+                    debug.contains(&format!("key: \"{configured}\"")),
+                    "{caller_flag}: the configured proxy's {configured} is missing: {debug}"
+                );
+            }
+            assert!(
+                !debug.contains(caller_value),
+                "{caller_flag}: the caller's flag must be dropped: {debug}"
+            );
+            let switch = caller_flag.split('=').next().expect("a switch name");
+            // ~keep A switch with no value has no secret to hide; its name is what the warning prints.
+            if caller_flag.contains('=') {
+                crate::tracing_capture::assert_logged_without_secret(&fields, caller_value, switch);
+            }
+        }
+    }
+
+    #[test]
+    fn a_caller_proxy_flag_reaches_chrome_when_no_proxy_is_configured() {
+        let browser = crate::types::BrowserConfig {
+            chrome_args: vec![
+                "--proxy-server=http://127.0.0.1:7".to_owned(),
+                "--proxy-bypass-list=*.internal".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let debug = format!(
+            "{:?}",
+            build_one_shot_launch_builder(std::path::Path::new("/tmp/browser-rs-test-profile"), &browser, None)
+                .expect("the config names no binary to check")
+        );
+        for flag in ["proxy-server=http://127.0.0.1:7", "proxy-bypass-list=*.internal"] {
+            assert!(
+                debug.contains(&format!("key: \"{flag}\"")),
+                "without a configured proxy the caller's {flag} must reach Chrome: {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_one_shot_launch_builder_uses_the_configured_chrome_path_and_args() {
+        crate::browser_pool::assert_launch_overrides_reach_the_builder(|chrome_path, chrome_args| {
+            build_one_shot_launch_builder(
+                std::path::Path::new("/tmp/browser-rs-test-profile"),
+                &crate::types::BrowserConfig {
+                    chrome_path,
+                    chrome_args,
+                    ..Default::default()
+                },
+                None,
+            )
+        });
+    }
+
+    #[test]
+    fn the_one_shot_launch_builder_chooses_the_transport_by_the_private_pipe_key() {
+        crate::browser_pool::assert_private_pipe_chooses_the_transport(|private_pipe| {
+            build_one_shot_launch_builder(
+                std::path::Path::new("/tmp/browser-rs-test-profile"),
+                &crate::types::BrowserConfig {
+                    private_pipe,
+                    ..Default::default()
+                },
+                None,
+            )
+        });
+    }
+
+    /// A scratch profile directory that never reaches a launched Chrome is removed when it drops.
+    ///
+    /// ~keep This is the failed-launch and cancelled-launch case stated as a unit: `launch_or_connect`
+    /// ~keep drops `user_data` without returning it, exactly as here. Proven at this level rather than
+    /// ~keep through a real Chrome because an integration test cannot reliably choose which window a
+    /// ~keep cancellation lands in -- see xberg-io/crawlberg#198.
+    #[test]
+    fn an_unclaimed_scratch_profile_directory_is_removed_when_it_drops() {
+        let resolved = resolve_user_data_dir(&CrawlConfig::default()).expect("resolve must succeed");
+        let path = resolved.path().to_path_buf();
+        assert!(path.is_dir(), "the scratch directory must exist before it drops");
+
+        drop(resolved);
+
+        assert!(
+            crate::browser_pool::tests::wait_for_removal(&path),
+            "an unclaimed scratch profile directory must be removed"
+        );
+    }
+
+    /// An unsaved named profile's scratch copy is removed when a runtime cancels its owner.
+    ///
+    /// ~keep This models a process ending immediately after its last unsaved-profile scrape: the
+    /// ~keep session teardown owns the copy, but Tokio drops that task before it can reach its
+    /// ~keep explicit cleanup (xberg-io/crawlberg#555).
+    #[test]
+    fn an_unsaved_profile_copy_is_removed_when_its_owner_task_is_cancelled() {
+        let name = format!("crawlberg-cancelled-unsaved-copy-{}", std::process::id());
+        let profile = crate::browser_profile::BrowserProfile::new(&name).expect("the profile name must be valid");
+        let _guard = DeleteProfile(profile.clone());
+        profile.create().expect("the profile must be creatable");
+        std::fs::write(profile.user_data_dir.join("marker"), b"copied").expect("the profile marker must be writable");
+        let config = CrawlConfig {
+            browser_profile: Some(name),
+            save_browser_profile: false,
+            ..CrawlConfig::default()
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime must build");
+        let scratch = runtime.block_on(async {
+            let copy = resolve_user_data_dir(&config).expect("the unsaved profile must be copied");
+            let path = copy.path().to_path_buf();
+            assert_ne!(path, profile.user_data_dir, "an unsaved profile must use a copy");
+            assert_eq!(
+                std::fs::read(path.join("marker")).expect("the copied marker must be readable"),
+                b"copied"
+            );
+            let (started, entered) = tokio::sync::oneshot::channel();
+            runtime.spawn(async move {
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+                drop(copy);
+            });
+            entered.await.expect("the owner task must start");
+            path
+        });
+
+        drop(runtime);
+
+        assert!(
+            crate::browser_pool::tests::wait_for_removal(&scratch),
+            "the cancelled owner task must remove its unsaved profile copy"
+        );
+        assert_eq!(
+            std::fs::read(profile.user_data_dir.join("marker")).expect("the source marker must remain readable"),
+            b"copied",
+            "removing the unsaved copy must leave the source profile intact"
+        );
+    }
+
+    /// A one-shot launch records the Chrome it starts, so dropping its profile directory stops
+    /// that Chrome and removes the directory.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+    async fn dropping_a_one_shot_launchs_profile_directory_stops_its_chrome() {
+        let test_name = "dropping_a_one_shot_launchs_profile_directory_stops_its_chrome";
+        let Some((browser, handler, user_data, _egress, _hold)) = crate::browser_pool::tests::expect_chrome_or_skip(
+            test_name,
+            launch_or_connect(&CrawlConfig::default()).await,
+        ) else {
+            return;
+        };
+        let user_data = user_data.expect("a launched Chrome must have a profile directory");
+        let path = user_data.path().to_path_buf();
+
+        crate::browser_pool::tests::assert_dropping_the_profile_stops_its_chrome(browser, handler, user_data, path)
+            .await;
+    }
+
+    /// A refused `chrome_path` removes the scratch directory `resolve_user_data_dir` created for
+    /// the launch it never made.
+    ///
+    /// ~keep Pins the call site in `launch_or_connect`: `resolve_user_data_dir(config)?` then
+    /// ~keep `build_one_shot_launch_builder(..)?`, whose `?` drops the guard on a refusal. No
+    /// ~keep Chrome is needed: the check on the path fails before any process would be spawned.
+    #[tokio::test]
+    async fn a_one_shot_launch_refused_by_a_missing_chrome_path_leaves_no_profile_directory() {
+        let config = CrawlConfig {
+            browser: crate::types::BrowserConfig {
+                chrome_path: Some(std::path::PathBuf::from("/nonexistent/crawlberg-one-shot-chrome")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error =
+            crate::browser_pool::tests::assert_refused_launch_leaves_no_scratch_dir(|| launch_or_connect(&config))
+                .await;
+        assert!(
+            error.contains("cannot be used"),
+            "the error must name the path, got: {error}"
+        );
+    }
+
+    /// The same call site refused by a `chrome_args` entry instead of `chrome_path`.
+    #[tokio::test]
+    async fn a_one_shot_launch_refused_by_a_user_data_dir_flag_leaves_no_profile_directory() {
+        let config = CrawlConfig {
+            browser: crate::types::BrowserConfig {
+                chrome_args: vec!["--user-data-dir=/tmp/crawlberg-one-shot-elsewhere".to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error =
+            crate::browser_pool::tests::assert_refused_launch_leaves_no_scratch_dir(|| launch_or_connect(&config))
+                .await;
+        assert!(
+            error.contains("must not set --user-data-dir"),
+            "the error must name the refused flag, got: {error}"
+        );
+    }
+
+    /// A one-shot launch cut off by the overall deadline hands its profile teardown off the
+    /// executor thread.
+    ///
+    /// ~keep A supervised launch intentionally outlives the caller's deadline, so the assertion
+    /// ~keep waits for that launch to finish and hand off the profile teardown.
+    #[tokio::test]
+    async fn a_cancelled_one_shot_launch_tears_its_profile_down_off_the_executor_thread() {
+        let mut config = CrawlConfig::default();
+        config.browser.overall_timeout = std::time::Duration::from_millis(1);
+        let before = crate::browser_pool::tests::profile_drops_here();
+
+        let fetched = super::super::one_shot_fetch(
+            "about:blank",
+            &config,
+            None,
+            false,
+            tokio::time::Instant::now() + config.browser.overall_timeout,
+        )
+        .await;
+
+        assert!(fetched.is_err(), "a Chrome launch cannot finish within a millisecond");
+        tokio::time::timeout(crate::browser_pool::tests::PROCESS_TEST_WAIT, async {
+            while crate::browser_pool::tests::profile_drops_here().0 == before.0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the supervised launch must hand off its profile teardown within the process-test bound");
+        crate::browser_pool::tests::assert_profile_teardown_left_this_thread(before);
+    }
+
+    /// `launch_or_connect`'s connect-error message must never carry a `browser.endpoint`
+    /// password or path token, though the failing origin must still be readable for debugging.
+    ///
+    /// ~keep A closed local port refuses the connection immediately, so this needs no real
+    /// ~keep Chrome and stays fast. `ws://` skips chromiumoxide's `json/version` HTTP probe
+    /// ~keep and goes straight to the WebSocket handshake. The endpoint-listener test just
+    /// ~keep below reaches the same error path with a local socket that answers HTTP 418, so
+    /// ~keep a closed port is not the only way here; it stays because it needs no listener at all.
+    #[tokio::test]
+    async fn connect_error_prints_only_the_endpoint_origin() {
+        let config = CrawlConfig {
+            browser: crate::types::BrowserConfig {
+                endpoint: Some("ws://user:hunter2@127.0.0.1:1/devtools/browser/b1946ac9-guid".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = launch_or_connect(&config)
+            .await
+            .expect_err("a refused local port must fail the connect");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("hunter2"),
+            "password must not survive into the error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("b1946ac9-guid"),
+            "the CDP path token must not survive into the error, got: {msg}"
+        );
+        assert!(
+            msg.contains("127.0.0.1"),
+            "host must still appear in the error, got: {msg}"
+        );
+    }
+
+    /// Every spelling of `browser.endpoint` that the config check accepts must reach the browser.
+    #[tokio::test]
+    async fn connects_every_endpoint_spelling_the_checks_accept() {
+        crate::browser_pool::tests::assert_every_accepted_endpoint_reaches_the_browser(|endpoint| async move {
+            let config = CrawlConfig {
+                browser: crate::types::BrowserConfig {
+                    endpoint: Some(endpoint),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            launch_or_connect(&config).await
+        })
+        .await;
+    }
+
+    /// A saved named profile is never removed when its value drops.
+    #[test]
+    fn a_persistent_profile_directory_is_never_removed() {
+        let dir = tempfile::tempdir().expect("the directory must be creatable");
+
+        drop(UserDataDir::Persistent(dir.path().to_path_buf()));
+
+        assert!(
+            dir.path().is_dir(),
+            "a persistent profile directory must survive its value"
+        );
+    }
+
+    /// Dropping a saved named profile neither removes it nor stops a Chrome still using it.
+    #[cfg(unix)]
+    #[test]
+    fn a_persistent_profile_in_use_is_neither_removed_nor_its_user_killed() {
+        let dir = tempfile::tempdir().expect("the directory must be creatable");
+        let flag = crate::browser_pool::user_data_dir_flag(dir.path());
+        let mut user = crate::browser_pool::tests::spawn_bystander(&flag);
+
+        drop(UserDataDir::Persistent(dir.path().to_path_buf()));
+
+        let running = user.try_wait().expect("the status must be readable").is_none();
+        let _ = user.kill();
+        let _ = user.wait();
+        assert!(
+            running,
+            "a Chrome using a saved profile must not be killed when its value drops"
+        );
+        assert!(dir.path().is_dir(), "a saved profile directory must survive its value");
+    }
+
+    /// A one-shot session whose teardown task runs to the end removes its profile directory.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+    async fn a_one_shot_session_torn_down_by_its_task_leaves_no_profile_directory() {
+        let test_name = "a_one_shot_session_torn_down_by_its_task_leaves_no_profile_directory";
+        let Some((browser, handler, data_dir, egress, profile_hold)) =
+            crate::browser_pool::tests::expect_chrome_or_skip(
+                test_name,
+                launch_or_connect(&CrawlConfig::default()).await,
+            )
+        else {
+            return;
+        };
+        let path = data_dir
+            .as_ref()
+            .map(|dir| dir.path().to_path_buf())
+            .expect("a launched Chrome must have a profile directory");
+        let handler_handle = crate::browser_pool::spawn_handler(handler);
+        drop(super::super::OneShotSession {
+            browser: Some(std::sync::Arc::new(browser)),
+            firewall: None,
+            open_tab: None,
+            handler_handle: Some(handler_handle),
+            data_dir,
+            egress,
+            profile_hold,
+            shutdown_timeout: std::time::Duration::from_secs(5),
+            origin: crate::ssrf_intercept::BrowserOrigin::Killed,
+        });
+
+        tokio::task::spawn_blocking(move || {
+            crate::browser_pool::tests::assert_profile_directory_is_gone_for_good(&path)
+        })
+        .await
+        .expect("the teardown task must stop Chrome and remove the profile directory");
+    }
+
+    /// A one-shot fetch whose Chrome dies during the navigation ends at once with an error that
+    /// names the closed connection, and its teardown removes the profile directory.
+    ///
+    /// ~keep chromiumoxide 0.9.1's handler stays pending after its websocket breaks. With a handler
+    /// ~keep loop that went on past the error, the fetch waited for its whole overall deadline, and
+    /// ~keep its teardown then waited on the dead connection and never removed the profile
+    /// ~keep (xberg-io/crawlberg#581). The fetch is bounded at half the overall deadline here, so
+    /// ~keep that defect fails the test.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+    async fn a_one_shot_fetch_whose_chrome_dies_ends_at_once_and_leaves_no_profile_directory() {
+        use std::time::Duration;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let site = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stalled"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<html><body>late</body></html>", "text/html")
+                    .set_delay(Duration::from_secs(120)),
+            )
+            .mount(&site)
+            .await;
+        let config = CrawlConfig {
+            browser: crate::types::BrowserConfig {
+                timeout: Duration::from_secs(60),
+                overall_timeout: Duration::from_secs(60),
+                ..crate::types::BrowserConfig::default()
+            },
+            ..CrawlConfig::builder().allow_private_networks(true).build()
+        };
+        let test_name = "a_one_shot_fetch_whose_chrome_dies_ends_at_once_and_leaves_no_profile_directory";
+        let Some(launched) =
+            crate::browser_pool::tests::expect_chrome_or_skip(test_name, launch_or_connect(&config).await)
+        else {
+            return;
+        };
+        let chrome = launched
+            .0
+            .process_id()
+            .map(sysinfo::Pid::from_u32)
+            .expect("a launched Chrome must have a process");
+        let profile = launched
+            .2
+            .as_ref()
+            .map(|dir| dir.path().to_path_buf())
+            .expect("a launched Chrome must have a profile directory");
+        let url = format!("{}/stalled", site.uri());
+        let killer = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while tokio::time::Instant::now() < deadline {
+                let received = site.received_requests().await.unwrap_or_default();
+                if received.iter().any(|request| request.url.path() == "/stalled") {
+                    let mut system = sysinfo::System::new();
+                    system.refresh_processes_specifics(
+                        sysinfo::ProcessesToUpdate::Some(&[chrome]),
+                        true,
+                        sysinfo::ProcessRefreshKind::nothing(),
+                    );
+                    return system
+                        .process(chrome)
+                        .and_then(|process| process.kill_with(sysinfo::Signal::Kill))
+                        .unwrap_or(false);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        });
+        let deadline = tokio::time::Instant::now() + config.browser.overall_timeout;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            super::super::fetch_launched(launched, deadline, &url, &config, None, false),
+        )
+        .await;
+        let killed = killer.await.expect("the task that kills Chrome must not panic");
+
+        assert!(killed, "Chrome must be killed once it has asked for the page");
+        match outcome {
+            Ok(result) => {
+                let message = result.err().map(|error| error.to_string()).unwrap_or_default();
+                assert!(
+                    message.contains("the browser's CDP connection closed ("),
+                    "a fetch whose Chrome died must fail and name the closed connection and its cause: {message:?}"
+                );
+            }
+            Err(_) => panic!("the fetch must end once its Chrome has died, not wait 30 s and more"),
+        }
+        tokio::task::spawn_blocking(move || {
+            crate::browser_pool::tests::assert_profile_directory_is_gone_for_good(&profile)
+        })
+        .await
+        .expect("the teardown of a fetch whose Chrome died must remove the profile directory");
+    }
+
+    /// A one-shot session dropped just before its runtime stops still removes its profile directory.
+    ///
+    /// ~keep The session's `Drop` spawns its teardown, and a runtime that stops right after, as every
+    /// ~keep `#[tokio::test]` ending on a one-shot fetch does, drops that task unfinished. That left one
+    /// ~keep `crawlberg-browser-*` directory per fetch in the temp directory (xberg-io/crawlberg#415).
+    #[test]
+    #[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+    fn a_one_shot_session_dropped_as_its_runtime_stops_leaves_no_profile_directory() {
+        let test_name = "a_one_shot_session_dropped_as_its_runtime_stops_leaves_no_profile_directory";
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime must build");
+        let path = runtime.block_on(async {
+            let (browser, handler, data_dir, egress, profile_hold) = crate::browser_pool::tests::expect_chrome_or_skip(
+                test_name,
+                launch_or_connect(&CrawlConfig::default()).await,
+            )?;
+            let path = data_dir
+                .as_ref()
+                .map(|dir| dir.path().to_path_buf())
+                .expect("a launched Chrome must have a profile directory");
+            let handler_handle = crate::browser_pool::spawn_handler(handler);
+            drop(super::super::OneShotSession {
+                browser: Some(std::sync::Arc::new(browser)),
+                firewall: None,
+                open_tab: None,
+                handler_handle: Some(handler_handle),
+                data_dir,
+                egress,
+                profile_hold,
+                shutdown_timeout: std::time::Duration::from_secs(5),
+                origin: crate::ssrf_intercept::BrowserOrigin::Killed,
+            });
+            Some(path)
+        });
+        drop(runtime);
+        let Some(path) = path else {
+            return;
+        };
+        crate::browser_pool::tests::assert_profile_directory_is_gone_for_good(&path);
+    }
+
+    #[test]
+    fn a_snap_opens_only_the_folders_its_home_interface_grants() {
+        let home = std::path::Path::new("/home/runner");
+        let common = home.join("snap").join("chromium").join("common");
+        for (dir, opens) in [
+            ("/home/runner/.local/share/crawlberg/profiles/work", false),
+            ("/home/runner/.config/work", false),
+            ("/home/runner/snap/firefox/common/work", false),
+            ("/home/runner/snap/chromium/common/crawlberg/profiles/work", true),
+            ("/home/runner/profiles/.hidden/work", true),
+            ("/home/runner/profiles/work", true),
+            ("/media/usb/work", true),
+        ] {
+            assert_eq!(
+                snap_can_open(std::path::Path::new(dir), &common, home),
+                opens,
+                "the chromium snap opening {dir}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_saved_profile_for_a_chrome_that_is_not_a_snap_is_not_refused() {
+        let chrome = crate::types::executable_temp_file("not-a-snap-saved");
+        let hidden = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".local/share/crawlberg/profiles/work");
+        let checked = check_snap_can_open_profile(&hidden, Some(&chrome));
+        let _ = std::fs::remove_file(&chrome);
+        assert!(checked.is_ok(), "only a snap Chrome is refused: {checked:?}");
+    }
+
+    #[test]
+    fn a_saved_profile_a_snap_chrome_cannot_open_is_refused_with_the_cause() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let hidden = home.join(".local/share/crawlberg/profiles/work");
+        let error = check_snap_can_open_profile(&hidden, Some(std::path::Path::new("/snap/bin/chromium")))
+            .expect_err("a snap Chrome must not be given a profile in a hidden folder");
+        let message = error.to_string();
+        assert!(
+            message.contains("which cannot open the saved browser profile") && message.contains("XDG_DATA_HOME"),
+            "the error must name the cause and the fix: {message}"
+        );
     }
 }

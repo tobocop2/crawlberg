@@ -5,11 +5,12 @@ use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crawlberg::{BypassProvider, BypassResponse, CrawlError};
+use crawlberg::{BypassBody, BypassProvider, BypassResponse, CrawlError};
 use tracing::{Instrument, info_span};
 
 use crate::config::{
-    AuthScheme, CrawlErrorKind, HttpMethod, ProviderConfig, RequestBody, ResponseKind, UrlParamLocation,
+    AuthScheme, CrawlErrorKind, HttpMethod, ProviderConfig, RequestBody, ResponseKind, URL_PLACEHOLDER,
+    UrlParamLocation,
 };
 use crate::error::ProviderError;
 use crate::extract;
@@ -52,6 +53,28 @@ impl SimpleHttpProvider {
     fn effective_endpoint(&self) -> &str {
         self.endpoint_override.as_deref().unwrap_or(&self.config.endpoint)
     }
+
+    /// Log a failed send or body read with what the error leaves out: the endpoint's origin and
+    /// the cause chain. The error itself names only the vendor and the error kind, because the
+    /// request URL can carry the API key.
+    fn warn_transport_failure(&self, vendor: &str, stage: &str, error: &reqwest::Error) {
+        let mut cause = String::new();
+        let mut source = std::error::Error::source(error);
+        while let Some(inner) = source {
+            if !cause.is_empty() {
+                cause.push_str(": ");
+            }
+            cause.push_str(&inner.to_string());
+            source = inner.source();
+        }
+        tracing::warn!(
+            vendor,
+            endpoint = %crawlberg::net::redact::redact_url_to_origin(self.effective_endpoint()),
+            error = %error,
+            cause = %cause,
+            "bypass provider {stage} failed"
+        );
+    }
 }
 
 impl fmt::Debug for SimpleHttpProvider {
@@ -76,9 +99,12 @@ impl BypassProvider for SimpleHttpProvider {
         async move {
             let req = self.build_request(url)?;
             let resp = req.send().await.map_err(|e| {
+                let e = e.without_url();
+                self.warn_transport_failure(&vendor, "send", &e);
                 CrawlError::other(
                     ProviderError::Send {
                         vendor: vendor.clone(),
+                        // ~keep The request URL carries a query-parameter API key; reqwest's message would print it.
                         message: e.to_string(),
                     }
                     .to_string(),
@@ -86,7 +112,6 @@ impl BypassProvider for SimpleHttpProvider {
             })?;
 
             let status_u16 = resp.status().as_u16();
-            let final_url = resp.url().to_string();
             let resp_headers = resp.headers().clone();
 
             if let Some(err) = self.map_status(status_u16, &vendor) {
@@ -112,10 +137,12 @@ impl BypassProvider for SimpleHttpProvider {
             }
 
             let body_bytes = resp.bytes().await.map_err(|e| {
+                let e = e.without_url();
+                self.warn_transport_failure(&vendor, "body read", &e);
                 CrawlError::other(
                     ProviderError::BodyRead {
                         vendor: vendor.clone(),
-                        message: e.to_string(),
+                        message: e.without_url().to_string(),
                     }
                     .to_string(),
                 )
@@ -123,7 +150,7 @@ impl BypassProvider for SimpleHttpProvider {
 
             let raw_body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-            let (body, body_bytes_final) = self.decode_body(&raw_body, body_bytes.to_vec(), &vendor)?;
+            let (body, body_bytes_final, body_kind) = self.decode_body(&raw_body, body_bytes.to_vec(), &vendor)?;
 
             let cost_usd = extract::cost(
                 &resp_headers,
@@ -137,8 +164,11 @@ impl BypassProvider for SimpleHttpProvider {
                 content_type: "text/html".into(),
                 body,
                 body_bytes: body_bytes_final,
+                body_kind,
                 headers: HashMap::new(),
-                final_url,
+                // ~keep The response URL is the vendor's API endpoint (with any query-parameter key), not the
+                // ~keep target's. `ProviderConfig` has no way to read a vendor-reported target URL, so this stays empty.
+                final_url: String::new(),
                 cost_usd,
                 vendor_request_id: None,
             })
@@ -161,7 +191,7 @@ impl SimpleHttpProvider {
             HttpMethod::Post => {
                 let mut r = self.client.post(&full_url);
                 if let Some(RequestBody::Json { template }) = &self.config.request.body {
-                    let body_str = template.replace("{{url}}", url);
+                    let body_str = template.replace(URL_PLACEHOLDER, url);
                     r = r.header("Content-Type", "application/json").body(body_str);
                 }
                 r
@@ -170,9 +200,9 @@ impl SimpleHttpProvider {
 
         req = match &self.config.auth {
             AuthScheme::None => req,
-            AuthScheme::Bearer { token } => req.bearer_auth(token),
-            AuthScheme::BasicUsername { username } => req.basic_auth(username, Option::<&str>::None),
-            AuthScheme::Header { name, value } => req.header(name.as_str(), value.as_str()),
+            AuthScheme::Bearer { token } => req.bearer_auth(token.expose()),
+            AuthScheme::BasicUsername { username } => req.basic_auth(username.expose(), Option::<&str>::None),
+            AuthScheme::Header { name, value } => req.header(name.as_str(), value.expose()),
             AuthScheme::QueryParam { .. } => req,
         };
 
@@ -189,7 +219,7 @@ impl SimpleHttpProvider {
             full.push(sep);
             full.push_str(k);
             full.push('=');
-            full.push_str(&urlencoding::encode(v));
+            full.push_str(&urlencoding::encode(v.expose()));
             sep = '&';
         }
 
@@ -207,7 +237,7 @@ impl SimpleHttpProvider {
             full.push(sep);
             full.push_str(name);
             full.push('=');
-            full.push_str(&urlencoding::encode(value));
+            full.push_str(&urlencoding::encode(value.expose()));
         }
 
         full
@@ -231,9 +261,19 @@ impl SimpleHttpProvider {
         None
     }
 
-    fn decode_body(&self, raw_body: &str, raw_bytes: Vec<u8>, vendor: &str) -> Result<(String, Vec<u8>), CrawlError> {
+    /// The page in the vendor's answer, and whether it is the origin's bytes or text.
+    ///
+    /// ~keep A raw body is the bytes of the page as the origin sent them. A JSON field is a
+    /// ~keep string, so it is text the vendor decoded already (Zyte's `browserHtml` is the HTML
+    /// ~keep its browser rendered); its `<meta charset>` no longer describes it.
+    fn decode_body(
+        &self,
+        raw_body: &str,
+        raw_bytes: Vec<u8>,
+        vendor: &str,
+    ) -> Result<(String, Vec<u8>, BypassBody), CrawlError> {
         match &self.config.response.kind {
-            ResponseKind::RawBody => Ok((raw_body.to_owned(), raw_bytes)),
+            ResponseKind::RawBody => Ok((raw_body.to_owned(), raw_bytes, BypassBody::Bytes)),
             ResponseKind::JsonField { html_field } => {
                 let v: serde_json::Value = serde_json::from_str(raw_body).map_err(|e| {
                     CrawlError::other(
@@ -258,7 +298,7 @@ impl SimpleHttpProvider {
                     })?
                     .to_owned();
                 let bytes = html.as_bytes().to_vec();
-                Ok((html, bytes))
+                Ok((html, bytes, BypassBody::Text))
             }
         }
     }

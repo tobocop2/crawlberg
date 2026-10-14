@@ -295,3 +295,179 @@ async fn test_plain_403_is_not_waf() {
         result
     );
 }
+
+/// A 403 identified by a response header other than `server` must name its vendor.
+///
+/// The Tower fetch service used to classify with the full header map but then re-derive the
+/// vendor from the `server` header alone, so a header-stamped block came back as "unknown".
+/// Both call sites now share one classifier (crawlberg#169).
+#[tokio::test]
+async fn test_403_identified_by_a_non_server_header_names_its_vendor() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_string("<html><body>Access denied.</body></html>")
+                .append_header("content-type", "text/html")
+                .append_header("x-datadome", "blocked"),
+        )
+        .mount(&mock)
+        .await;
+
+    let handle = create_engine(Some(no_browser_config()))
+        .expect("create_engine with no-browser config should succeed in integration test");
+    let result = scrape(&handle, &mock.uri()).await;
+    let Err(CrawlError::WafBlocked { vendor, .. }) = result else {
+        unreachable!("expected WafBlocked, got: {result:?}");
+    };
+    assert_eq!(
+        vendor, "datadome",
+        "the header that identified the block must name the vendor"
+    );
+}
+
+/// A challenge served with 503 is a WAF block on the engine's default path too, not only in
+/// the standalone `http_fetch` used by `map()` (crawlberg#169).
+#[tokio::test]
+async fn test_503_cloudflare_challenge_is_waf_blocked() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string(
+                    "<html><head><title>Just a moment...</title></head><body>\
+                     <script src=\"/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1\"></script>\
+                     </body></html>",
+                )
+                .append_header("content-type", "text/html")
+                .append_header("server", "cloudflare"),
+        )
+        .mount(&mock)
+        .await;
+
+    let handle = create_engine(Some(no_browser_config()))
+        .expect("create_engine with no-browser config should succeed in integration test");
+    let result = scrape(&handle, &mock.uri()).await;
+    let Err(CrawlError::WafBlocked { vendor, .. }) = result else {
+        unreachable!("a 503 Cloudflare challenge must be WafBlocked, got: {result:?}");
+    };
+    assert_eq!(vendor, "cloudflare", "expected the cloudflare vendor, got {vendor}");
+}
+
+/// Guard: a 503 with no WAF fingerprint must stay a plain server error on this path too.
+///
+/// ~keep This passes with and without the challenge-status change; it exists to fail if the
+/// change ever widens to every 503.
+#[tokio::test]
+async fn test_plain_503_is_not_waf() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("<html><body><h1>Service Unavailable</h1></body></html>")
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&mock)
+        .await;
+
+    let handle = create_engine(Some(no_browser_config()))
+        .expect("create_engine with no-browser config should succeed in integration test");
+    let result = scrape(&handle, &mock.uri()).await;
+    assert!(
+        matches!(result, Err(CrawlError::ServerError { .. })),
+        "plain 503 should be ServerError, not WafBlocked: {result:?}"
+    );
+}
+
+/// Akamai, Imperva and F5 stamp their own `server` header on every response they proxy, so
+/// that header alone proves the CDN is in the path and says nothing about a block. An
+/// ordinary 200 carrying it must be returned as content, not refused (crawlberg#231).
+///
+/// ~keep The assertion is on the page HTML, not on `is_ok()`: a scrape that returned an empty
+/// body would satisfy the weaker form while still having thrown the real page away.
+#[tokio::test]
+async fn a_2xx_whose_only_waf_evidence_is_cdn_presence_is_returned_as_content() {
+    let fronted = [
+        ("/akamai", "AkamaiGHost"),
+        ("/incapsula", "Incapsula"),
+        ("/bigip", "BIG-IP"),
+    ];
+    let page_html = "<html><head><title>Product page</title></head>\
+                <body><h1>Widgets for sale</h1><p>In stock today.</p></body></html>";
+
+    let mock = MockServer::start().await;
+    for (route, server) in fronted {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(page_html)
+                    .append_header("content-type", "text/html")
+                    .append_header("server", server),
+            )
+            .mount(&mock)
+            .await;
+    }
+
+    let handle = create_engine(Some(no_browser_config()))
+        .expect("create_engine with no-browser config should succeed in integration test");
+
+    for (route, server) in fronted {
+        let result = scrape(&handle, &format!("{}{route}", mock.uri())).await;
+        let page = result.unwrap_or_else(|error| panic!("a 200 behind {server} must succeed, got: {error:?}"));
+        assert_eq!(page.status_code, 200, "a 200 behind {server} must stay a 200");
+        assert!(
+            page.html.contains("Widgets for sale"),
+            "the real page behind {server} must reach the caller, got: {}",
+            page.html
+        );
+    }
+}
+
+/// A 403 whose only WAF evidence is the same CDN-presence header keeps blocking: the status
+/// is the evidence a 2xx lacks, and narrowing the 2xx path must not narrow this one.
+#[tokio::test]
+async fn a_403_whose_only_waf_evidence_is_cdn_presence_still_blocks() {
+    assert_waf_blocked(
+        "<html><body>Access Denied</body></html>",
+        vec![("content-type", "text/html"), ("server", "AkamaiGHost")],
+    )
+    .await;
+}
+
+/// Sucuri's `x-sucuri-id` fingerprint is a bare presence check: it names no value and no status,
+/// and Sucuri sets the header on every response it proxies. A 200 that carries it with an
+/// ordinary body is returned as content through the engine's scrape path, like the
+/// `server`-header CDNs above.
+///
+/// ~keep The body stays under the body limit of the 2xx WAF decision, so the check runs on this
+/// response rather than being skipped for size.
+#[tokio::test]
+async fn a_2xx_whose_only_waf_evidence_is_a_bare_sucuri_id_is_returned_as_content() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<html><head><title>Blog</title></head><body><h1>Release notes</h1></body></html>")
+                .append_header("content-type", "text/html")
+                .append_header("x-sucuri-id", "18012"),
+        )
+        .mount(&mock)
+        .await;
+
+    let handle = create_engine(Some(no_browser_config()))
+        .expect("create_engine with no-browser config should succeed in integration test");
+    let page = scrape(&handle, &mock.uri())
+        .await
+        .unwrap_or_else(|error| panic!("a 200 with a bare x-sucuri-id must succeed, got: {error:?}"));
+    assert_eq!(page.status_code, 200);
+    assert!(
+        page.html.contains("Release notes"),
+        "the real page must reach the caller, got: {}",
+        page.html
+    );
+}

@@ -1,0 +1,5400 @@
+//! Unit tests for [`super`]'s browser pool, session reuse and teardown.
+//!
+//! ~keep In its own file because `browser_pool.rs` crossed poly's 1000-line limit when the
+//! ~keep #146 close-outcome work landed, and `alef.toml` exempts `**/*_tests.rs` from the
+//! ~keep quality metrics -- the same split `engine/wasm_crawl_tests.rs` already uses. Nothing
+//! ~keep but test code belongs here: a production helper moved in would become lint-exempt
+//! ~keep by accident.
+
+use chromiumoxide::detection::{DetectionOptions, default_executable};
+use sysinfo::UpdateKind;
+
+use super::*;
+
+// ~keep #674: a non-exec launcher can leave its child outside any readable process family.
+#[cfg(unix)]
+fn assert_refused_launcher_stops_its_child(launcher_exits: bool) {
+    let ending = if launcher_exits { "exit 3" } else { "wait" };
+    let script = format!("#!/bin/sh\nsleep 300 &\necho $! > \"$0.child\"\n{ending}\n");
+    let (root, mut dir, config) = a_listed_launch_of_a_script("crawlberg-refused-descendant-test-", &script);
+    let marker = root.path().join("chrome-stand-in.sh.child");
+    let mut peer = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("peer must start");
+    let mut asked = None;
+    let outcome = start_listed_chrome_reading(dir.path(), &config, |pid| {
+        asked = Some(pid);
+        let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "launcher must start and report its child");
+        if launcher_exits {
+            assert!(ended_within_the_wait(pid), "launcher must exit before the failed read");
+        }
+        None
+    });
+    let descendant: u32 = std::fs::read_to_string(&marker)
+        .expect("launcher must report its child")
+        .trim()
+        .parse()
+        .expect("reported child must be a pid");
+    let stopped = ended_within_the_wait(descendant);
+    let peer_running = peer.try_wait().expect("peer status must be readable").is_none();
+    let mut system = System::new();
+    ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[Pid::from_u32(descendant)]));
+    if let Some(process) = system.process(Pid::from_u32(descendant)) {
+        process.kill();
+    }
+    let _ = peer.kill();
+    let _ = peer.wait();
+    drop(dir.0.take());
+    assert!(asked.is_some(), "the refused launch must actually run");
+    assert!(outcome.is_err(), "unreadable launch must be refused");
+    assert!(stopped, "the refused launch must stop the child of its launcher");
+    assert!(peer_running, "refusal must leave an unrelated process alive");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refusing_an_exited_launcher_stops_its_child_and_leaves_an_unrelated_process() {
+    assert_refused_launcher_stops_its_child(true);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn refusing_a_running_launcher_stops_its_child_and_leaves_an_unrelated_process() {
+    assert_refused_launcher_stops_its_child(false);
+}
+
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+pub(crate) fn expect_chrome_or_skip<T, E: std::fmt::Display>(test_name: &str, result: Result<T, E>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) if error.to_string().contains("auto detect a chrome executable") => {
+            eprintln!("skipping {test_name}: no Chrome executable: {error}");
+            None
+        }
+        Err(error) => panic!("{test_name}: setup with the detected Chrome must succeed: {error}"),
+    }
+}
+
+#[test]
+fn detected_chrome_launch_errors_are_not_skippable() {
+    let broken = std::panic::catch_unwind(|| {
+        expect_chrome_or_skip::<(), _>(
+            "detected_chrome_launch_errors_are_not_skippable",
+            Err("browser process exited before websocket URL was resolved"),
+        )
+    });
+    assert!(broken.is_err(), "a detected but broken Chrome must fail the test");
+    assert!(
+        expect_chrome_or_skip::<(), _>(
+            "detected_chrome_launch_errors_are_not_skippable",
+            Err("Could not auto detect a chrome executable"),
+        )
+        .is_none(),
+        "an absent Chrome executable remains skippable"
+    );
+}
+
+#[test]
+fn test_config_defaults() {
+    let config = BrowserPoolConfig::default();
+    assert_eq!(config.max_pages, 8);
+    assert_eq!(config.launch_timeout, Duration::from_secs(30));
+    assert!(config.browser_endpoint.is_none());
+    assert!(config.chrome_path.is_none());
+    assert!(config.chrome_args.is_empty());
+}
+
+#[test]
+fn test_pool_creation() {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    assert!(!pool.shutdown.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn a_stale_supervisor_cannot_mark_its_replacement_unhealthy() {
+    let active_generation = Arc::new(tokio::sync::Mutex::new(Some(1_u64)));
+    let healthy = Arc::new(AtomicBool::new(false));
+    let wake_stale_supervisor = Arc::new(tokio::sync::Notify::new());
+    let stale_state = Arc::clone(&active_generation);
+    let stale_health = Arc::clone(&healthy);
+    let stale_wake = Arc::clone(&wake_stale_supervisor);
+    let stale_supervisor = tokio::spawn(async move {
+        stale_wake.notified().await;
+        let mut generation = stale_state.lock().await;
+        if mark_unhealthy_if_current(*generation, 1, &stale_health) {
+            *generation = None;
+        }
+    });
+    *active_generation.lock().await = Some(2);
+    healthy.store(true, Ordering::Release);
+
+    wake_stale_supervisor.notify_one();
+    stale_supervisor.await.expect("stale supervisor task");
+
+    assert_eq!(
+        *active_generation.lock().await,
+        Some(2),
+        "the stale generation must not retire the replacement"
+    );
+    assert!(
+        healthy.load(Ordering::Acquire),
+        "the replacement must stay healthy when an old supervisor wakes"
+    );
+
+    let retired = mark_unhealthy_if_current(*active_generation.lock().await, 2, &healthy);
+
+    assert!(retired, "the current generation must be retired on controller loss");
+    assert!(
+        !healthy.load(Ordering::Acquire),
+        "the matching failed generation must mark the pool unhealthy"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_chrome_args_flag_reaches_the_chrome_the_pool_starts() {
+    const TEST_NAME: &str = "a_chrome_args_flag_reaches_the_chrome_the_pool_starts";
+    const MARKER: &str = "crawlberg-pool-chrome-args-marker";
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        chrome_args: vec![format!("--user-agent={MARKER}")],
+        ..BrowserPoolConfig::default()
+    });
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let path = pool_profile_dir(&pool).await;
+    let marker_flag = format!("--user-agent={MARKER}");
+    let reached_chrome = processes_naming(&mut sysinfo::System::new(), &user_data_dir_flag(&path))
+        .iter()
+        .any(|process| command_line_names(process.cmd(), &marker_flag));
+    pool.shutdown().await;
+
+    assert!(
+        reached_chrome,
+        "the pool's Chrome command line must carry the caller flag"
+    );
+}
+
+#[tokio::test]
+async fn test_shutdown_idempotent() {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    pool.shutdown().await;
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_acquire_after_shutdown_fails() {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    pool.shutdown().await;
+    let result = pool.acquire_page().await;
+    assert!(result.is_err());
+}
+
+thread_local! {
+    /// ~keep How many [`ScratchProfileDir`] teardowns this thread handed to a worker.
+    pub(crate) static PROFILE_HAND_OFFS_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many profile teardowns ran on this thread. An executor thread must see none.
+    pub(crate) static PROFILE_TEARDOWNS_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only seam: [`kill_if_chrome_using`] fires this once its re-check confirms the pid still
+    /// runs `chrome`, before it sends the kill. A test installs a hook here to force a pid reuse in
+    /// exactly the window a pidfd exists to close.
+    pub(crate) static REUSE_WINDOW_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Call and clear the reuse-window hook a test installed on [`REUSE_WINDOW_HOOK`], if any.
+pub(crate) fn fire_reuse_window_hook() {
+    let hook = REUSE_WINDOW_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// ~keep This thread's counts of profile teardown hand-offs and profile teardowns run on it.
+pub(crate) fn profile_drops_here() -> (usize, usize) {
+    (
+        PROFILE_HAND_OFFS_HERE.with(std::cell::Cell::get),
+        PROFILE_TEARDOWNS_HERE.with(std::cell::Cell::get),
+    )
+}
+
+/// ~keep Assert that this thread handed off a profile teardown since `before` and ran none of it.
+pub(crate) fn assert_profile_teardown_left_this_thread(before: (usize, usize)) {
+    let (hand_offs, teardowns) = profile_drops_here();
+    assert!(hand_offs > before.0, "the site must hand off a profile teardown");
+    assert_eq!(
+        teardowns, before.1,
+        "the profile teardown must run on another thread, not the executor thread that dropped it"
+    );
+}
+
+/// How long a process test waits for what another thread or process brings about: a profile
+/// directory removed, a process started or ended.
+///
+/// ~keep A bound for a poll, not a timing claim: each wait ends as soon as its condition holds.
+pub(crate) const PROCESS_TEST_WAIT: Duration = Duration::from_secs(10);
+
+/// Wait up to [`PROCESS_TEST_WAIT`] for the teardown another thread runs to remove `path`.
+pub(crate) fn wait_for_removal(path: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    !path.exists()
+}
+
+/// The entries still in the profile directory at `path` and the processes still naming it, for a
+/// failure message.
+pub(crate) fn what_is_left(path: &std::path::Path) -> String {
+    let entries: Vec<_> = std::fs::read_dir(path)
+        .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.file_name()).collect())
+        .unwrap_or_default();
+    let mut system = sysinfo::System::new();
+    let users: Vec<_> = processes_naming(&mut system, &user_data_dir_flag(path))
+        .iter()
+        .map(|process| (process.pid(), process.exe().map(std::path::Path::to_path_buf)))
+        .collect();
+    format!("entries left {entries:?}, processes naming it {users:?}")
+}
+
+/// Assert that the profile directory at `path` is removed, that no process uses it, and that it is
+/// still gone a second later, when a helper that outlived its browser would have written again.
+pub(crate) fn assert_profile_directory_is_gone_for_good(path: &std::path::Path) {
+    assert!(
+        wait_for_removal(path),
+        "the profile directory must be removed: {}; {}",
+        path.display(),
+        what_is_left(path)
+    );
+    let mut system = sysinfo::System::new();
+    let users: Vec<_> = processes_naming(&mut system, &user_data_dir_flag(path))
+        .iter()
+        .map(|process| process.pid())
+        .collect();
+    assert!(users.is_empty(), "processes {users:?} still use {}", path.display());
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        !path.exists(),
+        "the profile directory must stay removed: {}",
+        path.display()
+    );
+}
+
+/// Set on the child copy of this test binary that [`assert_refused_launch_leaves_no_scratch_dir`]
+/// starts: the child makes the refused launch itself, under a temp directory of its own.
+const REFUSED_LAUNCH_CHILD: &str = "CRAWLBERG_TEST_REFUSED_LAUNCH_CHILD";
+
+/// The marker before the refusal's error message that the child prints for its parent. libtest can
+/// print the test's name on the same line first.
+const REFUSED_LAUNCH_ERROR_LINE: &str = "crawlberg-refused-launch-error: ";
+
+/// The names of the entries directly inside `dir`.
+fn entries_in(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(dir)
+        .expect("the temp directory must be readable")
+        .filter_map(|entry| Some(entry.ok()?.file_name()))
+        .collect()
+}
+
+/// Run `attempt`, a launch expected to fail before any Chrome starts, and assert it leaves nothing
+/// in the temp directory: the scratch directory the launch's guard created for the launch it never
+/// made is removed on the same refusal that failed it. Returns the error message for the caller's
+/// own assertion.
+///
+/// ~keep The calling test starts this test binary again as a child that runs only that test, with
+/// ~keep `TMPDIR` (and Windows' `TMP` and `TEMP`) set to a fresh directory that no other test or
+/// ~keep process uses. The child makes the launch, waits up to [`PROCESS_TEST_WAIT`] for the
+/// ~keep teardown task to empty that directory, and prints the error. The parent then asserts the
+/// ~keep directory is empty, so a directory another test or process creates cannot turn it red.
+/// ~keep The test thread's name is the test's full name, which libtest sets.
+#[allow(clippy::print_stdout, reason = "the child reports the error to its parent on stdout")]
+pub(crate) async fn assert_refused_launch_leaves_no_scratch_dir<F, Fut, T>(attempt: F) -> String
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CrawlError>>,
+{
+    if std::env::var_os(REFUSED_LAUNCH_CHILD).is_some() {
+        let error = match attempt().await {
+            Ok(_) => panic!("a refused launch must return an error, not launch"),
+            Err(e) => e.to_string(),
+        };
+        let temp = std::env::temp_dir();
+        let deadline = tokio::time::Instant::now() + PROCESS_TEST_WAIT;
+        while !entries_in(&temp).is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        println!("{REFUSED_LAUNCH_ERROR_LINE}{error}");
+        return error;
+    }
+    let test = std::thread::current()
+        .name()
+        .expect("libtest names each test's thread after the test")
+        .to_owned();
+    let temp = tempfile::Builder::new()
+        .prefix("crawlberg-refused-launch-test-")
+        .tempdir()
+        .expect("the directory must be creatable");
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary must be readable"))
+        .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .env(REFUSED_LAUNCH_CHILD, "1")
+        .env("TMPDIR", temp.path())
+        .env("TMP", temp.path())
+        .env("TEMP", temp.path())
+        .output()
+        .expect("the test binary must start");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" 1 passed;"),
+        "the child run of {test} must run it and pass: {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let left = entries_in(temp.path());
+    assert!(
+        left.is_empty(),
+        "a refused launch left a scratch directory behind under {}: {left:?}",
+        temp.path().display()
+    );
+    stdout
+        .lines()
+        .find_map(|line| Some(line.split_once(REFUSED_LAUNCH_ERROR_LINE)?.1))
+        .expect("the child must print the refusal's error")
+        .to_owned()
+}
+
+/// Stopping a profile's users kills a process of the named Chrome still writing into it.
+///
+/// ~keep The stand-in carries `--user-data-dir=<dir>` on its command line, as each of Chrome's
+/// ~keep helper processes does, and rewrites a file in the directory in a loop, as the helpers do
+/// ~keep for a moment after the browser process dies. Its own executable stands in for Chrome's.
+/// ~keep It is a shell builtin loop, so no child of it without the flag can write into the
+/// ~keep directory after the kill. It is a child of this process that nothing reaps before the stop
+/// ~keep returns, as the browser process can be, so the stop must finish well inside its deadline
+/// ~keep instead of waiting on the zombie.
+#[cfg(unix)]
+#[test]
+fn stopping_a_profiles_users_kills_the_process_writing_into_it_and_skips_its_zombie() {
+    let dir =
+        ScratchProfileDir::create("crawlberg-profile-users-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let mut helper = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"d="${0#--user-data-dir=}"; while :; do : > "$d/state"; done"#)
+        .arg(user_data_dir_flag(&path))
+        .spawn()
+        .expect("sh must start");
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while !path.join("state").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        path.join("state").exists(),
+        "the stand-in must write into the directory"
+    );
+    let chrome = chrome_started_by(helper.id(), &path).expect("the stand-in's executable must be readable");
+
+    let started = std::time::Instant::now();
+    stop_chrome_processes_using(&path, &chrome);
+    let elapsed = started.elapsed();
+
+    let exited = helper.try_wait().expect("the stand-in's status must be readable");
+    if exited.is_none() {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+    assert!(exited.is_some(), "stopping the profile's users must kill the stand-in");
+    assert!(
+        elapsed < PROFILE_USERS_EXIT_TIMEOUT / 2,
+        "the stop must not wait on a killed child nobody has reaped yet: took {elapsed:?}"
+    );
+    drop(dir);
+    assert_profile_directory_is_gone_for_good(&path);
+}
+
+/// The teardown's wait on a process it killed lasts while the process runs and ends once it has
+/// ended, before anything reaps it.
+///
+/// ~keep `sleep` stands in for a killed Chrome whose threads are still exiting: its pidfd is not
+/// ~keep readable while any thread of it runs, so the wait runs to its deadline.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_wait_on_a_killed_process_lasts_until_it_has_ended() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("sleep must start");
+    let pinned = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("the pid must be valid");
+    let pidfd = rustix::process::pidfd_open(pinned, rustix::process::PidfdFlags::empty()).expect("the pidfd must open");
+    let killed = [pidfd];
+
+    let ended_while_running = wait_until_ended(&killed, std::time::Instant::now() + Duration::from_millis(200));
+    let _ = child.kill();
+    let ended_once_killed = wait_until_ended(&killed, std::time::Instant::now() + PROCESS_TEST_WAIT);
+    let _ = child.wait();
+
+    assert!(
+        !ended_while_running,
+        "the wait must not end while the killed process still runs"
+    );
+    assert!(
+        ended_once_killed,
+        "the wait must end once the killed process has ended, before anything reaps it"
+    );
+}
+
+/// Set on the child that [`the_teardown_removes_the_profile_only_after_every_thread_of_a_killed_process_has_exited`]
+/// starts from this test binary: the profile directory the child reports ready in.
+#[cfg(target_os = "linux")]
+const HELD_THREAD_CHILD: &str = "CRAWLBERG_TEST_HELD_THREAD_CHILD";
+
+/// A thread of a child process that this test thread traces, so that the thread stops at its exit
+/// instead of exiting. Dropping it releases the thread.
+#[cfg(target_os = "linux")]
+struct HeldThread(libc::pid_t);
+
+#[cfg(target_os = "linux")]
+impl HeldThread {
+    /// Trace the thread `tid` with `PTRACE_O_TRACEEXIT`, or return why the kernel refused.
+    #[allow(unsafe_code)]
+    fn seize(tid: libc::pid_t) -> std::io::Result<Self> {
+        let options = std::ptr::without_provenance_mut::<libc::c_void>(libc::PTRACE_O_TRACEEXIT as usize);
+        // ~keep SAFETY: PTRACE_SEIZE reads no memory through its pointer arguments; `data` carries the options.
+        let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, tid, std::ptr::null_mut::<libc::c_void>(), options) };
+        if rc == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(Self(tid))
+        }
+    }
+
+    /// Wait up to [`PROCESS_TEST_WAIT`] for the thread to stop at its exit. Return whether it did.
+    #[allow(unsafe_code)]
+    fn stopped_at_exit(&self) -> bool {
+        let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+        loop {
+            let mut status = 0;
+            // ~keep SAFETY: `status` is a live, writable c_int for the call's whole duration.
+            let rc = unsafe { libc::waitpid(self.0, &mut status, libc::__WALL | libc::WNOHANG) };
+            if rc == self.0 {
+                return libc::WIFSTOPPED(status) && status >> 8 == libc::SIGTRAP | (libc::PTRACE_EVENT_EXIT << 8);
+            }
+            if rc != 0 || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldThread {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // ~keep SAFETY: PTRACE_DETACH reads no memory through its pointer arguments.
+        unsafe {
+            libc::ptrace(
+                libc::PTRACE_DETACH,
+                self.0,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+    }
+}
+
+/// The child side of the test below: start a second thread, report ready in `dir`, and park until
+/// killed.
+#[cfg(target_os = "linux")]
+fn hold_two_threads_in(dir: &std::path::Path) -> ! {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::park();
+        }
+    });
+    std::fs::write(dir.join("ready"), b"").expect("the ready file must be writable");
+    loop {
+        std::thread::park();
+    }
+}
+
+/// The teardown removes the profile only after every thread of a process it killed has exited.
+///
+/// ~keep The scan stops seeing a killed process once its main thread is a zombie, while its other
+/// ~keep threads can still be exiting. The test holds one of them at its exit: it starts this test
+/// ~keep binary again as a child that runs only this test, names the directory on its command line
+/// ~keep and runs a second thread. It traces that thread with `PTRACE_O_TRACEEXIT` and runs the
+/// ~keep teardown on another thread. The kill leaves the main thread a zombie and the traced thread
+/// ~keep stopped at its exit, so the teardown must neither return nor remove the directory until the
+/// ~keep test releases the thread. A parent may trace its own child under Yama's default
+/// ~keep `ptrace_scope` of 1. Where the kernel refuses the trace (`ptrace_scope` 3, a seccomp filter),
+/// ~keep `PTRACE_SEIZE` fails with EPERM, EACCES or ENOSYS, and the test returns early and says so.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+fn the_teardown_removes_the_profile_only_after_every_thread_of_a_killed_process_has_exited() {
+    if let Some(dir) = std::env::var_os(HELD_THREAD_CHILD) {
+        hold_two_threads_in(std::path::Path::new(&dir));
+    }
+    let path = tempfile::Builder::new()
+        .prefix("crawlberg-held-thread-test-")
+        .tempdir()
+        .expect("the directory must be creatable")
+        .keep();
+    let mut child = std::process::Command::new(std::env::current_exe().expect("the test binary must be readable"))
+        .args([
+            "the_teardown_removes_the_profile_only_after_every_thread_of_a_killed_process_has_exited",
+            "--",
+            &user_data_dir_flag(&path),
+        ])
+        .env(HELD_THREAD_CHILD, &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the test binary must start");
+    let ready = path.join("ready");
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "the child must start its second thread");
+    let chrome = chrome_started_by(child.id(), &path).expect("the child's executable must be readable");
+    let pid = libc::pid_t::try_from(child.id()).expect("the pid must fit a pid_t");
+    let second = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("the child's threads must be readable")
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .find(|&tid| tid != pid)
+        .expect("the child must run a second thread");
+    let held = match HeldThread::seize(second) {
+        Ok(held) => held,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EPERM | libc::EACCES | libc::ENOSYS)) => {
+            eprintln!("skipping: the kernel refuses to trace a thread of this test's child: {error}");
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&path);
+            return;
+        }
+        Err(error) => panic!("tracing the child's second thread must work: {error}"),
+    };
+
+    let started = std::time::Instant::now();
+    let teardown = {
+        let dir = path.clone();
+        std::thread::spawn(move || {
+            drop(ProfileTeardown {
+                owner: std::process::id(),
+                dir,
+                launched: None,
+                tree: None,
+                chrome: Some(chrome),
+                turn: ProfileTurn::default(),
+            })
+        })
+    };
+    let held_at_exit = held.stopped_at_exit();
+    std::thread::sleep(Duration::from_secs(1));
+    let returned_while_held = teardown.is_finished();
+    let removed_while_held = !path.exists();
+    drop(held);
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while !teardown.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let elapsed = started.elapsed();
+    let returned = teardown.is_finished();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        held_at_exit,
+        "the teardown must kill the child, which stops the traced thread at its exit"
+    );
+    assert!(
+        !returned_while_held && !removed_while_held,
+        "the teardown must wait while a thread of the killed process has not exited: returned {returned_while_held}, removed {removed_while_held}"
+    );
+    assert!(
+        returned && elapsed < PROFILE_USERS_EXIT_TIMEOUT,
+        "the teardown must return once the released thread has exited, before its deadline: took {elapsed:?}"
+    );
+    assert!(
+        !path.exists(),
+        "the teardown must remove the directory: {}",
+        path.display()
+    );
+}
+
+/// A profile directory dropped outside a Tokio runtime is torn down on another thread, so a host's
+/// finalizer thread that drops the last owner is not held for up to the five-second wait.
+#[test]
+fn a_profile_directory_dropped_outside_a_runtime_is_torn_down_on_another_thread() {
+    let dir = ScratchProfileDir::create("crawlberg-no-runtime-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let before = profile_drops_here();
+
+    drop(dir);
+
+    assert_profile_teardown_left_this_thread(before);
+    assert!(wait_for_removal(&path), "the directory must be removed");
+}
+
+/// The wait for killed processes to exit gives up once its timeout passes.
+///
+/// ~keep A user this process cannot kill, such as another account's process naming the flag, would
+/// ~keep otherwise hold the teardown forever.
+#[test]
+fn stopping_gives_up_on_a_user_that_never_exits_once_its_timeout_passes() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(kill_until_gone(Duration::from_millis(100), || true));
+    });
+    let stopped = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the wait must end once its timeout passes");
+    assert!(!stopped, "a user that never exits must be reported as still running");
+}
+
+/// The flag counts only as a whole token of the command line, bounded by a space or an end.
+#[test]
+fn a_command_line_names_the_flag_only_as_a_whole_token() {
+    let flag = "--user-data-dir=/tmp/crawlberg-chrome-a1";
+    let names = |arguments: &[&str]| {
+        let cmd: Vec<std::ffi::OsString> = arguments.iter().map(std::ffi::OsString::from).collect();
+        command_line_names(&cmd, flag)
+    };
+    assert!(names(&[flag]), "the flag alone");
+    assert!(names(&["/opt/chrome", flag, "--headless"]), "the flag as one argument");
+    assert!(
+        names(&["/opt/chrome --type=renderer --user-data-dir=/tmp/crawlberg-chrome-a1 --lang=en"]),
+        "the flag inside Chrome's space-joined process title"
+    );
+    for other in [
+        format!("{flag}-other"),
+        format!("{flag}/Default"),
+        format!("x{flag}"),
+        format!("--no{flag}"),
+        "/tmp/crawlberg-chrome-a1".to_owned(),
+    ] {
+        assert!(!names(&["/opt/chrome", &other]), "{other:?} must not name the flag");
+    }
+}
+
+/// Start `sh` blocked on its stdin with `argument` on its command line, and wait until a scan
+/// of the process table sees it there.
+#[cfg(unix)]
+pub(crate) fn spawn_bystander(argument: &str) -> std::process::Child {
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("read _")
+        .arg(argument)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must start");
+    let mut system = sysinfo::System::new();
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while processes_naming(&mut system, argument).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !processes_naming(&mut system, argument).is_empty(),
+        "the bystander must show {argument:?} on its command line"
+    );
+    child
+}
+
+/// Dropping a profile directory stops the Chrome launched on it and leaves running a process that
+/// is not Chrome, even one that carries the exact flag as an argument of its own, as a shell,
+/// `strace` or `grep` can.
+///
+/// ~keep A `cat` blocked on its stdin stands in for the Chrome launched on the directory, with the
+/// ~keep flag as an operand it never reaches. It lies in the same directory as the bystander's `sh`,
+/// ~keep as a launcher such as `/usr/bin/snap` lies beside shells, so only the executable itself
+/// ~keep tells the two apart.
+#[cfg(unix)]
+#[test]
+fn dropping_a_profile_directory_leaves_a_process_that_is_not_chrome_running() {
+    let mut dir =
+        ScratchProfileDir::create("crawlberg-profile-bystander-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let flag = user_data_dir_flag(&path);
+    let mut chrome = std::process::Command::new("cat")
+        .args(["--", "-", &flag])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cat must start");
+    let mut bystander = spawn_bystander(&flag);
+    dir.record_chrome(chrome.id());
+
+    drop(dir);
+    let removed = wait_for_removal(&path);
+
+    let stopped = chrome.try_wait().expect("the status must be readable").is_some();
+    let running = bystander.try_wait().expect("the status must be readable").is_none();
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+    let _ = chrome.kill();
+    let _ = chrome.wait();
+    assert!(removed, "the directory must be removed");
+    assert!(stopped, "the Chrome launched on the directory must be killed");
+    assert!(running, "a process that is not Chrome must not be killed");
+}
+
+/// A pid from the scan that now names a process without the flag, as a pid reused since the scan
+/// does, is not killed.
+///
+/// ~keep `/` holds every executable, so only the check of the command line spares the process.
+#[cfg(unix)]
+#[test]
+fn a_scanned_pid_whose_process_no_longer_names_the_profile_is_not_killed() {
+    let dir = tempfile::tempdir().expect("the directory must be creatable");
+    let mut other = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cat must start");
+
+    kill_if_chrome_using(
+        sysinfo::Pid::from_u32(other.id()),
+        &user_data_dir_flag(dir.path()),
+        std::path::Path::new("/"),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+
+    let exited = other.try_wait().expect("the status must be readable");
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(
+        exited.is_none(),
+        "a process that does not name the profile must not be killed: pid {} ended with {exited:?}",
+        other.id()
+    );
+}
+
+/// How many times a forced-reuse test repeats its whole scenario before it gives up.
+///
+/// ~keep `ns_last_pid` is one setting for the whole pid namespace, so any process that forks between
+/// ~keep the write and the test's own fork takes the freed pid first, and the test's process lands on
+/// ~keep another one. Nothing in a test can stop an unrelated fork, so each test detects a miss,
+/// ~keep cleans up and repeats the scenario with a fresh scanned process and a fresh pid. The
+/// ~keep assertions run only on an attempt where the pid landed, so the retry does not weaken them.
+#[cfg(target_os = "linux")]
+const PID_REUSE_ATTEMPTS: usize = 50;
+
+/// What happened when a test tried to start a new process on a freed pid.
+#[cfg(target_os = "linux")]
+enum PidReuse {
+    /// Writing `ns_last_pid` needs root, and the test does not have it.
+    NotRoot,
+    /// The new process runs on the freed pid.
+    Landed(std::process::Child),
+    /// Another fork took the pid first; the new process runs on a different one.
+    Missed(std::process::Child),
+}
+
+/// Point `ns_last_pid` just below `pid`, which must be free, and start a `cat` on it.
+#[cfg(target_os = "linux")]
+fn spawn_on_pid(pid: u32) -> PidReuse {
+    if std::fs::write("/proc/sys/kernel/ns_last_pid", (pid - 1).to_string()).is_err() {
+        return PidReuse::NotRoot;
+    }
+    let child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cat must start");
+    if child.id() == pid {
+        PidReuse::Landed(child)
+    } else {
+        PidReuse::Missed(child)
+    }
+}
+
+/// Kill and reap a process the test started.
+#[cfg(target_os = "linux")]
+fn stop(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Start a `cat` that names `flag`, and return it with its executable and the pids a scan for
+/// `flag` finds running that executable.
+#[cfg(target_os = "linux")]
+fn spawn_scanned(dir: &std::path::Path, flag: &str) -> (std::process::Child, std::path::PathBuf, Vec<sysinfo::Pid>) {
+    let scanned = std::process::Command::new("cat")
+        .args(["--", "-", flag])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cat must start");
+    let chrome = chrome_started_by(scanned.id(), dir).expect("the scanned process's executable must be readable");
+    let mut system = sysinfo::System::new();
+    let users: Vec<_> = processes_naming(&mut system, flag)
+        .into_iter()
+        .filter(|process| runs(process, &chrome))
+        .map(sysinfo::Process::pid)
+        .collect();
+    assert_eq!(
+        users,
+        [sysinfo::Pid::from_u32(scanned.id())],
+        "the scan must find the process"
+    );
+    (scanned, chrome, users)
+}
+
+/// A pid reused between the scan and the kill is not killed.
+///
+/// ~keep Forces the reuse as the review did: the scanned process exits and is reaped, then
+/// ~keep `ns_last_pid` hands its pid to a new process. Writing `ns_last_pid` needs root, so the test
+/// ~keep returns early without it, and says so. See [`PID_REUSE_ATTEMPTS`] for why it repeats.
+/// ~keep It shares the `process_table` serial key with the test below only: each rewinds
+/// ~keep `ns_last_pid`, and two rewinds at once make each other miss the freed pid.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial_test::serial(process_table)]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+fn a_pid_reused_between_the_scan_and_the_kill_is_not_killed() {
+    let dir = tempfile::tempdir().expect("the directory must be creatable");
+    let flag = user_data_dir_flag(dir.path());
+    for _ in 0..PID_REUSE_ATTEMPTS {
+        let (scanned, chrome, users) = spawn_scanned(dir.path(), &flag);
+        let pid = scanned.id();
+        stop(scanned);
+        let mut reused = match spawn_on_pid(pid) {
+            PidReuse::NotRoot => {
+                eprintln!("skipping: choosing the next pid needs root");
+                return;
+            }
+            PidReuse::Missed(other) => {
+                stop(other);
+                continue;
+            }
+            PidReuse::Landed(reused) => reused,
+        };
+
+        for &user in &users {
+            kill_if_chrome_using(user, &flag, &chrome);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        let running = reused.try_wait().expect("the status must be readable").is_none();
+        stop(reused);
+        assert!(running, "the process that reused the pid must not be killed");
+        return;
+    }
+    panic!(
+        "the new process must reuse the scanned pid: other forks took it first in all {PID_REUSE_ATTEMPTS} attempts"
+    );
+}
+
+/// A pid reused between the re-check and the kill, inside [`kill_if_chrome_using`], is not killed.
+///
+/// ~keep The forced-reuse test above reuses the pid before `kill_if_chrome_using` runs, so its own
+/// ~keep re-check catches the reuse and nothing reaches the gap between the re-check and the kill: a
+/// ~keep pidfd protects against reuse in that exact gap, and nothing else does. This test installs
+/// ~keep the [`REUSE_WINDOW_HOOK`] the production code fires right there, and inside it reaps the
+/// ~keep scanned process and forces its pid onto a new, innocent one, so the reuse lands after the
+/// ~keep re-check has already passed. Root, like the test above; returns early without it, and says so.
+/// ~keep Repeats on a miss like the test above, and shares its `process_table` serial key for the
+/// ~keep same reason.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial_test::serial(process_table)]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+fn a_pid_reused_between_the_recheck_and_the_kill_is_not_killed() {
+    let dir = tempfile::tempdir().expect("the directory must be creatable");
+    let flag = user_data_dir_flag(dir.path());
+    for _ in 0..PID_REUSE_ATTEMPTS {
+        let (scanned, chrome, users) = spawn_scanned(dir.path(), &flag);
+        let pid = scanned.id();
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None::<PidReuse>));
+        {
+            let outcome = outcome.clone();
+            REUSE_WINDOW_HOOK.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move || {
+                    stop(scanned);
+                    *outcome.borrow_mut() = Some(spawn_on_pid(pid));
+                }));
+            });
+        }
+
+        for &user in &users {
+            kill_if_chrome_using(user, &flag, &chrome);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        let outcome = outcome.borrow_mut().take();
+        let mut innocent = match outcome.expect("the hook must run and spawn the innocent process") {
+            PidReuse::NotRoot => {
+                eprintln!("skipping: choosing the next pid needs root");
+                return;
+            }
+            PidReuse::Missed(other) => {
+                stop(other);
+                continue;
+            }
+            PidReuse::Landed(innocent) => innocent,
+        };
+        let running = innocent.try_wait().expect("the status must be readable").is_none();
+        stop(innocent);
+        assert!(running, "the process that reused the pid must not be killed");
+        return;
+    }
+    panic!(
+        "the new process must reuse the scanned pid: other forks took it first in all {PID_REUSE_ATTEMPTS} attempts"
+    );
+}
+
+/// Removing the profile directory of a Chrome that is still running stops that Chrome first.
+///
+/// ~keep A real Chrome, because Chrome rewrites the command line of each of its processes into
+/// ~keep one space-joined string, which a stand-in started with separate arguments does not do, and
+/// ~keep because its helpers must run the executable the launch reads from the process tree.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn removing_a_running_chromes_profile_directory_stops_that_chrome() {
+    const TEST_NAME: &str = "removing_a_running_chromes_profile_directory_stops_that_chrome";
+    let dir =
+        ScratchProfileDir::create("crawlberg-running-chrome-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let Some(config) = expect_chrome_or_skip(
+        TEST_NAME,
+        build_pool_launch_builder(&path, &BrowserPoolConfig::default())
+            .expect("the default pool config names no binary to check")
+            .build(),
+    ) else {
+        return;
+    };
+    let (browser, handler, dir) = expect_chrome_or_skip(TEST_NAME, dir.launch(config).await)
+        .expect("the detected Chrome launch either succeeds or panics");
+    assert_dropping_the_profile_stops_its_chrome(browser, handler, dir, path).await;
+}
+
+/// Drop `profile`, the profile directory of the running Chrome `browser` at `path`, and assert
+/// that the drop stops that Chrome and removes the directory for good.
+///
+/// ~keep The browser's exit is read from its own handle, not from the process scan under test.
+pub(crate) async fn assert_dropping_the_profile_stops_its_chrome<P>(
+    mut browser: Browser,
+    handler: Handler,
+    profile: P,
+    path: std::path::PathBuf,
+) {
+    let handler_handle = spawn_handler(handler);
+
+    drop(profile);
+    let deadline = tokio::time::Instant::now() + PROCESS_TEST_WAIT;
+    let mut exited = browser.try_wait().expect("the browser's status must be readable");
+    while exited.is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        exited = browser.try_wait().expect("the browser's status must be readable");
+    }
+    if exited.is_none() {
+        let _ = browser.kill().await;
+    }
+    handler_handle.abort();
+    assert!(
+        exited.is_some(),
+        "dropping the profile directory must stop the Chrome still using it"
+    );
+    tokio::task::spawn_blocking(move || assert_profile_directory_is_gone_for_good(&path))
+        .await
+        .expect("no Chrome may use or recreate the profile directory after it is removed");
+}
+
+/// Write an executable `sh` script at `path` that runs `chrome` with its own arguments, through
+/// `exec` or as a child of the script.
+#[cfg(unix)]
+fn write_launcher(path: &std::path::Path, chrome: &std::path::Path, exec: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let run = if exec { "exec " } else { "" };
+    std::fs::write(path, format!("#!/bin/sh\n{run}'{}' \"$@\"\n", chrome.display()))
+        .expect("the launcher must be writable");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("the launcher must be executable");
+}
+
+/// Dropping a running Chrome's profile directory stops that Chrome and leaves a shell naming the
+/// directory running, whether the launched executable is Chrome's own launcher, a script that
+/// `exec`s Chrome, or a script that runs Chrome as its child.
+///
+/// ~keep With the third launcher the process crawlberg starts is `sh`, not Chrome, and the
+/// ~keep bystander runs that same `sh`, so the executable of the launched process tells nothing.
+/// ~keep The launched process is `sh` and ends on its own once its Chrome child is killed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_profile_teardown_stops_the_launched_chrome_and_no_bystander_whatever_the_launcher() {
+    let detection = chromiumoxide::detection::DetectionOptions {
+        msedge: false,
+        unstable: false,
+    };
+    let chrome = match std::env::var_os("CRAWLBERG_TEST_CHROME_PATH") {
+        Some(path) => path.into(),
+        None => match chromiumoxide::detection::default_executable(detection) {
+            Ok(chrome) => chrome,
+            Err(error) => {
+                eprintln!("skipping: no usable Chrome: {error}");
+                return;
+            }
+        },
+    };
+    let scripts = tempfile::tempdir().expect("the launcher directory must be creatable");
+    let exec_launcher = scripts.path().join("exec-chrome");
+    let child_launcher = scripts.path().join("child-chrome");
+    write_launcher(&exec_launcher, &chrome, true);
+    write_launcher(&child_launcher, &chrome, false);
+
+    for launcher in [chrome.clone(), exec_launcher, child_launcher] {
+        let dir = ScratchProfileDir::create("crawlberg-launcher-test-", None).expect("the directory must be creatable");
+        let path = dir.path().to_path_buf();
+        let config = build_pool_launch_builder(&path, &BrowserPoolConfig::default())
+            .expect("the default pool config names no binary to check")
+            .chrome_executable(&launcher)
+            .build()
+            .expect("a config naming its executable must build");
+        let (mut browser, handler, dir) = match dir.launch(config).await {
+            Ok(launched) => launched,
+            Err(error) => panic!(
+                "{} must launch as {} did: {error}",
+                launcher.display(),
+                chrome.display()
+            ),
+        };
+        let handler_handle = spawn_handler(handler);
+        let mut bystander = spawn_bystander(&user_data_dir_flag(&path));
+
+        drop(dir);
+        let deadline = tokio::time::Instant::now() + PROCESS_TEST_WAIT;
+        let mut exited = browser
+            .try_wait()
+            .expect("the launched process's status must be readable");
+        while exited.is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            exited = browser
+                .try_wait()
+                .expect("the launched process's status must be readable");
+        }
+        let running = bystander.try_wait().expect("the status must be readable").is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        let check = path.clone();
+        let gone = tokio::task::spawn_blocking(move || assert_profile_directory_is_gone_for_good(&check)).await;
+        if exited.is_none() {
+            let _ = browser.kill().await;
+        }
+        handler_handle.abort();
+        let flag = user_data_dir_flag(&path);
+        let mut system = sysinfo::System::new();
+        let left: Vec<_> = processes_naming(&mut system, &flag)
+            .iter()
+            .filter_map(|process| Some((process.pid(), process.exe()?.to_path_buf())))
+            .collect();
+        for (pid, executable) in left {
+            kill_if_chrome_using(pid, &flag, &executable);
+        }
+        let _ = std::fs::remove_dir_all(&path);
+
+        let launcher = launcher.display();
+        assert!(
+            running,
+            "{launcher}: a shell naming the profile directory must not be killed"
+        );
+        assert!(
+            exited.is_some(),
+            "{launcher}: the teardown must stop the Chrome it launched"
+        );
+        if let Err(error) = gone {
+            let panic = error.into_panic();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("the removal check panicked");
+            panic!("{launcher}: {message}");
+        }
+    }
+}
+
+/// A pool dropped without `shutdown` removes the profile directory of the Chrome it launched,
+/// off the thread that dropped it.
+///
+/// ~keep Tests and embedders drop pools without shutting them down, and each such drop left one
+/// ~keep `crawlberg-chrome-*` directory in the temp directory (xberg-io/crawlberg#415).
+#[tokio::test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_pool_dropped_without_shutdown_leaves_no_profile_directory() {
+    const TEST_NAME: &str = "a_pool_dropped_without_shutdown_leaves_no_profile_directory";
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let path = pool_profile_dir(&pool).await;
+
+    let before = profile_drops_here();
+    drop(pool);
+    assert_profile_teardown_left_this_thread(before);
+
+    tokio::task::spawn_blocking(move || assert_profile_directory_is_gone_for_good(&path))
+        .await
+        .expect("a pool dropped without shutdown must stop its Chrome and remove its profile directory");
+}
+
+/// A pool dropped without shutdown stops every process of its Chrome before it removes the
+/// profile directory, also a helper that cannot end by itself and that a scan for the
+/// directory's flag does not find.
+///
+/// ~keep The helper is stopped with a signal first, as a helper that the host gives no time is.
+/// ~keep The driver killed the main process when the browser handle dropped, and the teardown then
+/// ~keep looked for the directory's flag. The helpers of the Chromium headless shell do not carry
+/// ~keep it, so nothing killed one or waited for it, and under load it wrote into the directory
+/// ~keep after the removal (xberg-io/crawlberg#594: 6 of 40 runs at loads over 110). The test
+/// ~keep prefers a helper without the flag; a Chrome whose helpers all carry it shows nothing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_dropped_pool_stops_a_stopped_helper_before_it_removes_the_profile_directory() {
+    const TEST_NAME: &str = "a_dropped_pool_stops_a_stopped_helper_before_it_removes_the_profile_directory";
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let path = pool_profile_dir(&pool).await;
+    let flag = user_data_dir_flag(&path);
+    let mut system = System::new();
+    let main = processes_naming(&mut system, &flag)
+        .into_iter()
+        .find(|process| {
+            !process
+                .cmd()
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("--type="))
+        })
+        .map(Process::pid)
+        .expect("the pool's Chrome must have a main process");
+    // ~keep The helpers are every process below the main one. `system` holds the whole table,
+    // ~keep with command lines, from the scan above.
+    let mut helpers = vec![main];
+    let mut next = 0;
+    while next < helpers.len() {
+        let parent = helpers[next];
+        helpers.extend(
+            system
+                .processes()
+                .values()
+                .filter(|process| process.parent() == Some(parent))
+                .map(Process::pid),
+        );
+        next += 1;
+    }
+    helpers.remove(0);
+    let helper = helpers
+        .iter()
+        .copied()
+        .find(|helper| system.process(*helper).is_some_and(|process| !names(process, &flag)))
+        .or_else(|| helpers.first().copied())
+        .expect("the pool's Chrome must have a helper process");
+    let helper_named = system.process(helper).is_some_and(|process| names(process, &flag));
+    let stopped = system
+        .process(helper)
+        .and_then(|process| process.kill_with(Signal::Stop))
+        .unwrap_or(false);
+
+    drop(pool);
+
+    let (removed, helper_left) = tokio::task::spawn_blocking(move || {
+        let removed = wait_for_removal(&path);
+        (
+            removed,
+            ChromeFamily::running(&[helper], |_| {}) + stopped_count(helper),
+        )
+    })
+    .await
+    .expect("the wait for the removal must not panic");
+    let mut system = System::new();
+    ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[helper]));
+    if let Some(process) = system.process(helper) {
+        process.kill();
+    }
+    assert!(
+        stopped,
+        "the helper must take the stop signal, or the test shows nothing"
+    );
+    assert!(removed, "the dropped pool must remove its profile directory");
+    assert_eq!(
+        helper_left, 0,
+        "the helper must have ended when the profile directory is removed (it named the directory: {helper_named})"
+    );
+}
+
+/// 1 when the process `pid` is in the table and stopped by a signal, else 0.
+#[cfg(unix)]
+fn stopped_count(pid: Pid) -> usize {
+    let mut system = System::new();
+    ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[pid]));
+    usize::from(
+        system
+            .process(pid)
+            .is_some_and(|process| process.status() == ProcessStatus::Stop),
+    )
+}
+
+/// The profile directory of the Chrome `pool` runs, which must exist and be the one that Chrome
+/// uses.
+pub(crate) async fn pool_profile_dir(pool: &BrowserPool) -> std::path::PathBuf {
+    let path = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|state| state.user_data_dir.as_ref())
+        .map(|dir| dir.path().to_path_buf())
+        .expect("a launched pool must own a profile directory");
+    assert!(path.is_dir(), "the profile directory must exist while Chrome runs");
+    assert!(
+        !processes_naming(&mut sysinfo::System::new(), &user_data_dir_flag(&path)).is_empty(),
+        "the pool's Chrome must run on the profile directory the pool owns: {}",
+        path.display()
+    );
+    path
+}
+
+pub(crate) fn chrome_process_count_for_profile(path: &std::path::Path) -> usize {
+    processes_naming(&mut sysinfo::System::new(), &user_data_dir_flag(path)).len()
+}
+
+/// A profile directory is listed for the exit hook from its creation until its teardown has
+/// finished, and the hook of another process, such as a forked child, leaves it alone.
+#[test]
+fn a_profile_directory_is_listed_for_its_own_process_until_it_is_torn_down() {
+    let listed_for = |owner: u32, path: &std::path::Path| {
+        let teardowns = live_profile_teardowns_of(&live_profiles(), owner);
+        let listed = teardowns.iter().any(|teardown| teardown.dir == path);
+        // ~keep Forgotten, not dropped: a drop would tear down every live profile of this process.
+        teardowns.into_iter().for_each(std::mem::forget);
+        listed
+    };
+    let dir =
+        ScratchProfileDir::create("crawlberg-listed-profile-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let this_process = std::process::id();
+
+    assert!(
+        listed_for(this_process, &path),
+        "a live profile directory must be listed for the process that created it"
+    );
+    assert!(
+        !listed_for(this_process.wrapping_add(1), &path),
+        "a profile directory must not be listed for another process"
+    );
+
+    drop(dir);
+    assert!(wait_for_removal(&path), "the dropped directory must be removed");
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while listed_for(this_process, &path) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !listed_for(this_process, &path),
+        "a profile directory that was torn down must no longer be listed"
+    );
+}
+
+/// The teardown that the exit hook makes from the list stops the Chrome that a finished launch
+/// recorded on the directory, and removes the directory.
+///
+/// ~keep A `cat` blocked on its stdin stands in for the Chrome, as in
+/// ~keep `dropping_a_profile_directory_leaves_a_process_that_is_not_chrome_running`.
+#[cfg(unix)]
+#[test]
+fn the_teardown_made_from_the_list_stops_the_recorded_chrome() {
+    let mut dir =
+        ScratchProfileDir::create("crawlberg-listed-chrome-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let mut chrome = std::process::Command::new("cat")
+        .args(["--", "-", &user_data_dir_flag(&path)])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cat must start");
+    // ~keep The process table shows the stand-in's command line a moment after the spawn returns.
+    let flag = user_data_dir_flag(&path);
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while processes_naming(&mut sysinfo::System::new(), &flag).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    dir.record_chrome(chrome.id());
+    let recorded = live_profiles()
+        .get(&path)
+        .is_some_and(|profile| profile.chrome.is_some());
+
+    let (taken, others): (Vec<_>, Vec<_>) = live_profile_teardowns_of(&live_profiles(), std::process::id())
+        .into_iter()
+        .partition(|teardown| teardown.dir == path);
+    // ~keep Forgotten, not dropped: a drop would tear down every live profile of this process.
+    others.into_iter().for_each(std::mem::forget);
+    let taken_count = taken.len();
+    drop(taken);
+
+    let stopped = chrome.try_wait().expect("the status must be readable").is_some();
+    let removed = !path.exists();
+    let _ = chrome.kill();
+    let _ = chrome.wait();
+    assert!(recorded, "the list must hold the stand-in as the directory's Chrome");
+    assert_eq!(taken_count, 1, "the listed directory must get one teardown");
+    assert!(
+        stopped,
+        "the recorded Chrome must be killed by the teardown made from the list"
+    );
+    assert!(removed, "the teardown made from the list must remove the directory");
+}
+
+/// A second teardown of a profile directory, as the exit hook makes one from the list, starts only
+/// when the teardown that already runs has finished.
+#[test]
+fn a_second_teardown_of_a_profile_directory_waits_for_the_first() {
+    assert_a_second_teardown_waits_while_the_first_holds_the_turn(Duration::from_millis(300));
+}
+
+/// A second teardown still waits when the first has held the turn for most of the time it may
+/// spend waiting for its Chrome processes to end.
+///
+/// ~keep A second teardown that gave up sooner removed the directory under the first.
+#[test]
+fn a_second_teardown_waits_for_as_long_as_the_first_may_wait_for_its_processes() {
+    assert_a_second_teardown_waits_while_the_first_holds_the_turn(PROFILE_USERS_EXIT_TIMEOUT - Duration::from_secs(1));
+}
+
+/// Hold the turn of a new profile directory for `held_for`, as a running teardown does, with a
+/// second teardown of the directory started beside it.
+fn assert_a_second_teardown_waits_while_the_first_holds_the_turn(held_for: Duration) {
+    let dir =
+        ScratchProfileDir::create("crawlberg-teardown-turn-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let turn = live_profiles()
+        .get(&path)
+        .map(|profile| Arc::clone(&profile.turn))
+        .expect("the directory must be listed");
+    // ~keep The test holds the turn, as a running teardown does.
+    let first = turn.lock().expect("nothing else holds the turn");
+    let (taken, others): (Vec<_>, Vec<_>) = live_profile_teardowns_of(&live_profiles(), std::process::id())
+        .into_iter()
+        .partition(|teardown| teardown.dir == path);
+    // ~keep Forgotten, not dropped: a drop would tear down every live profile of this process.
+    others.into_iter().for_each(std::mem::forget);
+    let taken_count = taken.len();
+    let second = std::thread::spawn(move || drop(taken));
+    std::thread::sleep(held_for);
+    let removed_while_held = !path.exists();
+    drop(first);
+    let removed_after = wait_for_removal(&path);
+    let joined = second.join().is_ok();
+    assert_eq!(taken_count, 1, "the listed directory must get one teardown");
+    assert!(
+        !removed_while_held,
+        "the second teardown must not remove the directory while the first holds the turn ({held_for:?})"
+    );
+    assert!(
+        removed_after && joined,
+        "the second teardown must run once the turn is free"
+    );
+}
+
+/// The teardown tries the removal of its directory again when an attempt fails, and removes the
+/// directory once the cause of the failure is gone.
+///
+/// ~keep The parent of the directory refuses writes for a short time, so the first attempts fail
+/// ~keep with a permission error. On Windows a file that an ended process still holds fails them.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+fn the_teardown_tries_the_removal_again_until_the_directory_can_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::Builder::new()
+        .prefix("crawlberg-removal-retry-test-")
+        .tempdir()
+        .expect("the parent directory must be creatable");
+    let path = parent.path().join("profile");
+    let probe = parent.path().join("probe");
+    std::fs::create_dir_all(path.join("Default")).expect("the profile directory must be creatable");
+    std::fs::create_dir(&probe).expect("the probe directory must be creatable");
+    let set_mode = |mode| std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(mode));
+    set_mode(0o500).expect("the parent's permissions must be settable");
+    if std::fs::remove_dir(&probe).is_ok() {
+        let _ = set_mode(0o700);
+        eprintln!("skipping: this user removes an entry of a directory that refuses writes, so no removal fails");
+        return;
+    }
+    let (begin, begun) = std::sync::mpsc::channel::<()>();
+    let allowed = Arc::new(AtomicBool::new(false));
+    let allow = {
+        let parent = parent.path().to_path_buf();
+        let allowed = Arc::clone(&allowed);
+        std::thread::spawn(move || {
+            let _ = begun.recv();
+            std::thread::sleep(Duration::from_millis(300));
+            allowed.store(true, Ordering::Release);
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        })
+    };
+
+    let started = std::time::Instant::now();
+    let _ = begin.send(());
+    // ~keep Dropped here, not handed to a thread: the teardown has finished when the drop returns.
+    drop(ProfileTeardown {
+        owner: std::process::id(),
+        dir: path.clone(),
+        launched: None,
+        tree: None,
+        chrome: None,
+        turn: ProfileTurn::default(),
+    });
+    let elapsed = started.elapsed();
+    let returned_after_the_cause_went = allowed.load(Ordering::Acquire);
+    let restored = allow.join().is_ok_and(|set| set.is_ok());
+    let _ = set_mode(0o700);
+
+    assert!(restored, "the parent's permissions must be restored");
+    assert!(
+        returned_after_the_cause_went,
+        "the teardown must go on trying while the removal fails: it returned after {elapsed:?}"
+    );
+    assert!(
+        !path.exists(),
+        "the teardown must remove the directory once the removal can succeed: {}",
+        what_is_left(&path)
+    );
+}
+
+/// The teardown that the exit hook makes from the list during a launch stops every process below
+/// the launched one, also one whose command line does not name the directory.
+///
+/// ~keep A shell that names the directory stands in for the launched Chrome, and its `sleep` for a
+/// ~keep helper that a scan for the directory's flag does not see: a Chrome helper that is
+/// ~keep replacing its program shows an empty command line.
+#[cfg(unix)]
+#[test]
+fn a_teardown_during_a_launch_stops_a_helper_that_does_not_name_the_directory() {
+    let dir =
+        ScratchProfileDir::create("crawlberg-launching-helper-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let mut launcher = std::process::Command::new("sh")
+        .args(["-c", "sleep 60 & wait", "sh", &user_data_dir_flag(&path)])
+        .spawn()
+        .expect("sh must start");
+    let helper_of = |parent: u32| {
+        let mut system = System::new();
+        ChromeFamily::refresh(&mut system, ProcessesToUpdate::All);
+        system
+            .processes()
+            .values()
+            .find(|process| process.parent() == Some(Pid::from_u32(parent)))
+            .map(Process::pid)
+    };
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    let mut helper = helper_of(launcher.id());
+    while helper.is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        helper = helper_of(launcher.id());
+    }
+    let helper_ran = helper.is_some_and(|helper| ChromeFamily::running(&[helper], |_| {}) == 1);
+    if let Some(profile) = live_profiles().get_mut(&path) {
+        profile.launched = LaunchedProcess::of(launcher.id());
+    }
+
+    let (taken, others): (Vec<_>, Vec<_>) = live_profile_teardowns_of(&live_profiles(), std::process::id())
+        .into_iter()
+        .partition(|teardown| teardown.dir == path);
+    // ~keep Forgotten, not dropped: a drop would tear down every live profile of this process.
+    others.into_iter().for_each(std::mem::forget);
+    let taken_count = taken.len();
+    drop(taken);
+
+    // ~keep macOS can report the killed process as gone before waitpid publishes its exit status.
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    let launcher_stopped = loop {
+        if launcher.try_wait().expect("the status must be readable").is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let helper_left = helper.map_or(0, |helper| ChromeFamily::running(&[helper], |_| {}));
+    let removed = !path.exists();
+    if let Some(helper) = helper {
+        let mut system = System::new();
+        ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[helper]));
+        if let Some(process) = system.process(helper) {
+            process.kill();
+        }
+    }
+    let _ = launcher.kill();
+    let _ = launcher.wait();
+    assert!(
+        helper_ran,
+        "the stand-in launcher must have a running child before the teardown, or the test shows nothing"
+    );
+    assert_eq!(taken_count, 1, "the listed directory must get one teardown");
+    assert!(
+        launcher_stopped,
+        "the launched process must be killed by the teardown made from the list"
+    );
+    assert_eq!(
+        helper_left, 0,
+        "the launched process's child, which does not name the directory, must be killed too"
+    );
+    assert!(removed, "the teardown made from the list must remove the directory");
+}
+
+/// Wait until this process lists a profile directory, and return it. A launch creates the directory
+/// before it starts its Chrome.
+#[cfg_attr(
+    not(feature = "browser"),
+    expect(dead_code, reason = "the binding exit tests require the browser feature")
+)]
+pub(crate) fn a_listed_profile() -> std::path::PathBuf {
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    loop {
+        if let Some(dir) = live_profiles().keys().next() {
+            return dir.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "no profile directory was listed");
+        std::thread::yield_now();
+    }
+}
+
+/// Wait until a launch has started a process on a listed profile directory and has not recorded
+/// its Chrome yet, and return that directory.
+///
+/// ~keep The list is asked first: it learns the process under its lock as the process starts, so
+/// ~keep the whole launch is seen. The wait sampled the process table before, and on a loaded
+/// ~keep host it missed the launch of the headless shell (1 of 20 runs).
+/// ~keep The table is read only once a directory has been listed for two seconds with no
+/// ~keep process, so the wait also ends when the list never learns the process.
+#[cfg_attr(
+    not(feature = "browser"),
+    expect(dead_code, reason = "the binding exit tests require the browser feature")
+)]
+pub(crate) fn a_profile_whose_chrome_is_launching() -> std::path::PathBuf {
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    let mut system = sysinfo::System::new();
+    let mut unrecorded_since = None;
+    loop {
+        let (launching, unrecorded): (Vec<_>, Vec<_>) = live_profiles()
+            .iter()
+            .filter(|(_, profile)| profile.chrome.is_none())
+            .map(|(dir, profile)| (dir.clone(), profile.launched.is_some()))
+            .partition(|(_, launched)| *launched);
+        if let Some((dir, _)) = launching.into_iter().next() {
+            return dir;
+        }
+        if !unrecorded.is_empty() {
+            let since = *unrecorded_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= Duration::from_secs(2) {
+                let named = unrecorded
+                    .into_iter()
+                    .map(|(dir, _)| dir)
+                    .find(|dir| !processes_naming(&mut system, &user_data_dir_flag(dir)).is_empty());
+                if let Some(dir) = named {
+                    return dir;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no launch was seen between the start of its process and its recorded Chrome"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Lock the list of live profile directories on a thread that never releases it, as a thread
+/// that ended while it held the lock does.
+#[cfg_attr(
+    not(feature = "browser"),
+    expect(dead_code, reason = "the binding exit tests require the browser feature")
+)]
+pub(crate) fn hold_the_live_profile_list_for_good() {
+    let (locked, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _held = live_profiles();
+        let _ = locked.send(());
+        loop {
+            std::thread::park();
+        }
+    });
+    wait.recv_timeout(PROCESS_TEST_WAIT)
+        .expect("the list of live profile directories must be lockable");
+}
+
+/// Kill every process that names `path` as its profile, so a failed assertion leaves none behind.
+#[cfg_attr(
+    not(feature = "browser"),
+    expect(dead_code, reason = "the binding exit tests require the browser feature")
+)]
+pub(crate) fn kill_processes_naming_profile(path: &std::path::Path) {
+    for process in processes_naming(&mut sysinfo::System::new(), &user_data_dir_flag(path)) {
+        process.kill();
+    }
+}
+
+/// The markers before what [`try_a_profile_and_a_launch_after_the_exit_hook`] prints: `refused`,
+/// or `created` and `started`.
+#[cfg(feature = "browser")]
+pub(crate) const AFTER_EXIT_HOOK_CREATE_LINE: &str = "crawlberg-after-exit-hook-create: ";
+#[cfg(feature = "browser")]
+pub(crate) const AFTER_EXIT_HOOK_LAUNCH_LINE: &str = "crawlberg-after-exit-hook-launch: ";
+/// The marker before the outcome of a preference write into the directory listed before the exit:
+/// `refused` or `written`.
+#[cfg(feature = "browser")]
+pub(crate) const AFTER_EXIT_HOOK_WRITE_LINE: &str = "crawlberg-after-exit-hook-write: ";
+
+/// The profile directory, and the launch config for it, that
+/// [`try_a_profile_and_a_launch_after_the_exit_hook`] lists before the process exits.
+#[cfg(feature = "browser")]
+static LISTED_BEFORE_EXIT: std::sync::Mutex<Option<(ScratchProfileDir, BrowserConfig)>> = std::sync::Mutex::new(None);
+
+/// Arrange for this process to try two things after its exit hook has run: to create a profile
+/// directory, and to start a Chrome on a directory that was listed before the exit. It prints
+/// the outcome of each. Returns the directory it listed.
+///
+/// ~keep C runs exit functions in the reverse order of their registration. The function is
+/// ~keep registered here before the first profile directory of the process exists, so it runs
+/// ~keep after crawlberg's hook. Call it before anything else makes a profile directory.
+#[cfg(feature = "browser")]
+#[allow(unsafe_code)]
+#[allow(
+    clippy::print_stdout,
+    reason = "the child reports the two outcomes to its parent on stdout"
+)]
+pub(crate) fn try_a_profile_and_a_launch_after_the_exit_hook() -> std::path::PathBuf {
+    unsafe extern "C" {
+        fn atexit(hook: extern "C" fn()) -> std::ffi::c_int;
+    }
+    extern "C" fn after_the_exit_hook() {
+        let _ = std::panic::catch_unwind(|| {
+            let created = ScratchProfileDir::create("crawlberg-after-exit-hook-test-", None);
+            let outcome = if created.is_ok() { "created" } else { "refused" };
+            println!("{AFTER_EXIT_HOOK_CREATE_LINE}{outcome}");
+            let listed = match LISTED_BEFORE_EXIT.lock() {
+                Ok(mut listed) => listed.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            let Some((dir, config)) = listed else {
+                return;
+            };
+            let outcome = if dir.disable_non_proxied_udp().is_ok() {
+                "written"
+            } else {
+                "refused"
+            };
+            println!("{AFTER_EXIT_HOOK_WRITE_LINE}{outcome}");
+            // ~keep A spawn needs a runtime to watch the child, and none is left at exit. The
+            // ~keep attempt runs on a thread of its own: glibc's `exit` destroys the calling
+            // ~keep thread's thread-local values before it runs the exit functions, and a runtime
+            // ~keep cannot be entered on a thread whose runtime context is destroyed.
+            let (tried, outcome) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+                let _entered = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+                let outcome = match start_listed_chrome(dir.path(), &config) {
+                    Ok((mut child, _)) => {
+                        let _ = child.start_kill();
+                        "started"
+                    }
+                    Err(_) => "refused",
+                };
+                // ~keep Forgotten: its teardown already ran, in crawlberg's hook.
+                std::mem::forget(dir);
+                let _ = tried.send(outcome);
+            });
+            let outcome = outcome.recv_timeout(PROCESS_TEST_WAIT).unwrap_or("not tried");
+            println!("{AFTER_EXIT_HOOK_LAUNCH_LINE}{outcome}");
+        });
+    }
+    // ~keep SAFETY: the declaration matches C's `atexit`, and the function lives as long as this
+    // ~keep test binary, takes no argument and does not unwind.
+    assert_eq!(
+        unsafe { atexit(after_the_exit_hook) },
+        0,
+        "the exit function must be registered"
+    );
+    let dir = ScratchProfileDir::create("crawlberg-after-exit-hook-test-", None)
+        .expect("the directory must be creatable before the exit");
+    let path = dir.path().to_path_buf();
+    let builder = BrowserConfig::builder()
+        .no_sandbox()
+        .new_headless_mode()
+        .user_data_dir(&path);
+    let config = apply_default_args(builder, &[])
+        .build()
+        .expect("a Chrome must be found: the parent launched one");
+    *LISTED_BEFORE_EXIT
+        .lock()
+        .expect("nothing else holds the listed directory") = Some((dir, config));
+    path
+}
+
+/// On Windows a process that the launched one starts at once is in the launch's process tree, so
+/// stopping the tree ends it too.
+///
+/// ~keep The launched process starts suspended and runs only once it is in the job. A child it
+/// ~keep started before that would be outside the job, and the system would not end it with the
+/// ~keep tree. `cmd` stands in for the browser and starts a `ping` as its first act; the address
+/// ~keep is the mark the `ping` is found by.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_process_started_at_once_by_the_launched_one_is_in_its_process_tree() {
+    let mark = format!(
+        "127.77.{}.{}",
+        std::process::id() % 250 + 1,
+        std::process::id() / 250 % 250 + 1
+    );
+    let marked = |system: &mut sysinfo::System| -> Vec<sysinfo::Pid> {
+        processes_naming(system, &mark)
+            .into_iter()
+            .filter(|process| {
+                process
+                    .name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("ping")
+            })
+            .map(sysinfo::Process::pid)
+            .collect()
+    };
+    let mut launcher = chromiumoxide::async_process::Command::new("cmd");
+    launcher
+        .args(["/c", "start", "/b", "ping", "-n", "60", mark.as_str()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = launcher.spawn().expect("cmd must start");
+    let tree = child.tree().cloned();
+    let mut system = sysinfo::System::new();
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    let mut started = marked(&mut system);
+    while started.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        started = marked(&mut system);
+    }
+    let stopped = tree.as_ref().is_some_and(|tree| tree.stop(Duration::from_secs(5)));
+    let left = marked(&mut system);
+    for pid in &left {
+        if let Some(process) = system.process(*pid) {
+            process.kill();
+        }
+    }
+    let _ = child.inner.start_kill();
+    assert!(tree.is_some(), "a launch on Windows must have a process tree");
+    assert!(
+        !started.is_empty(),
+        "the stand-in must have started its ping, or the test shows nothing"
+    );
+    assert!(stopped, "the process tree must stop within five seconds");
+    assert!(
+        left.is_empty(),
+        "the process the launched one started at once must end with the tree: {left:?}"
+    );
+}
+
+/// On Windows the pool's profile directory and its entry in the list of live profile directories
+/// both hold the process tree of the launch, so a teardown from either stops Chrome through the
+/// system and searches for no process.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launched_profile_holds_the_process_tree_of_its_chrome() {
+    const TEST_NAME: &str = "a_launched_profile_holds_the_process_tree_of_its_chrome";
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let path = pool_profile_dir(&pool).await;
+    let listed = live_profiles().get(&path).is_some_and(|profile| profile.tree.is_some());
+    let owned = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|state| state.user_data_dir.as_ref())
+        .is_some_and(|dir| dir.teardown().tree.is_some());
+    pool.shutdown().await;
+    assert!(
+        listed,
+        "the list must hold the process tree of the launch, for the exit hook"
+    );
+    assert!(
+        owned,
+        "the pool's profile directory must hold the process tree of its launch"
+    );
+}
+
+/// A pool dropped where no runtime runs its tasks still stops its Chrome and removes its profile
+/// directory.
+///
+/// ~keep The runtime is a current-thread one that nothing drives during or after the drop, as when
+/// ~keep a host language's finalizer thread drops the engine. The listener task that holds the
+/// ~keep other `Browser` reference never runs, so chromiumoxide's own kill never happens: the
+/// ~keep profile directory's teardown, on a thread of its own, is what stops that Chrome.
+#[test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+fn a_pool_dropped_where_no_runtime_runs_stops_its_chrome_and_removes_its_profile_directory() {
+    const TEST_NAME: &str = "a_pool_dropped_where_no_runtime_runs_stops_its_chrome_and_removes_its_profile_directory";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime must build");
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, runtime.block_on(pool.warm())).is_none() {
+        return;
+    }
+    let path = runtime.block_on(pool_profile_dir(&pool));
+
+    drop(pool);
+
+    assert_profile_directory_is_gone_for_good(&path);
+    drop(runtime);
+}
+
+// ~keep A supervisor can retire its browser just before the host stops driving its runtime.
+#[test]
+fn a_failed_browser_releases_its_profile_before_cleanup_waits_on_a_paused_runtime() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime must build");
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    runtime
+        .block_on(pool.warm())
+        .expect("Chrome must launch for the retirement regression");
+    let (pending, path) = runtime.block_on(async {
+        let state = pool.state.lock().await.take().expect("a warm pool must own a browser");
+        let path = state
+            .user_data_dir
+            .as_ref()
+            .expect("an owned profile")
+            .path()
+            .to_path_buf();
+        state.handler_handle.abort();
+        let mut pending = Box::pin(state.fail_closed());
+        assert!(
+            futures::poll!(pending.as_mut()).is_pending(),
+            "retirement must reach its first wait"
+        );
+        (pending, path)
+    });
+    drop(pool);
+    let removed_while_paused = wait_for_removal(&path);
+    drop(pending);
+    drop(runtime);
+    assert!(
+        removed_while_paused,
+        "retirement must release the owned profile while the runtime is paused: {}",
+        path.display()
+    );
+    assert_profile_directory_is_gone_for_good(&path);
+}
+
+/// A pool dropped without `shutdown` logs no warning that its browser "was not closed manually".
+///
+/// ~keep The pool starts its Chrome with no kill on drop and stops it in the profile teardown, so
+/// ~keep the driver's warning of a kill by the runtime was false, and every normal drop of an
+/// ~keep engine logged it. The runtime is a current-thread one, so the drop of the pool and every
+/// ~keep task that holds the browser run on the thread that captures.
+#[test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+fn a_pool_dropped_without_shutdown_logs_no_warning_of_an_unclosed_browser() {
+    const TEST_NAME: &str = "a_pool_dropped_without_shutdown_logs_no_warning_of_an_unclosed_browser";
+    let (path, fields) = crate::tracing_capture::capture_events(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the runtime must build");
+        let pool = BrowserPool::new(BrowserPoolConfig::default());
+        expect_chrome_or_skip(TEST_NAME, runtime.block_on(pool.warm()))?;
+        let path = runtime.block_on(pool_profile_dir(&pool));
+        drop(pool);
+        // ~keep Let the tasks that hold the browser end on this thread before the runtime goes.
+        runtime.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(200)).await });
+        drop(runtime);
+        Some(path)
+    });
+    let Some(path) = path else {
+        return;
+    };
+
+    assert_profile_directory_is_gone_for_good(&path);
+    let warnings: Vec<&(String, String)> = fields
+        .iter()
+        .filter(|(_, value)| value.contains("not closed manually"))
+        .collect();
+    assert!(
+        warnings.is_empty(),
+        "a dropped pool stops its Chrome itself, so no warning of an unclosed browser may be logged: {warnings:?}"
+    );
+}
+
+/// The removal of a profile directory that is already gone logs no failure, and the removal of
+/// one that cannot be removed still does.
+///
+/// ~keep A teardown from the exit hook can remove the directory first, and the removal after a
+/// ~keep kill then logged "failed to remove" on a normal exit.
+#[test]
+fn removing_a_profile_directory_that_is_gone_logs_no_failure() {
+    const FAILURE: &str = "failed to remove the Chrome profile directory";
+    let parent = tempfile::tempdir().expect("a temp directory must be creatable");
+    let gone = parent.path().join("gone");
+    let a_file = parent.path().join("a-file");
+    std::fs::write(&a_file, b"").expect("the file must be writable");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("the runtime must build");
+
+    let ((), of_a_file) = crate::tracing_capture::capture_events(|| runtime.block_on(remove_profile_dir(a_file)));
+    assert!(
+        of_a_file.iter().any(|(_, value)| value.contains(FAILURE)),
+        "a path that is no directory cannot be removed, and that must be logged: {of_a_file:?}"
+    );
+
+    let ((), of_gone) = crate::tracing_capture::capture_events(|| runtime.block_on(remove_profile_dir(gone)));
+    assert!(
+        !of_gone.iter().any(|(_, value)| value.contains(FAILURE)),
+        "a directory that is already gone is no failure: {of_gone:?}"
+    );
+}
+
+/// Kill the main process of the Chrome `pool` runs, and return its profile directory.
+async fn kill_pool_chrome(pool: &BrowserPool) -> std::path::PathBuf {
+    let path = pool_profile_dir(pool).await;
+    let mut system = sysinfo::System::new();
+    let killed = processes_naming(&mut system, &user_data_dir_flag(&path))
+        .into_iter()
+        .filter(|process| {
+            !process
+                .cmd()
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("--type="))
+        })
+        .map(|process| process.kill_with(sysinfo::Signal::Kill).unwrap_or(false))
+        .filter(|killed| *killed)
+        .count();
+    assert_eq!(killed, 1, "the pool's Chrome main process must be killed");
+    path
+}
+
+/// Losing the CDP handler retires and reaps an owned Chrome without waiting for another checkout.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn controller_loss_immediately_reaps_the_owned_browser() {
+    const TEST_NAME: &str = "controller_loss_immediately_reaps_the_owned_browser";
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        chrome_path: std::env::var_os("CRAWLBERG_TEST_CHROME_PATH").map(Into::into),
+        ..BrowserPoolConfig::default()
+    });
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let profile = pool_profile_dir(&pool).await;
+    let controller = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .expect("a warm pool must hold a browser")
+        .handler_handle
+        .abort_handle();
+
+    controller.abort();
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if pool.state.lock().await.is_none() && chrome_process_count_for_profile(&profile) == 0 && !profile.exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("controller loss must retire, kill, reap, and remove the owned browser without another acquire");
+    assert!(
+        !pool.is_healthy(),
+        "a pool with no security controller must be unhealthy"
+    );
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn should_reap_the_retired_browser_before_replacing_a_failed_controller() {
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        chrome_path: std::env::var_os("CRAWLBERG_TEST_CHROME_PATH").map(Into::into),
+        ..BrowserPoolConfig::default()
+    });
+    pool.warm()
+        .await
+        .expect("Chrome must launch for the retirement regression");
+    let guard = pool.state.lock().await;
+    let original = guard.as_ref().expect("a warm pool must hold a browser");
+    let profile = original.user_data_dir.as_ref().expect("an owned profile");
+    let old_profile = profile.path().to_path_buf();
+    let old_process = profile.teardown().launched.expect("the owned Chrome identity");
+    let old_generation = original.generation;
+    let ended = original.handler_end.clone();
+    let controller = original.handler_handle.abort_handle();
+    let next = pool.acquire_page();
+    tokio::pin!(next);
+    // ~keep Queue acquisition ahead of the supervisor on Tokio's FIFO mutex, so replacement
+    // ~keep itself must reap the failed generation rather than depending on the supervisor.
+    assert!(futures::poll!(next.as_mut()).is_pending());
+    controller.abort();
+    tokio::time::timeout(Duration::from_secs(15), ended.ended())
+        .await
+        .expect("the aborted controller must publish its end");
+    drop(guard);
+
+    let replacement = tokio::time::timeout(Duration::from_secs(60), next)
+        .await
+        .expect("replacement must finish")
+        .expect("replacement page must open");
+    let new_generation = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .expect("replacement browser")
+        .generation;
+    let old_identity_exists = old_process.has_its_pid(start_mark);
+    let old_profile_exists = old_profile.exists();
+    let old_profile_users = chrome_process_count_for_profile(&old_profile);
+    let new_value = tokio::time::timeout(Duration::from_secs(15), replacement.page().evaluate("21 * 2")).await;
+    replacement.close().await;
+    pool.shutdown().await;
+    // ~keep A deliberately broken retirement must still clean up its old process before the
+    // ~keep assertion fails. The live-profile record owns the same teardown turn as the pool.
+    let abandoned = {
+        let profiles = live_profiles();
+        profiles.get(&old_profile).map(|profile| ProfileTeardown {
+            owner: profile.owner,
+            dir: old_profile.clone(),
+            launched: profile.launched,
+            tree: profile.tree.clone(),
+            chrome: profile.chrome.clone(),
+            turn: Arc::clone(&profile.turn),
+        })
+    };
+    tokio::task::spawn_blocking(move || drop(abandoned))
+        .await
+        .expect("retired browser fallback cleanup");
+
+    assert_ne!(new_generation, old_generation);
+    assert_eq!(
+        new_value
+            .expect("new controller must answer within the CDP deadline")
+            .expect("new controller must answer CDP")
+            .into_value::<u64>()
+            .expect("numeric CDP result"),
+        42
+    );
+    assert_eq!(
+        (old_identity_exists, old_profile_exists, old_profile_users),
+        (false, false, 0),
+        "the original Chrome identity, profile and profile users must be gone before replacement returns"
+    );
+}
+
+/// A pool whose Chrome was killed launches a new one for the next page, and still shuts down.
+///
+/// ~keep chromiumoxide 0.9.1's handler stays pending after its websocket breaks, so a handler loop
+/// ~keep that went on past the error never finished. The pool, which relaunches only a browser
+/// ~keep whose handler has ended, kept the dead Chrome: every page request failed and
+/// ~keep `shutdown` waited forever (xberg-io/crawlberg#581). Every wait here is bounded, so that
+/// ~keep defect fails the test instead of hanging it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_pool_whose_chrome_was_killed_relaunches_it_and_shuts_down() {
+    const TEST_NAME: &str = "a_pool_whose_chrome_was_killed_relaunches_it_and_shuts_down";
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let original_handler = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .expect("a warm pool must hold a browser")
+        .handler_handle
+        .abort_handle();
+    kill_pool_chrome(&pool).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut handler_finished = false;
+    while tokio::time::Instant::now() < deadline {
+        if original_handler.is_finished() {
+            handler_finished = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let page = match tokio::time::timeout(Duration::from_secs(60), pool.acquire_page()).await {
+        Ok(Ok(page)) => Ok(page),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("no answer within 60 s".to_string()),
+    };
+    let page_outcome = match &page {
+        Ok(_) => "ok".to_string(),
+        Err(error) => error.clone(),
+    };
+    drop(page);
+    let shut_down = tokio::time::timeout(Duration::from_secs(30), pool.shutdown())
+        .await
+        .is_ok();
+
+    assert!(
+        handler_finished && page_outcome == "ok" && shut_down,
+        "a pool whose Chrome was killed must end its handler, open a page on a new Chrome and shut \
+         down: handler_finished_within_15s={handler_finished} acquire_page={page_outcome} \
+         shutdown_within_30s={shut_down}"
+    )
+}
+
+/// A warm pool whose Chrome was killed and whose handler has ended, with the handler's task held
+/// open, and the dead Chrome's profile directory. `None` after a skip line when no Chrome is usable.
+///
+/// ~keep A handler fails its commands as it drops, and its task is finished only after that. A
+/// ~keep page request that meets a dying Chrome runs in that gap, which lasts microseconds. The
+/// ~keep pool's test hold keeps the gap open, so a test reaches it by construction and not by
+/// ~keep timing (xberg-io/crawlberg#581).
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn pool_whose_handler_ended_with_its_task_held(
+    test_name: &str,
+) -> Option<(Arc<BrowserPool>, std::path::PathBuf)> {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    pool.hold_handler_end.send_replace(true);
+    expect_chrome_or_skip(test_name, pool.warm().await)?;
+    let handler_end = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .expect("a warm pool must hold a browser")
+        .handler_end
+        .clone();
+    let old = kill_pool_chrome(&pool).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if handler_end.has_ended() {
+            let cause = handler_end.cause().map(str::to_owned);
+            assert!(
+                cause.as_deref().is_some_and(|cause| !cause.is_empty()),
+                "{test_name}: the handler of a killed Chrome must record the websocket error it stopped on"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{test_name}: the handler of a killed Chrome must end within 15 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Some((pool, old))
+}
+
+/// The text for a websocket error names the kind of the I/O error under it, and is the error's
+/// `Display` alone when there is none.
+#[test]
+fn the_text_for_a_websocket_error_names_the_io_kind_under_it() {
+    #[derive(Debug)]
+    struct Outer(std::io::Error);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "IO error: {}", self.0)
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    let reset = Outer(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "reset by peer",
+    ));
+    assert_eq!(
+        websocket_error_text(&reset),
+        "IO error: reset by peer (ConnectionReset)"
+    );
+    assert_eq!(websocket_error_text(&std::fmt::Error), std::fmt::Error.to_string());
+}
+
+/// A command Chrome never answers fails with a timeout, on a connection with no other traffic.
+///
+/// ~keep chromiumoxide 0.9.1 fails such a command only when something polls its handler after
+/// ~keep the request timeout, and on a quiet connection nothing did: the command waited forever
+/// ~keep (xberg-io/crawlberg#586). The request timeout is 2 s here and the wait is bounded at
+/// ~keep 20 s, so that defect fails the test.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_command_chrome_never_answers_times_out_on_a_quiet_connection() {
+    const TEST_NAME: &str = "a_command_chrome_never_answers_times_out_on_a_quiet_connection";
+    use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+    use chromiumoxide::error::CdpError;
+
+    let user_data_dir = ScratchProfileDir::create("crawlberg-chrome-", None).expect("a profile directory");
+    let Some(config) = expect_chrome_or_skip(
+        TEST_NAME,
+        build_pool_launch_builder(user_data_dir.path(), &BrowserPoolConfig::default())
+            .expect("the launch builder must build")
+            .request_timeout(Duration::from_secs(2))
+            .build(),
+    ) else {
+        return;
+    };
+    let Some((mut browser, handler)) = expect_chrome_or_skip(TEST_NAME, Browser::launch(config).await) else {
+        return;
+    };
+    let handler_task = spawn_handler(handler);
+    let page = browser.new_page("about:blank").await.expect("a page must open");
+    let never_settles = EvaluateParams::builder()
+        .expression("new Promise(() => {})")
+        .await_promise(true)
+        .build()
+        .expect("the evaluate parameters must build");
+    let outcome = tokio::time::timeout(Duration::from_secs(20), page.evaluate(never_settles)).await;
+    let _ = browser.kill().await;
+    handler_task.abort();
+    drop(user_data_dir);
+
+    match outcome {
+        Ok(Err(CdpError::Timeout)) => {}
+        Ok(other) => panic!("a command with no answer must fail with a timeout, got {other:?}"),
+        Err(_) => panic!("a command with no answer must fail after the request timeout, not wait 20 s and more"),
+    }
+}
+
+/// The profile directory of the Chrome `pool` holds now, if it holds one.
+async fn pool_profile_path(pool: &BrowserPool) -> Option<std::path::PathBuf> {
+    pool.state
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|state| state.user_data_dir.as_ref())
+        .map(|dir| dir.path().to_path_buf())
+}
+
+/// A page opened after the handler ended and before its task finished is opened on a new Chrome.
+#[tokio::test(flavor = "multi_thread")]
+async fn opening_a_page_replaces_a_dead_chrome_before_its_handler_task_finishes() {
+    let test_name = "opening_a_page_replaces_a_dead_chrome_before_its_handler_task_finishes";
+    let Some((pool, old)) = pool_whose_handler_ended_with_its_task_held(test_name).await else {
+        return;
+    };
+    let config = crate::types::CrawlConfig::default();
+    let opened = match tokio::time::timeout(Duration::from_secs(60), pool.try_new_page(None, &config)).await {
+        Ok(Ok(page)) => {
+            page.close().await;
+            Ok(pool_profile_path(&pool).await)
+        }
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("no answer within 60 s".to_string()),
+    };
+    pool.hold_handler_end.send_replace(false);
+    let shut_down = tokio::time::timeout(Duration::from_secs(30), pool.shutdown())
+        .await
+        .is_ok();
+
+    assert!(
+        opened
+            .as_ref()
+            .is_ok_and(|new| new.as_ref().is_some_and(|new| *new != old))
+            && shut_down,
+        "the page must open on a new Chrome: opened={opened:?} old={} shutdown_within_30s={shut_down}",
+        old.display()
+    );
+}
+
+/// The relaunch a failed page request asks for replaces a Chrome whose handler ended, before the
+/// handler's task finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relaunch_replaces_a_dead_chrome_before_its_handler_task_finishes() {
+    let test_name = "a_relaunch_replaces_a_dead_chrome_before_its_handler_task_finishes";
+    let Some((pool, old)) = pool_whose_handler_ended_with_its_task_held(test_name).await else {
+        return;
+    };
+    let relaunched = match tokio::time::timeout(Duration::from_secs(60), pool.relaunch_browser()).await {
+        Ok(Ok(())) => Ok(pool_profile_path(&pool).await),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("no answer within 60 s".to_string()),
+    };
+    pool.hold_handler_end.send_replace(false);
+    let shut_down = tokio::time::timeout(Duration::from_secs(30), pool.shutdown())
+        .await
+        .is_ok();
+
+    assert!(
+        relaunched
+            .as_ref()
+            .is_ok_and(|new| new.as_ref().is_some_and(|new| *new != old))
+            && shut_down,
+        "the relaunch must start a new Chrome: relaunched={relaunched:?} old={} shutdown_within_30s={shut_down}",
+        old.display()
+    );
+}
+
+/// Relaunching a pool connection whose handler ended reconnects to the caller's Chrome without
+/// stopping that Chrome.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn relaunching_an_external_pool_connection_leaves_the_callers_chrome_running() {
+    use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+
+    let executable = match std::env::var_os("CRAWLBERG_TEST_CHROME_PATH") {
+        Some(path) => path.into(),
+        None => match default_executable(DetectionOptions::default()) {
+            Ok(executable) => executable,
+            Err(error) => {
+                eprintln!(
+                    "skipping relaunching_an_external_pool_connection_leaves_the_callers_chrome_running: \
+                     no Chrome executable: {error}"
+                );
+                return;
+            }
+        },
+    };
+    let owner_dir = ScratchProfileDir::create("crawlberg-external-owner-test-", Some(&executable))
+        .expect("the external Chrome's profile directory must be created");
+    let owner_config = build_pool_launch_builder(owner_dir.path(), &BrowserPoolConfig::default())
+        .expect("the default pool configuration must build")
+        .chrome_executable(executable)
+        .build()
+        .expect("the external Chrome configuration must build");
+    let (mut owner, owner_handler, owner_dir) = owner_dir
+        .launch(owner_config)
+        .await
+        .expect("the detected Chrome executable must launch");
+    let mut owner_task = spawn_handler(owner_handler);
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        browser_endpoint: Some(owner.websocket_address().clone()),
+        ..BrowserPoolConfig::default()
+    });
+    let operation_timeout = Duration::from_secs(30);
+    let mut pool_handlers = Vec::new();
+    let exercise: Result<(), String> = async {
+        tokio::time::timeout(operation_timeout, pool.warm())
+            .await
+            .map_err(|_| "the pool warm timed out".to_owned())?
+            .map_err(|error| format!("the pool must connect to the external Chrome: {error}"))?;
+
+        let original_handler_end = {
+            let state = pool.state.lock().await;
+            let Some(state) = state.as_ref() else {
+                return Err("a warm pool must hold a browser connection".to_owned());
+            };
+            if state.user_data_dir.is_some() {
+                return Err("the pool must treat the connected Chrome as external".to_owned());
+            }
+            let old_handler = state.handler_handle.abort_handle();
+            old_handler.abort();
+            pool_handlers.push(old_handler);
+            state.handler_end.clone()
+        };
+        tokio::time::timeout(PROCESS_TEST_WAIT, async {
+            while !original_handler_end.has_ended() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the aborted pool connection's handler must end".to_owned())?;
+
+        tokio::time::timeout(operation_timeout, pool.relaunch_browser())
+            .await
+            .map_err(|_| "the pool relaunch timed out".to_owned())?
+            .map_err(|error| format!("the pool must reconnect after its handler ends: {error}"))?;
+        {
+            let state = pool.state.lock().await;
+            let Some(state) = state.as_ref() else {
+                return Err("a successful relaunch must install new browser state".to_owned());
+            };
+            pool_handlers.push(state.handler_handle.abort_handle());
+            if state.handler_end.has_ended() {
+                return Err("the relaunched handler must still be running before page acquisition".to_owned());
+            }
+        }
+
+        let config = crate::types::CrawlConfig::builder()
+            .allow_private_networks(true)
+            .build();
+        let page = tokio::time::timeout(operation_timeout, pool.acquire_page_with_config(&config))
+            .await
+            .map_err(|_| "page acquisition after relaunch timed out".to_owned())?
+            .map_err(|error| format!("the relaunched connection must open a page: {error}"))?;
+        let target = page.page().target_id().clone();
+        let target_is_open = owner
+            .execute(GetTargetsParams::default())
+            .await
+            .map_err(|error| format!("the caller's Chrome must list its targets after relaunch: {error}"))?
+            .result
+            .target_infos
+            .iter()
+            .any(|info| info.target_id == target);
+        if !target_is_open {
+            return Err("the relaunched connection's page target must exist in the caller's Chrome".to_owned());
+        }
+        tokio::time::timeout(operation_timeout, page.close())
+            .await
+            .map_err(|_| "closing the relaunched page timed out".to_owned())?;
+        tokio::time::timeout(operation_timeout, async {
+            loop {
+                let target_is_open = owner
+                    .execute(GetTargetsParams::default())
+                    .await
+                    .map_err(|error| format!("the caller's Chrome must keep listing its targets: {error}"))?
+                    .result
+                    .target_infos
+                    .iter()
+                    .any(|info| info.target_id == target);
+                if !target_is_open {
+                    return Ok::<(), String>(());
+                }
+                owner
+                    .version()
+                    .await
+                    .map_err(|error| format!("the caller's Chrome must answer while its target closes: {error}"))?;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the relaunched connection's page target must close".to_owned())??;
+        tokio::time::timeout(operation_timeout, pool.shutdown())
+            .await
+            .map_err(|_| "pool shutdown after relaunch timed out".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(5), owner.version())
+            .await
+            .map_err(|_| "the caller's Chrome version request timed out".to_owned())?
+            .map_err(|error| format!("the caller's Chrome must answer after pool shutdown: {error}"))?;
+        Ok(())
+    }
+    .await;
+
+    let cleanup_shutdown = tokio::time::timeout(operation_timeout, pool.shutdown()).await;
+    for handler in &pool_handlers {
+        handler.abort();
+    }
+    let pool_handlers_stopped = tokio::time::timeout(Duration::from_secs(5), async {
+        while pool_handlers.iter().any(|handler| !handler.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    owner_task.abort();
+    let owner_handler_stopped = tokio::time::timeout(Duration::from_secs(5), &mut owner_task).await;
+    let owner_killed = tokio::time::timeout(Duration::from_secs(5), owner.kill()).await;
+    drop(owner_dir);
+
+    assert!(exercise.is_ok(), "{}", exercise.expect_err("checked above"));
+    assert!(cleanup_shutdown.is_ok(), "cleanup pool shutdown must not time out");
+    assert!(
+        pool_handlers_stopped.is_ok(),
+        "every pool handler must stop during cleanup"
+    );
+    assert!(
+        matches!(&owner_killed, Ok(Some(Ok(())))),
+        "stopping the test-owned Chrome must succeed: {owner_killed:?}"
+    );
+    assert!(
+        matches!(&owner_handler_stopped, Ok(Err(error)) if error.is_cancelled()),
+        "the aborted test-owned Chrome handler must report cancellation: {owner_handler_stopped:?}"
+    );
+}
+
+/// A pool shut down stops its Chrome and removes its profile directory, off the executor thread.
+#[tokio::test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_pool_shut_down_leaves_no_profile_directory() {
+    const TEST_NAME: &str = "a_pool_shut_down_leaves_no_profile_directory";
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let path = pool_profile_dir(&pool).await;
+
+    let before = profile_drops_here();
+    pool.shutdown().await;
+    assert_profile_teardown_left_this_thread(before);
+
+    tokio::task::spawn_blocking(move || assert_profile_directory_is_gone_for_good(&path))
+        .await
+        .expect("a pool shut down must stop its Chrome and remove its profile directory");
+}
+
+/// A pool that relaunches a Chrome whose handler ended removes the old Chrome's profile directory.
+#[tokio::test]
+#[allow(clippy::print_stderr, reason = "test-only skip announcement")]
+async fn a_relaunched_pool_removes_the_old_chromes_profile_directory() {
+    const TEST_NAME: &str = "a_relaunched_pool_removes_the_old_chromes_profile_directory";
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, pool.warm().await).is_none() {
+        return;
+    }
+    let old = pool_profile_dir(&pool).await;
+    let before = profile_drops_here();
+    // ~keep A relaunch replaces only a Chrome whose handler has ended.
+    let original_handler = pool
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .expect("a warm pool must hold a browser")
+        .handler_handle
+        .abort_handle();
+    original_handler.abort();
+    let deadline = tokio::time::Instant::now() + PROCESS_TEST_WAIT;
+    while !original_handler.is_finished() {
+        assert!(tokio::time::Instant::now() < deadline, "the aborted handler must end");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let relaunched = pool.relaunch_browser().await;
+    assert_eq!(
+        profile_drops_here().1,
+        before.1,
+        "profile removal must not run on this executor thread"
+    );
+    let new = pool_profile_dir(&pool).await;
+    assert!(relaunched.is_ok(), "the relaunch must succeed: {relaunched:?}");
+    assert_ne!(old, new, "the relaunched Chrome must use a new profile directory");
+    tokio::task::spawn_blocking(move || assert_profile_directory_is_gone_for_good(&old))
+        .await
+        .expect("a relaunch must stop the old Chrome and remove its profile directory");
+    assert_profile_teardown_left_this_thread(before);
+    pool.shutdown().await;
+}
+
+/// A launch that fails removes its profile directory, off the executor thread.
+///
+/// ~keep No Chrome is needed: the executable is missing, so the launch fails before any Chrome runs.
+#[tokio::test]
+async fn a_failed_launch_removes_its_profile_directory() {
+    let dir =
+        ScratchProfileDir::create("crawlberg-failed-launch-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let config = build_pool_launch_builder(&path, &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check")
+        .chrome_executable(path.join("no-such-chrome"))
+        .build()
+        .expect("a config naming its executable must build");
+    let before = profile_drops_here();
+
+    let launched = dir.launch(config).await;
+
+    assert!(launched.is_err(), "a launch of a missing executable must fail");
+    assert_profile_teardown_left_this_thread(before);
+    assert!(wait_for_removal(&path), "the directory must be removed");
+}
+
+/// A pool launch that times out hands its profile teardown off the executor thread, which holds
+/// the pool's state lock at that point.
+///
+/// ~keep No Chrome is needed: without one the launch fails before the timeout, and the profile
+/// ~keep directory drops on the same path.
+#[tokio::test]
+async fn a_timed_out_pool_launch_tears_its_profile_down_off_the_executor_thread() {
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        launch_timeout: Duration::from_millis(1),
+        ..BrowserPoolConfig::default()
+    });
+    let before = profile_drops_here();
+    let warmed = pool.warm().await;
+    assert!(warmed.is_err(), "a Chrome launch cannot finish within a millisecond");
+    assert_profile_teardown_left_this_thread(before);
+}
+
+/// `close_browser_within` must return near its configured `shutdown_timeout`, and the
+/// process must actually be dead afterward, even when `Browser::close`/`wait` cannot make
+/// progress -- the reported case was a Chrome process blocked behind an OS dialog
+/// (see the `~keep` on `close_browser_within`'s own doc comment).
+///
+/// ~keep Simulates that without a real dialog: `SIGSTOP` freezes a genuinely launched
+/// ~keep Chrome process so it cannot respond to the CDP `Browser.close` command or exit,
+/// ~keep without killing it -- `close()`/`wait()` then hang exactly as they did against
+/// ~keep the keychain-prompt report. Skipped (not failed) when this machine has no usable
+/// ~keep Chrome binary or `kill -STOP` is unavailable (non-Unix), matching the browser
+/// ~keep integration tests' skip convention. Requires a real Chrome binary; a fully mocked
+/// ~keep `Browser` was not practical here (`chromiumoxide::Browser` wraps a real child
+/// ~keep process and CDP connection with no test seam for either).
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn close_browser_within_returns_promptly_when_the_process_is_stopped() {
+    const TEST_NAME: &str = "close_browser_within_returns_promptly_when_the_process_is_stopped";
+    if !cfg!(unix) {
+        eprintln!("skipping close_browser_within_returns_promptly_when_the_process_is_stopped: not unix");
+        return;
+    }
+
+    let user_data_dir =
+        ScratchProfileDir::create("crawlberg-pool-test-", None).expect("a profile directory must be created");
+    let Some(browser_config) = expect_chrome_or_skip(
+        TEST_NAME,
+        build_pool_launch_builder(user_data_dir.path(), &BrowserPoolConfig::default())
+            .expect("the default pool config names no binary to check")
+            .build(),
+    ) else {
+        return;
+    };
+    let Some((mut browser, handler)) = expect_chrome_or_skip(TEST_NAME, Browser::launch(browser_config).await) else {
+        return;
+    };
+    let handler_task = spawn_handler(handler);
+
+    let pid = browser
+        .get_mut_child()
+        .and_then(|child| child.as_mut_inner().id())
+        .expect("a freshly launched child must have a pid");
+
+    let stopped = std::process::Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .expect("`kill -STOP` must run")
+        .success();
+    assert!(stopped, "failed to SIGSTOP the launched Chrome process (pid {pid})");
+
+    let shutdown_timeout = Duration::from_millis(500);
+    let start = std::time::Instant::now();
+    let close_outcome = close_browser_within(&mut browser, shutdown_timeout).await;
+    let elapsed = start.elapsed();
+    let still_running = browser
+        .try_wait()
+        .expect("the browser's status must be readable")
+        .is_none();
+
+    // ~keep Always sent, even if the assertions below fail: a stopped process left behind
+    // ~keep by a broken implementation would otherwise leak past this test. Sent through the
+    // ~keep browser's own handle, which signals nothing once the process is reaped: a kill by pid
+    // ~keep after the reap reaches whatever process has the pid now.
+    let _ = browser.kill().await;
+    handler_task.abort();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "close_browser_within must return near its configured budget ({shutdown_timeout:?}) \
+         even when close()/wait() cannot make progress on a stopped process; took {elapsed:?}"
+    );
+
+    assert!(
+        !still_running,
+        "the Chrome process (pid {pid}) must be dead after close_browser_within returns, \
+         via its Browser::kill() fallback"
+    );
+    // ~keep A guard on the reported outcome rather than a second behaviour: the timing this
+    // ~keep distinction buys is asserted by
+    // ~keep `release_browser_kills_a_stopped_launched_chrome_within_one_shutdown_timeout`.
+    assert_eq!(
+        close_outcome,
+        BrowserCloseOutcome::Killed,
+        "a process that could not answer close()/wait() must be reported as killed, so the \
+         caller can skip waiting on a CDP handler that will never end"
+    );
+}
+
+/// Releasing a launched Chrome that has stopped responding kills it within one
+/// `shutdown_timeout`, and returns within one too, even when a tab is handed over for
+/// closing: the tab dies with the browser, so no separate tab close may run ahead of the
+/// close-and-kill.
+///
+/// ~keep `SIGSTOP` freezes the process so every CDP call hangs, as in
+/// ~keep `close_browser_within_returns_promptly_when_the_process_is_stopped`.
+/// ~keep The return-time assertion is xberg-io/crawlberg#146's regression coverage and fails
+/// ~keep before its fix: the release used to wait the full `HANDLER_SHUTDOWN_TIMEOUT` for a
+/// ~keep handler loop that a killed Chrome can never end, so it returned about one
+/// ~keep `shutdown_timeout` plus five seconds after it started.
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn release_browser_kills_a_stopped_launched_chrome_within_one_shutdown_timeout() {
+    const TEST_NAME: &str = "release_browser_kills_a_stopped_launched_chrome_within_one_shutdown_timeout";
+    if !cfg!(unix) {
+        eprintln!("skipping {TEST_NAME}: not unix");
+        return;
+    }
+    let user_data_dir =
+        ScratchProfileDir::create("crawlberg-pool-test-", None).expect("a profile directory must be created");
+    let launched = match build_pool_launch_builder(user_data_dir.path(), &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut browser, mut handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    // ~keep Kept as the plain loop, which a killed Chrome never ends: the release must not wait on
+    // ~keep it (#146). A loop that ends at the websocket error would hide a release that waits again.
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    // ~keep Bounded here: the plain loop never fails this command if the Chrome dies first.
+    let page = tokio::time::timeout(PROCESS_TEST_WAIT, browser.new_page("about:blank"))
+        .await
+        .expect("a launched Chrome must answer the request for a tab within the wait")
+        .expect("a launched Chrome must open a tab");
+    let tab = page.target_id().clone();
+    let pid = browser
+        .get_mut_child()
+        .and_then(|child| child.as_mut_inner().id())
+        .expect("a freshly launched child must have a pid");
+    let stopped = std::process::Command::new("kill")
+        .args(["-STOP", &pid.to_string()])
+        .status()
+        .expect("`kill -STOP` must run")
+        .success();
+    assert!(stopped, "failed to SIGSTOP the launched Chrome process (pid {pid})");
+
+    // ~keep The process's death is timed on its own thread because it lands while
+    // ~keep `release_browser` is still running; the release's own return is timed below.
+    let alive = move || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    let start = std::time::Instant::now();
+    let died_after = std::thread::spawn(move || {
+        while alive() && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        start.elapsed()
+    });
+    let shutdown_timeout = Duration::from_secs(1);
+    let cleanup = ExternalTabCleanup {
+        open_tab: Some(tab),
+        ..ExternalTabCleanup::default()
+    };
+    release_browser(browser, handler_task, cleanup, shutdown_timeout).await;
+    let released_after = start.elapsed();
+    // ~keep No kill by pid follows: the release owns the process and chromiumoxide's handle kills
+    // ~keep it on drop, and once it is reaped the pid can name another process.
+    let died_after = died_after.join().expect("the watcher thread must not panic");
+
+    // ~keep The kill lands one `shutdown_timeout` after the release starts. A tab close run
+    // ~keep ahead of the close-and-kill would add a second timeout before it.
+    assert!(
+        died_after < shutdown_timeout + Duration::from_millis(700),
+        "a stopped launched Chrome must be killed within one shutdown_timeout \
+         ({shutdown_timeout:?}); it died after {died_after:?}"
+    );
+    assert!(
+        released_after < shutdown_timeout + Duration::from_secs(2),
+        "the release must return once the process is reaped, not wait \
+         {HANDLER_SHUTDOWN_TIMEOUT:?} for a CDP handler that a killed Chrome can never end \
+         (xberg-io/crawlberg#146); it returned after {released_after:?}"
+    );
+}
+
+/// Releasing a connected browser disconnects from it: the handler task that owns the CDP
+/// websocket stops at once, and the Chrome at the other end keeps running.
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn release_browser_disconnects_from_a_connected_browser_without_closing_it() {
+    const TEST_NAME: &str = "release_browser_disconnects_from_a_connected_browser_without_closing_it";
+    let user_data_dir =
+        ScratchProfileDir::create("crawlberg-pool-test-", None).expect("a profile directory must be created");
+    let launched = match build_pool_launch_builder(user_data_dir.path(), &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut owner, owner_handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    let owner_task = spawn_handler(owner_handler);
+
+    let (connected, mut handler) = Browser::connect(owner.websocket_address().clone())
+        .await
+        .expect("connecting to the launched Chrome must succeed");
+    // ~keep Kept as the plain loop: the assertion reads this task's end as the release's abort, and
+    // ~keep a loop that ends at a websocket error would also end if the release closed the Chrome.
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_abort = handler_task.abort_handle();
+
+    release_browser(
+        connected,
+        handler_task,
+        ExternalTabCleanup::default(),
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let disconnected = handler_abort.is_finished();
+    let version = tokio::time::timeout(Duration::from_secs(5), owner.version()).await;
+
+    let _ = owner.kill().await;
+    owner_task.abort();
+
+    assert!(
+        disconnected,
+        "the handler task for a connected browser must stop, closing its websocket"
+    );
+    assert!(
+        matches!(version, Ok(Ok(_))),
+        "the connected Chrome must still answer CDP after release: {version:?}"
+    );
+}
+
+/// Launch a Chrome on `user_data_dir` for a test, or announce the skip and return `None`.
+async fn launch_for(test_name: &str, user_data_dir: &std::path::Path) -> Option<(Browser, JoinHandle<()>)> {
+    let builder = build_pool_launch_builder(user_data_dir, &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check");
+    launch_config(test_name, builder).await
+}
+
+/// Launch the Chrome `builder` describes for a test, or announce the skip and return `None`.
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn launch_config(test_name: &str, builder: BrowserConfigBuilder) -> Option<(Browser, JoinHandle<()>)> {
+    let launched = match builder.build() {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    expect_chrome_or_skip(test_name, launched).map(|(browser, handler)| (browser, spawn_handler(handler)))
+}
+
+/// How many live processes have `text` on their command line.
+fn processes_containing(text: &str) -> usize {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cmd(UpdateKind::Always),
+    );
+    system
+        .processes()
+        .values()
+        .filter(|process| {
+            process.status() != ProcessStatus::Zombie
+                && process
+                    .cmd()
+                    .iter()
+                    .any(|argument| argument.to_string_lossy().contains(text))
+        })
+        .count()
+}
+
+/// A killed browser's processes are found through the process tree, not by matching text, so a
+/// profile path with a space in it is no different: every process is gone and the directory is
+/// removed when the kill returns.
+#[tokio::test]
+async fn a_killed_browser_with_a_space_in_its_profile_path_leaves_no_process_and_no_directory() {
+    let test_name = "a_killed_browser_with_a_space_in_its_profile_path_leaves_no_process_and_no_directory";
+    let root = std::env::temp_dir().join(format!("crawlberg spaced {}", std::process::id()));
+    let profile = root.join("crawlberg-interact-0-0");
+    let Some((browser, task)) = launch_for(test_name, &profile).await else {
+        return;
+    };
+    let text = profile.display().to_string();
+    let before = processes_containing(&text);
+    kill_browser(browser, task, profile.clone(), Duration::from_secs(5)).await;
+    let after = processes_containing(&text);
+    let left = profile.exists();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        before > 1,
+        "{test_name}: the launched Chrome must have helper processes that name its profile, got {before}"
+    );
+    assert_eq!(
+        after, 0,
+        "{test_name}: no process may still run with the profile once the kill returns"
+    );
+    assert!(!left, "{test_name}: the profile must be removed");
+}
+
+/// The kill ends the browser it launched and nothing else: a process of another program that
+/// names crawlberg's profile on its command line, and a Chrome on a profile whose path starts
+/// with crawlberg's, both survive it.
+#[tokio::test]
+async fn kill_browser_ends_only_the_browser_it_launched() {
+    let test_name = "kill_browser_ends_only_the_browser_it_launched";
+    if !cfg!(unix) {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("crawlberg-only-ours-{}", std::process::id()));
+    let profile = root.join("crawlberg-interact-0-0");
+    let Some((browser, task)) = launch_for(test_name, &profile).await else {
+        return;
+    };
+    let Some((mut foreign, foreign_task)) = launch_for(test_name, &root.join("crawlberg-interact-0-0 copy")).await
+    else {
+        return;
+    };
+    let mut wrapper = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("sleep 60; : --user-data-dir={}", profile.display()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("sh must start");
+
+    kill_browser(browser, task, profile.clone(), Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let wrapper_alive = wrapper.try_wait().expect("the wrapper must be waitable").is_none();
+    let foreign_alive = foreign
+        .get_mut_child()
+        .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+    let foreign_answers = tokio::time::timeout(Duration::from_secs(5), foreign.version()).await;
+
+    let _ = wrapper.kill();
+    let _ = wrapper.wait();
+    let _ = foreign.kill().await;
+    foreign_task.abort();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        wrapper_alive,
+        "{test_name}: a process of another program that names crawlberg's profile must survive the kill"
+    );
+    assert!(
+        foreign_alive,
+        "{test_name}: a Chrome on a profile whose path starts with crawlberg's must survive the kill"
+    );
+    assert!(
+        matches!(foreign_answers, Ok(Ok(_))),
+        "{test_name}: the other Chrome must still answer after the kill: {foreign_answers:?}"
+    );
+}
+
+/// How many members of `family` are neither stopped nor zombies.
+fn members_running(family: &ChromeFamily) -> usize {
+    let mut system = System::new();
+    ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&family.members));
+    family
+        .members
+        .iter()
+        .filter(|pid| {
+            system
+                .process(**pid)
+                .is_some_and(|process| !matches!(process.status(), ProcessStatus::Stop | ProcessStatus::Zombie))
+        })
+        .count()
+}
+
+/// Start `script` in a shell, with `marker` as its `$0`.
+///
+/// ~keep Every script of these tests starts its commands in the background and waits with the
+/// ~keep `wait` builtin. A shell such as dash starts a foreground command with `vfork`, and a
+/// ~keep shell inside `vfork` cannot take a stop while its child is stopped before the child
+/// ~keep starts its program: it reads as running, and 1 collection in 1054 under load ended
+/// ~keep with such a shell. A background command is started with `fork`.
+fn start_family(script: &str, marker: &str) -> std::process::Child {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(marker)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("sh must start")
+}
+
+/// A shell with two children. None of them forks, so a test decides which member runs.
+fn start_idle_family() -> std::process::Child {
+    start_family("sleep 60 & sleep 60 & wait", "crawlberg-idle-family")
+}
+
+/// Continue the stopped process `pid`, and wait for at most five seconds until it reads as
+/// running. Returns whether it does.
+fn resume(pid: Pid) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut system = System::new();
+        ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[pid]));
+        let Some(process) = system.process(pid) else {
+            return false;
+        };
+        if process.status() != ProcessStatus::Stop {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        process.kill_with(Signal::Continue);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// How many live children the process `parent` has.
+fn children_of(parent: Pid) -> usize {
+    let mut system = System::new();
+    ChromeFamily::refresh(&mut system, ProcessesToUpdate::All);
+    system
+        .processes()
+        .values()
+        .filter(|process| process.parent() == Some(parent) && process.status() != ProcessStatus::Zombie)
+        .count()
+}
+
+/// Whether a captured log holds a line that contains `text`.
+fn logged(fields: &[(String, String)], text: &str) -> bool {
+    fields.iter().any(|(_, value)| value.contains(text))
+}
+
+/// The line that is logged for a member that did not take its stop.
+const UNSTOPPED: &str = "did not take its stop in two waits";
+/// The line that is logged for a family whose walks ran out.
+const UNSETTLED: &str = "did not come to rest";
+
+/// A family that keeps forking is stopped as it is found, and every member has taken its stop when
+/// the collection returns, so a child forked while the family is collected cannot slip past the
+/// kill.
+#[test]
+#[serial_test::serial(chrome_family_log)]
+fn a_forking_family_is_stopped_as_it_is_found_and_leaves_no_child_behind() {
+    let test_name = "a_forking_family_is_stopped_as_it_is_found_and_leaves_no_child_behind";
+    if !cfg!(unix) {
+        return;
+    }
+    let marker = format!("crawlberg-family-test-{}", std::process::id());
+    let mut parent = start_family(
+        "while :; do sh -c 'sleep 2 & wait' \"$0\" & sleep 0.01 & wait $!; done",
+        &marker,
+    );
+    std::thread::sleep(Duration::from_millis(200));
+
+    let family = ChromeFamily::freeze(parent.id());
+    let running = members_running(&family);
+    family.kill();
+    let gone = family.wait(Duration::from_secs(5));
+    let _ = parent.wait();
+    std::thread::sleep(Duration::from_millis(100));
+    let survivors = processes_containing(&marker);
+
+    assert!(
+        family.members.len() > 2,
+        "{test_name}: the family must hold the shell and its children, got {}",
+        family.members.len()
+    );
+    assert_eq!(
+        running, 0,
+        "{test_name}: every member must have taken its stop when the collection returns, {running} still ran"
+    );
+    assert!(gone, "{test_name}: every member must be gone within the limit");
+    assert_eq!(
+        survivors, 0,
+        "{test_name}: no child forked while the family was collected may survive the kill"
+    );
+}
+
+/// A family at rest is collected without a warning: every member reads as stopped in the first
+/// wait.
+///
+/// ~keep This holds the read of the status into a new `System`. With a kept `System`, sysinfo on
+/// ~keep macOS never shows a stop, every wait runs out, and the collection ends with the warning
+/// ~keep for a member that did not take its stop. Linux reads the status on every refresh, so
+/// ~keep only the macOS run of this test can fail for that.
+#[test]
+#[serial_test::serial(chrome_family_log)]
+fn a_family_at_rest_is_collected_without_a_warning() {
+    let test_name = "a_family_at_rest_is_collected_without_a_warning";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut parent = start_idle_family();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let (family, fields) = crate::tracing_capture::capture_events(|| ChromeFamily::freeze(parent.id()));
+    let running = members_running(&family);
+    family.kill();
+    let gone = family.wait(Duration::from_secs(5));
+    let _ = parent.wait();
+
+    assert!(
+        family.members.len() > 2,
+        "{test_name}: the family must hold the shell and its children, got {}",
+        family.members.len()
+    );
+    assert!(
+        fields.is_empty(),
+        "{test_name}: a family at rest must be collected without a log line, got {fields:?}"
+    );
+    assert_eq!(
+        running, 0,
+        "{test_name}: every member must have its stop, {running} still ran"
+    );
+    assert!(gone, "{test_name}: every member must be gone within the limit");
+}
+
+/// A member that runs again after the family was seen at rest is stopped again and stays in the
+/// list the collection waits for, and a walk taken while a member ran is not the last one: every
+/// member has its stop when the collection returns.
+///
+/// ~keep On macOS a stop sent to a process that is starting a program does not always hold
+/// ~keep (xberg-io/crawlberg#585). The test makes that happen on every Unix: it continues one
+/// ~keep member right after each of the first two waits that have a member to wait for.
+#[test]
+#[serial_test::serial(chrome_family_log)]
+fn a_member_that_runs_again_after_its_stop_is_stopped_again() {
+    let test_name = "a_member_that_runs_again_after_its_stop_is_stopped_again";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut parent = start_idle_family();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut resumed: Vec<Pid> = Vec::new();
+    let mut waited_for_resumed = true;
+    let mut waits = 0;
+    let family = ChromeFamily::freeze_with(parent.id(), |stopping| {
+        waits += 1;
+        waited_for_resumed &= resumed.iter().all(|member| stopping.contains(member));
+        let stopped = ChromeFamily::settle(stopping);
+        if let (true, Some(member)) = (resumed.len() < 2, stopping.last())
+            && resume(*member)
+        {
+            resumed.push(*member);
+        }
+        stopped
+    });
+    let running = members_running(&family);
+    family.kill();
+    let gone = family.wait(Duration::from_secs(5));
+    let _ = parent.wait();
+
+    assert!(
+        family.members.len() > 2,
+        "{test_name}: the family must hold the shell and its children, got {}",
+        family.members.len()
+    );
+    assert!(
+        waited_for_resumed,
+        "{test_name}: every wait after a member ran again must be for that member too"
+    );
+    assert!(
+        waits > 3,
+        "{test_name}: the collection must wait and walk once more each time a member ran, got {waits} waits"
+    );
+    assert_eq!(
+        resumed.len(),
+        2,
+        "{test_name}: the test must have made a stopped member run again twice"
+    );
+    assert_eq!(
+        running, 0,
+        "{test_name}: a member that ran again must have its stop when the collection returns, {running} still ran"
+    );
+    assert!(gone, "{test_name}: every member must be gone within the limit");
+}
+
+/// A walk taken after one wait that ran out is not the last one, because a member that still ran
+/// during it can have forked a child it did not see. The collection waits and walks once more.
+#[test]
+#[serial_test::serial(chrome_family_log)]
+fn a_walk_after_a_wait_that_ran_out_is_not_the_last_one() {
+    let test_name = "a_walk_after_a_wait_that_ran_out_is_not_the_last_one";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut parent = start_idle_family();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // ~keep The first wait has no member to wait for. The second one waits for the whole family
+    // ~keep and is then reported as run out.
+    let mut waits = 0;
+    let (family, fields) = crate::tracing_capture::capture_events(|| {
+        ChromeFamily::freeze_with(parent.id(), |stopping| {
+            waits += 1;
+            ChromeFamily::settle(stopping) && waits != 2
+        })
+    });
+    let running = members_running(&family);
+    family.kill();
+    let gone = family.wait(Duration::from_secs(5));
+    let _ = parent.wait();
+
+    assert!(
+        family.members.len() > 2,
+        "{test_name}: the family must hold the shell and its children, got {}",
+        family.members.len()
+    );
+    assert!(
+        waits > 2,
+        "{test_name}: the collection must wait and walk once more after the wait that ran out, got {waits} waits"
+    );
+    assert!(
+        fields.is_empty(),
+        "{test_name}: one wait that ran out must not end the collection with a warning, got {fields:?}"
+    );
+    assert_eq!(
+        running, 0,
+        "{test_name}: every member must have its stop, {running} still ran"
+    );
+    assert!(gone, "{test_name}: every member must be gone within the limit");
+}
+
+/// A member that does not take its stop does not hold the collection for every walk: after two
+/// waits in a row that ran out, with no new member in the walk after each, the collection ends
+/// and logs the member.
+///
+/// ~keep A process inside `vfork` on Linux is such a member. The test reports every wait as
+/// ~keep run out, which is what the collection sees of it.
+#[test]
+#[serial_test::serial(chrome_family_log)]
+fn a_member_that_does_not_take_its_stop_ends_the_collection_after_two_waits() {
+    let test_name = "a_member_that_does_not_take_its_stop_ends_the_collection_after_two_waits";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut parent = start_idle_family();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut waits = 0;
+    let (family, fields) = crate::tracing_capture::capture_events(|| {
+        ChromeFamily::freeze_with(parent.id(), |_| {
+            waits += 1;
+            false
+        })
+    });
+    family.kill();
+    let gone = family.wait(Duration::from_secs(5));
+    let _ = parent.wait();
+
+    assert!(
+        family.members.len() > 2,
+        "{test_name}: the family must hold the shell and its children, got {}",
+        family.members.len()
+    );
+    assert_eq!(
+        waits, 3,
+        "{test_name}: the collection must end after the first wait, which has no member, and two waits that ran out"
+    );
+    assert!(
+        logged(&fields, UNSTOPPED) && !logged(&fields, UNSETTLED),
+        "{test_name}: the collection must log the member that did not take its stop, got {fields:?}"
+    );
+    assert!(gone, "{test_name}: every member must be gone within the limit");
+}
+
+/// A family in which a member runs and forks before every walk is never taken as at rest, and not
+/// as a member that cannot take its stop either: the collection uses every walk and logs that the
+/// family did not come to rest.
+///
+/// ~keep The wait of the test continues every member, waits until the shell has one more child,
+/// ~keep and reports that the wait ran out, so every walk finds a new member.
+#[test]
+#[serial_test::serial(chrome_family_log)]
+fn a_family_that_forks_before_every_walk_uses_every_walk_and_is_logged() {
+    let test_name = "a_family_that_forks_before_every_walk_uses_every_walk_and_is_logged";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut parent = start_family(
+        "while :; do sleep 5 & sleep 0.05 & wait $!; done",
+        "crawlberg-forking-family",
+    );
+    let shell = Pid::from_u32(parent.id());
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut waits = 0;
+    let mut forked = true;
+    let (family, fields) = crate::tracing_capture::capture_events(|| {
+        ChromeFamily::freeze_with(parent.id(), |stopping| {
+            waits += 1;
+            if !stopping.is_empty() {
+                let before = children_of(shell);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut grew = false;
+                while !grew && std::time::Instant::now() < deadline {
+                    for member in stopping {
+                        resume(*member);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    grew = children_of(shell) > before;
+                }
+                forked &= grew;
+            }
+            false
+        })
+    });
+    family.kill();
+    let gone = family.wait(Duration::from_secs(5));
+    let _ = parent.wait();
+
+    assert!(forked, "{test_name}: the shell must have forked before every walk");
+    assert_eq!(
+        waits,
+        ChromeFamily::WALKS,
+        "{test_name}: a family that forks before every walk must use every walk"
+    );
+    assert!(
+        logged(&fields, UNSETTLED) && !logged(&fields, UNSTOPPED),
+        "{test_name}: the collection must log that the family did not come to rest, got {fields:?}"
+    );
+    assert!(gone, "{test_name}: every member must be gone within the limit");
+}
+
+/// The kill ends every process the browser started, not only the main process: Chrome is launched
+/// through a script that leaves a marked child behind before it becomes Chrome, and that child must
+/// be gone when the kill returns.
+///
+/// ~keep Chrome's own helpers exit on their own soon after the main process is killed, so a kill
+/// ~keep that collected nothing passed the profile tests on an idle host and left the directory
+/// ~keep behind only under load. The script's child never exits on its own, so the kill has to
+/// ~keep end it. The child's parent is the script's shell, which becomes Chrome's main process
+/// ~keep when it execs, so the child is family.
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn kill_browser_ends_a_process_the_browser_started() {
+    let test_name = "kill_browser_ends_a_process_the_browser_started";
+    if !cfg!(unix) {
+        return;
+    }
+    let chrome = match std::env::var_os("CRAWLBERG_TEST_CHROME_PATH") {
+        Some(path) => path.into(),
+        None => {
+            let Ok(chrome) = default_executable(DetectionOptions::default()) else {
+                eprintln!("skipping {test_name} because no usable Chrome was found");
+                return;
+            };
+            chrome
+        }
+    };
+    let root = std::env::temp_dir().join(format!("crawlberg-wrapped-{}", std::process::id()));
+    let profile = root.join("crawlberg-interact-0-0");
+    let marker = format!("crawlberg-left-behind-{}", std::process::id());
+    let script = root.join("chrome-that-leaves-a-child.sh");
+    std::fs::create_dir_all(&root).expect("the test directory must be created");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsh -c 'sleep 60; : {marker}' >/dev/null 2>&1 &\nexec \"{}\" \"$@\"\n",
+            chrome.display()
+        ),
+    )
+    .expect("the script must be written");
+    let executable = std::process::Command::new("chmod")
+        .arg("755")
+        .arg(&script)
+        .status()
+        .is_ok_and(|status| status.success());
+    assert!(executable, "{test_name}: the script must be made executable");
+    let builder = build_pool_launch_builder(&profile, &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check")
+        .chrome_executable(&script);
+    let Some((browser, task)) = launch_config(test_name, builder).await else {
+        return;
+    };
+    let before = processes_containing(&marker);
+    kill_browser(browser, task, profile.clone(), Duration::from_secs(5)).await;
+    let after = processes_containing(&marker);
+    let _ = std::process::Command::new("pkill").args(["-f", &marker]).status();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        before, 1,
+        "{test_name}: the script must leave one child behind before it becomes Chrome, got {before}"
+    );
+    assert_eq!(
+        after, 0,
+        "{test_name}: a process the browser started must be gone when the kill returns, {after} left"
+    );
+}
+
+/// The wait for a member's stop ends once the member has taken it, and at its bound while a member
+/// has not.
+#[test]
+fn the_wait_for_a_stop_ends_when_it_is_taken_or_at_its_bound() {
+    let test_name = "the_wait_for_a_stop_ends_when_it_is_taken_or_at_its_bound";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut stopped = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep must start");
+    let mut running = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep must start");
+    let sent = std::process::Command::new("kill")
+        .args(["-STOP", &stopped.id().to_string()])
+        .status()
+        .is_ok_and(|status| status.success());
+    let members = [Pid::from_u32(stopped.id()), Pid::from_u32(running.id())];
+    let (report, waited) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let settled = ChromeFamily::settle(&members);
+        let _ = report.send((started.elapsed(), settled));
+    });
+    let waited = waited.recv_timeout(ChromeFamily::SETTLE * 5);
+    let started = std::time::Instant::now();
+    let settled = ChromeFamily::settle(&members[..1]);
+    let settled_in = started.elapsed();
+    let _ = stopped.kill();
+    let _ = stopped.wait();
+    let _ = running.kill();
+    let _ = running.wait();
+
+    assert!(sent, "{test_name}: the stop must be sent");
+    assert!(
+        matches!(waited, Ok((waited, false)) if waited >= ChromeFamily::SETTLE),
+        "{test_name}: the wait must last until its bound while a member has not taken its stop, and say that it ran out, got {waited:?}"
+    );
+    assert!(
+        settled && settled_in < ChromeFamily::SETTLE,
+        "{test_name}: the wait must end once every member has taken its stop, and say so: it took {settled_in:?} and returned {settled}"
+    );
+}
+
+/// The wait for a family ends when its members are gone, and at its limit while they are not.
+#[test]
+fn the_wait_for_a_family_ends_with_its_members_or_at_its_limit() {
+    let test_name = "the_wait_for_a_family_ends_with_its_members_or_at_its_limit";
+    if !cfg!(unix) {
+        return;
+    }
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep must start");
+    let family = ChromeFamily {
+        members: vec![Pid::from_u32(child.id())],
+    };
+    let started = std::time::Instant::now();
+    let gone_early = family.wait(Duration::from_millis(300));
+    let waited = started.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    let gone = family.wait(Duration::from_secs(5));
+
+    assert!(
+        !gone_early,
+        "{test_name}: the wait must report a member still running at its limit"
+    );
+    assert!(
+        waited >= Duration::from_millis(300),
+        "{test_name}: the wait must last until its limit, it ended after {waited:?}"
+    );
+    assert!(gone, "{test_name}: the wait must end once every member is gone");
+}
+
+/// A member whose main thread has exited reads as a zombie while another thread of it still
+/// runs, and the wait holds until that thread is gone too.
+///
+/// ~keep The child's main thread leaves through pthread_exit while a second thread sleeps on:
+/// ~keep the shape a killed Chrome process takes while a thread of it finishes a write.
+#[test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+fn the_wait_for_a_family_holds_while_a_thread_of_a_zombie_member_runs() {
+    let test_name = "the_wait_for_a_family_holds_while_a_thread_of_a_zombie_member_runs";
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Ok(mut child) = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import ctypes, threading, time\nthreading.Thread(target=time.sleep, args=(30,)).start()\n\
+             ctypes.CDLL(None).pthread_exit(None)",
+        )
+        .spawn()
+    else {
+        eprintln!("skipping {test_name} because python3 is not available");
+        return;
+    };
+    let pid = Pid::from_u32(child.id());
+    let mut system = System::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reads_as_zombie = false;
+    while std::time::Instant::now() < deadline {
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::nothing());
+        if system
+            .process(pid)
+            .is_some_and(|process| process.status() == ProcessStatus::Zombie)
+        {
+            reads_as_zombie = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let family = ChromeFamily { members: vec![pid] };
+    let started = std::time::Instant::now();
+    let gone_while_running = family.wait(Duration::from_millis(500));
+    let held = started.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    let gone = family.wait(Duration::from_secs(5));
+
+    assert!(
+        reads_as_zombie,
+        "{test_name}: the child's main thread must have exited so that it reads as a zombie"
+    );
+    assert!(
+        !gone_while_running && held >= Duration::from_millis(500),
+        "{test_name}: a member with a running thread must not be taken as gone, gone={gone_while_running} after {held:?}"
+    );
+    assert!(gone, "{test_name}: the member must be gone once its threads are");
+}
+
+/// A kill that cannot run falls back to releasing the browser, and the profile is still removed.
+///
+/// ~keep A browser reached through `Browser::connect` has no child process, so its kill returns
+/// ~keep nothing: that is the failed kill this drives.
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn kill_browser_releases_a_browser_it_cannot_kill_and_removes_the_profile() {
+    const TEST_NAME: &str = "kill_browser_releases_a_browser_it_cannot_kill_and_removes_the_profile";
+    let user_data_dir = std::env::temp_dir().join(format!("crawlberg-kill-fallback-test-{}", std::process::id()));
+    let launched = match build_pool_launch_builder(&user_data_dir, &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut owner, owner_handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    let owner_task = spawn_handler(owner_handler);
+    let (connected, mut handler) = Browser::connect(owner.websocket_address().clone())
+        .await
+        .expect("connecting to the launched Chrome must succeed");
+    // ~keep Kept as the plain loop: the assertion reads this task's end as the release's abort, and
+    // ~keep a loop that ends at a websocket error would also end if the release closed the Chrome.
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let handler_abort = handler_task.abort_handle();
+    let profile = std::env::temp_dir().join(format!("crawlberg-kill-fallback-profile-{}", std::process::id()));
+    std::fs::create_dir_all(profile.join("Default")).expect("the profile must be created");
+
+    kill_browser(connected, handler_task, profile.clone(), Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let released = handler_abort.is_finished();
+    let removed = !profile.exists();
+
+    let _ = owner.kill().await;
+    owner_task.abort();
+    let _ = std::fs::remove_dir_all(&user_data_dir);
+    let _ = std::fs::remove_dir_all(&profile);
+
+    assert!(
+        released,
+        "a browser the kill cannot end must be released: its handler task must stop"
+    );
+    assert!(removed, "the profile must be removed after the fallback release");
+}
+
+/// The profile check of a Chrome on the private pipe confirms the directory that Chrome opened.
+/// It refuses another directory and stops the Chrome that it refuses.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn the_profile_check_of_a_pipe_launch_refuses_a_directory_chrome_did_not_open() {
+    const TEST_NAME: &str = "the_profile_check_of_a_pipe_launch_refuses_a_directory_chrome_did_not_open";
+    // ~keep Made as a launch makes it, where a snap Chrome reads it: a snap has a private /tmp.
+    let profile = ScratchProfileDir::create("crawlberg-pipe-profile-check-", None).expect("a profile directory");
+    let user_data_dir = profile.path().to_path_buf();
+    let other_dir = std::env::temp_dir().join(format!("crawlberg-pipe-profile-other-{}", std::process::id()));
+    let pool_config = BrowserPoolConfig {
+        private_pipe: true,
+        ..BrowserPoolConfig::default()
+    };
+    let launched = match build_pool_launch_builder(&user_data_dir, &pool_config)
+        .expect("the pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut browser, handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    let handler_task = spawn_handler(handler);
+    std::fs::create_dir_all(&other_dir).expect("the other directory must be created");
+
+    let transport = browser.websocket_address().clone();
+    let confirmed = confirm_profile_in_use(&mut browser, &user_data_dir).await;
+    let refused = confirm_profile_in_use(&mut browser, &other_dir).await;
+    let stopped = matches!(browser.try_wait(), Ok(Some(_)));
+
+    let _ = browser.kill().await;
+    handler_task.abort();
+    drop(profile);
+    let _ = std::fs::remove_dir_all(&other_dir);
+
+    assert_eq!(
+        transport, "pipe",
+        "a pool with the key on must launch on the private pipe"
+    );
+    confirmed.expect("the check must confirm the directory that Chrome opened");
+    let refusal = refused
+        .expect_err("the check must refuse a directory that Chrome did not open")
+        .to_string();
+    assert!(refusal.contains("a different profile"), "{refusal}");
+    assert!(stopped, "the Chrome that the check refuses must be stopped");
+}
+
+/// The handler of a Chrome on the private pipe ends when that Chrome is killed, and it records
+/// that the pipe closed. A page request reads that cause for its error.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn the_handler_of_a_killed_pipe_chrome_ends_with_the_cause_that_the_pipe_closed() {
+    const TEST_NAME: &str = "the_handler_of_a_killed_pipe_chrome_ends_with_the_cause_that_the_pipe_closed";
+    let user_data_dir = std::env::temp_dir().join(format!("crawlberg-pipe-handler-end-{}", std::process::id()));
+    let pool_config = BrowserPoolConfig {
+        private_pipe: true,
+        ..BrowserPoolConfig::default()
+    };
+    let launched = match build_pool_launch_builder(&user_data_dir, &pool_config)
+        .expect("the pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await.map_err(|error| error.to_string()),
+        Err(error) => Err(error),
+    };
+    let Some((mut browser, handler)) = expect_chrome_or_skip(TEST_NAME, launched) else {
+        return;
+    };
+    let transport = browser.websocket_address().clone();
+    let (handler_task, handler_end) = spawn_watched_handler(handler);
+
+    let _ = browser.kill().await;
+    let ended = tokio::time::timeout(Duration::from_secs(15), handler_task)
+        .await
+        .is_ok();
+    let cause = handler_end.cause().map(str::to_owned);
+    let _ = std::fs::remove_dir_all(&user_data_dir);
+
+    assert_eq!(
+        transport, "pipe",
+        "a pool with the key on must launch on the private pipe"
+    );
+    assert!(ended, "the handler of a killed Chrome must end within 15 s");
+    assert!(
+        cause
+            .as_deref()
+            .is_some_and(|cause| cause.contains("CDP pipe connection closed")),
+        "the handler must record that the pipe closed: {cause:?}"
+    );
+}
+
+/// A launched browser opens no tab of its own, so nothing loads before crawlberg asks.
+#[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "test-only skip announcement, matching tests/common/mod.rs's convention"
+)]
+async fn a_launched_browser_opens_no_startup_tab() {
+    const TEST_NAME: &str = "a_launched_browser_opens_no_startup_tab";
+    let user_data_dir = std::env::temp_dir().join(format!("crawlberg-startup-tab-test-{}", std::process::id()));
+    let launched = match build_pool_launch_builder(&user_data_dir, &BrowserPoolConfig::default())
+        .expect("the default pool config names no binary to check")
+        .build()
+    {
+        Ok(config) => Browser::launch(config).await,
+        Err(error) if error.contains("auto detect a chrome executable") => {
+            eprintln!("skipping {TEST_NAME}: no Chrome executable: {error}");
+            return;
+        }
+        Err(error) => panic!("{TEST_NAME}: the detected Chrome configuration must build: {error}"),
+    };
+    let (mut browser, handler) = match launched {
+        Ok(pair) => pair,
+        Err(error) => panic!("{TEST_NAME}: the detected Chrome must launch: {error}"),
+    };
+    let handler_task = spawn_handler(handler);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let pages: Vec<String> = browser
+        .fetch_targets()
+        .await
+        .expect("the targets must be listed")
+        .into_iter()
+        .filter(|target| target.r#type == "page")
+        .map(|target| target.url)
+        .collect();
+    let _ = close_browser_within(&mut browser, HANDLER_SHUTDOWN_TIMEOUT).await;
+    handler_task.abort();
+    let _ = std::fs::remove_dir_all(&user_data_dir);
+    assert!(
+        pages.is_empty(),
+        "the browser must open no tab of its own, got {pages:?}"
+    );
+}
+
+#[test]
+fn test_safe_default_args_never_double_prefixes_for_chromiumoxide() {
+    // ~keep chromiumoxide's BrowserConfig::arg renders every entry as `--{arg}`; an
+    // ~keep already-`--`-prefixed entry would render as `----...` and Chrome discards
+    // ~keep it as an unknown flag (see chrome_args.rs).
+    for arg in safe_default_args() {
+        let rendered = format!("--{arg}");
+        assert!(!rendered.starts_with("----"), "double-prefixed flag: {rendered}");
+    }
+}
+
+#[test]
+fn test_safe_default_args_adds_use_mock_keychain_on_macos_only() {
+    let args = safe_default_args();
+    if cfg!(target_os = "macos") {
+        assert!(
+            args.contains(&"use-mock-keychain"),
+            "missing --use-mock-keychain on macOS"
+        );
+    } else {
+        assert!(
+            !args.contains(&"use-mock-keychain"),
+            "use-mock-keychain should be macOS-only"
+        );
+    }
+}
+
+#[test]
+fn test_apply_default_args_produces_normalized_flags() {
+    let builder = apply_default_args(BrowserConfig::builder(), &[]);
+    assert_launch_flags_are_normalized(&builder);
+}
+
+#[test]
+fn the_pool_launch_builder_carries_no_double_dashed_flag_and_the_macos_keychain_flag() {
+    // ~keep Behavioral, not textual: this calls the exact function `launch_browser`
+    // ~keep uses to build its `BrowserConfig`, so a path that stops calling
+    // ~keep `apply_default_args` (even by looping over a raw flag instead) fails here
+    // ~keep because the returned flags actually change.
+    let builder = build_pool_launch_builder(
+        std::path::Path::new("/tmp/pool-test-profile"),
+        &BrowserPoolConfig::default(),
+    )
+    .expect("the default pool config names no binary to check");
+    assert_launch_flags_are_normalized(&builder);
+}
+
+#[test]
+fn the_pool_launch_builder_uses_the_configured_chrome_path_and_args() {
+    assert_launch_overrides_reach_the_builder(|chrome_path, chrome_args| {
+        build_pool_launch_builder(
+            std::path::Path::new("/tmp/pool-test-profile"),
+            &BrowserPoolConfig {
+                chrome_path,
+                chrome_args,
+                ..BrowserPoolConfig::default()
+            },
+        )
+    });
+}
+
+#[test]
+fn the_pool_launch_builder_chooses_the_transport_by_the_private_pipe_key() {
+    assert!(
+        !BrowserPoolConfig::default().private_pipe,
+        "a default pool must launch on the debugging port"
+    );
+    assert_private_pipe_chooses_the_transport(|private_pipe| {
+        build_pool_launch_builder(
+            std::path::Path::new("/tmp/pool-test-profile"),
+            &BrowserPoolConfig {
+                private_pipe,
+                ..BrowserPoolConfig::default()
+            },
+        )
+    });
+}
+
+/// A pool serves a fetch from its own launch only when the key of the fetch is the pool's.
+#[test]
+fn a_pool_does_not_claim_the_launch_options_of_a_config_with_another_private_pipe_key() {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let same = crate::types::BrowserConfig::default();
+    let other = crate::types::BrowserConfig {
+        private_pipe: true,
+        ..Default::default()
+    };
+    assert!(pool.uses_launch_options(&same));
+    assert!(!pool.uses_launch_options(&other));
+}
+
+#[test]
+fn the_debug_text_of_a_pool_config_shows_the_private_pipe_key() {
+    let text = format!(
+        "{:?}",
+        BrowserPoolConfig {
+            private_pipe: true,
+            ..BrowserPoolConfig::default()
+        }
+    );
+    assert!(text.contains("private_pipe: true"), "{text}");
+}
+
+#[test]
+fn the_pool_launch_builder_refuses_the_chrome_args_validate_refuses_and_names_the_pool_key() {
+    for (chrome_args, expected) in [
+        (
+            vec!["disable-gpu"],
+            "browser: BrowserPoolConfig.chrome_args entry at index 0 must start with --",
+        ),
+        (
+            vec!["--headless=new"],
+            "browser: BrowserPoolConfig.chrome_args must not set --headless; crawlberg sets it to run Chrome",
+        ),
+        (
+            vec!["--LANG=fr"],
+            "browser: BrowserPoolConfig.chrome_args entry at index 0 must name the flag in lowercase",
+        ),
+        (
+            vec!["--enable-features=A", "--enable-features=B"],
+            "browser: BrowserPoolConfig.chrome_args entry at index 1 duplicates an earlier flag",
+        ),
+    ] {
+        let err = build_pool_launch_builder(
+            std::path::Path::new("/tmp/pool-test-profile"),
+            &BrowserPoolConfig {
+                chrome_args: chrome_args.iter().map(|arg| (*arg).to_owned()).collect(),
+                ..BrowserPoolConfig::default()
+            },
+        )
+        .expect_err("the pool must refuse what CrawlConfig::validate refuses")
+        .to_string();
+        assert!(err.contains(expected), "{chrome_args:?}: unexpected error: {err}");
+    }
+}
+
+#[test]
+fn the_pool_launch_builder_does_not_echo_rejected_chrome_arg_input() {
+    const SECRET: &str = "sk-live-pool-9f8e7d6c5b4a";
+
+    for (chrome_args, expected) in [
+        (
+            vec![format!("proxy-server={SECRET}")],
+            "browser: BrowserPoolConfig.chrome_args entry at index 0 must start with -- followed by a flag name; \
+             write a flag with a value as --flag=value",
+        ),
+        (
+            vec![format!("--Proxy-Server={SECRET}")],
+            "browser: BrowserPoolConfig.chrome_args entry at index 0 must name the flag in lowercase, as Chrome does",
+        ),
+        (
+            vec![format!("--{SECRET}=first"), format!("--{SECRET}=second")],
+            "browser: BrowserPoolConfig.chrome_args entry at index 1 duplicates an earlier flag",
+        ),
+    ] {
+        let error = build_pool_launch_builder(
+            std::path::Path::new("/tmp/pool-test-profile"),
+            &BrowserPoolConfig {
+                chrome_args,
+                ..BrowserPoolConfig::default()
+            },
+        )
+        .expect_err("the pool must reject an invalid Chrome argument");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert_eq!(display, expected);
+        assert!(!display.contains(SECRET), "Display printed caller input: {display}");
+        assert!(!debug.contains(SECRET), "Debug printed caller input: {debug}");
+    }
+}
+
+#[tokio::test]
+async fn a_pool_with_a_missing_chrome_path_fails_to_launch_and_names_the_path() {
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        chrome_path: Some(std::path::PathBuf::from("/nonexistent/crawlberg-pool-chrome")),
+        ..BrowserPoolConfig::default()
+    });
+    let error = match pool.acquire_page().await {
+        Ok(_) => panic!("a pool must not launch a different Chrome when chrome_path is missing"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("BrowserPoolConfig.chrome_path '/nonexistent/crawlberg-pool-chrome' cannot be used"),
+        "the error must name the pool key and the path, got: {error}"
+    );
+}
+
+/// The pool is the one launch path a caller reaches without going through `CrawlConfig::validate`,
+/// so a refused `chrome_path` must remove the scratch directory the guard created for the launch it
+/// never made, not only fail with the right message.
+///
+/// ~keep Pins the call site in `launch_browser`: `ScratchProfileDir::create` then
+/// ~keep `build_pool_launch_builder(..)?`, whose `?` drops the guard on a refusal. A future call
+/// ~keep site that reorders this (or forgets the `?`) leaks the directory and every shipped test
+/// ~keep before this one still passes, because none of them checked for the directory.
+#[tokio::test]
+async fn a_pool_refused_by_a_missing_chrome_path_leaves_no_profile_directory() {
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        chrome_path: Some(std::path::PathBuf::from("/nonexistent/crawlberg-pool-chrome")),
+        ..BrowserPoolConfig::default()
+    });
+    let error = assert_refused_launch_leaves_no_scratch_dir(|| pool.acquire_page()).await;
+    assert!(
+        error.contains("BrowserPoolConfig.chrome_path '/nonexistent/crawlberg-pool-chrome' cannot be used"),
+        "the error must name the pool key and the path, got: {error}"
+    );
+}
+
+/// The same call site refused by a `chrome_args` entry instead of `chrome_path`: `--user-data-dir`
+/// is a flag the launch itself sets, so `CrawlConfig::validate`'s own rule refuses it here too.
+#[tokio::test]
+async fn a_pool_refused_by_a_user_data_dir_flag_leaves_no_profile_directory() {
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        chrome_args: vec!["--user-data-dir=/tmp/crawlberg-pool-elsewhere".to_owned()],
+        ..BrowserPoolConfig::default()
+    });
+    let error = assert_refused_launch_leaves_no_scratch_dir(|| pool.acquire_page()).await;
+    assert!(
+        error.contains("must not set --user-data-dir"),
+        "the error must name the refused flag, got: {error}"
+    );
+}
+
+#[test]
+fn test_every_known_launch_path_calls_the_shared_apply_default_args_helper() {
+    // ~keep Textual guard, kept alongside the behavioral tests above and in browser.rs's
+    // ~keep and interact/chromiumoxide.rs's own test modules (each builds the real
+    // ~keep launch config for its path and inspects the flags). Comments are stripped
+    // ~keep and apply_default_args' own definition line is excluded, so a path that
+    // ~keep only mentions the helper's name in a comment, or is the file that defines
+    // ~keep it, does not satisfy this; only a real call site does.
+    // ~keep Limitation: this can only check the three files named here. A fourth
+    // ~keep launch path added in a new file is NOT caught by this test; it needs its
+    // ~keep own behavioral test or a new entry in this list.
+    for (path, src) in [
+        ("browser/launch.rs", include_str!("browser/launch.rs")),
+        ("browser_pool.rs", include_str!("browser_pool.rs")),
+        ("interact/chromiumoxide.rs", include_str!("interact/chromiumoxide.rs")),
+    ] {
+        // ~keep Cut at the first test module's declaration, not at the first `#[cfg(test)]`:
+        // ~keep production code carries `#[cfg(test)]` statements of its own (the profile
+        // ~keep teardown's counters in browser_pool.rs), and cutting there hid every launch
+        // ~keep path below them.
+        let code_only: String = src
+            .lines()
+            .take_while(|line| {
+                let line = line.trim_start();
+                !((line.starts_with("mod ") || line.starts_with("pub(crate) mod ")) && line.contains("tests"))
+            })
+            .filter(|line| !line.contains("fn apply_default_args("))
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code_only.contains("apply_default_args("),
+            "{path} does not call the shared apply_default_args helper outside a comment or its own definition"
+        );
+    }
+}
+
+#[test]
+fn the_pool_config_debug_hides_a_credential_in_a_chrome_flag() {
+    let config = BrowserPoolConfig {
+        chrome_args: vec![
+            "--proxy-server=http://operator:IMPL385-CA-PW@proxy.test:8080".to_owned(),
+            "--proxy-server=operator:IMPL385-CA-BARE@proxy.test:8080".to_owned(),
+            "--disable-gpu".to_owned(),
+        ],
+        ..BrowserPoolConfig::default()
+    };
+    let shown = format!("{config:?}");
+    assert!(
+        !shown.contains("IMPL385-CA"),
+        "a chrome flag shows its credential: {shown}"
+    );
+    assert!(
+        shown.contains("--proxy-server") && shown.contains("--disable-gpu"),
+        "positive twin: the flag names are shown: {shown}"
+    );
+}
+
+/// Every spelling of a WebSocket endpoint that the endpoint checks accept, each with its own
+/// path so a recorded request names the spelling that sent it: upper case, mixed case, padded
+/// with spaces, no `//`, and the plain lower-case form as the control.
+fn accepted_endpoint_spellings(port: u16) -> Vec<(String, &'static str)> {
+    vec![
+        (format!("ws://127.0.0.1:{port}/lower"), "/lower"),
+        (format!("WS://127.0.0.1:{port}/upper"), "/upper"),
+        (format!("Ws://127.0.0.1:{port}/mixed"), "/mixed"),
+        (format!(" ws://127.0.0.1:{port}/padded "), "/padded"),
+        (format!("ws:127.0.0.1:{port}/no-slashes"), "/no-slashes"),
+    ]
+}
+
+/// Drive `connect` with every accepted endpoint spelling against a local listener, and assert
+/// that each one reaches it: an endpoint the checks accept must never fail before it connects.
+///
+/// ~keep The listener answers every request with HTTP 418 and records the request line before
+/// ~keep it answers, so the connect fails fast after the request arrived and the record is
+/// ~keep complete when `connect` returns. A closed port cannot tell the two failures apart:
+/// ~keep the TCP connect happens before the scheme check, so every spelling is refused alike.
+pub(crate) async fn assert_every_accepted_endpoint_reaches_the_browser<F, Fut, T>(mut connect: F)
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, CrawlError>>,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a local port must be free");
+    let port = listener.local_addr().expect("the listener has an address").port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = Arc::clone(&seen);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let line = request.lines().next().unwrap_or_default().to_owned();
+            recorder.lock().expect("the recorder lock is never poisoned").push(line);
+            let _ = stream
+                .write_all(b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+
+    let mut missed = Vec::new();
+    for (endpoint, path) in accepted_endpoint_spellings(port) {
+        assert!(
+            crate::net::is_websocket_scheme(&endpoint),
+            "the endpoint checks must accept {endpoint:?}"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(10), connect(endpoint.clone())).await;
+        let error = match outcome {
+            Ok(Ok(_)) => panic!("a listener that answers 418 must not complete a connect for {endpoint:?}"),
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => panic!("the connect for {endpoint:?} did not finish within 10 seconds"),
+        };
+        let expected = format!("GET {path} HTTP/1.1");
+        if !seen
+            .lock()
+            .expect("the recorder lock is never poisoned")
+            .contains(&expected)
+        {
+            missed.push(format!("{endpoint:?} (connect error: {error})"));
+        }
+    }
+    server.abort();
+    assert!(
+        missed.is_empty(),
+        "accepted endpoints that never reached the browser: {missed:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_pool_connects_every_endpoint_spelling_the_checks_accept() {
+    assert_every_accepted_endpoint_reaches_the_browser(|endpoint| async move {
+        let pool = BrowserPool::new(BrowserPoolConfig {
+            browser_endpoint: Some(endpoint),
+            launch_timeout: Duration::from_secs(5),
+            ..BrowserPoolConfig::default()
+        });
+        pool.warm().await
+    })
+    .await;
+}
+
+/// The pool's connect-error message must never carry a `browser.endpoint` password or path
+/// token, though the failing origin must still be readable for debugging.
+///
+/// ~keep The launch path and the interact backend have the same test (`browser/launch.rs`,
+/// ~keep `interact/chromiumoxide.rs`): xberg-io/crawlberg#473 was this test missing for one
+/// ~keep connect site after another added it for a different one, so each site keeps its own,
+/// ~keep including the pool. A closed local port refuses the connection immediately, so this
+/// ~keep needs no real Chrome and stays fast; `ws://` skips chromiumoxide's `json/version` HTTP
+/// ~keep probe and goes straight to the WebSocket handshake.
+#[tokio::test]
+async fn pool_connect_error_prints_only_the_endpoint_origin() {
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        browser_endpoint: Some("ws://user:hunter2@127.0.0.1:1/devtools/browser/b1946ac9-guid".into()),
+        launch_timeout: Duration::from_secs(5),
+        ..BrowserPoolConfig::default()
+    });
+
+    let err = pool
+        .warm()
+        .await
+        .expect_err("a refused local port must fail the connect");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("hunter2"),
+        "password must not survive into the error, got: {msg}"
+    );
+    assert!(
+        !msg.contains("b1946ac9-guid"),
+        "the CDP path token must not survive into the error, got: {msg}"
+    );
+    assert!(
+        msg.contains("127.0.0.1"),
+        "host must still appear in the error, got: {msg}"
+    );
+}
+
+fn preferences(dir: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(dir.join("Default").join("Preferences")).expect("the preference file must exist");
+    serde_json::from_slice(&bytes).expect("the preference file must be JSON")
+}
+
+#[test]
+fn the_webrtc_preference_is_written_into_a_new_profile() {
+    let dir = tempfile::tempdir().expect("a temp profile directory");
+    disable_non_proxied_udp(dir.path()).expect("the preference must be written");
+    assert_eq!(
+        preferences(dir.path()),
+        serde_json::json!({ "webrtc": { "ip_handling_policy": "disable_non_proxied_udp" } })
+    );
+}
+
+#[test]
+fn the_webrtc_preference_keeps_what_a_profile_already_holds() {
+    let dir = tempfile::tempdir().expect("a temp profile directory");
+    std::fs::create_dir_all(dir.path().join("Default")).expect("the profile directory must be made");
+    std::fs::write(
+        dir.path().join("Default").join("Preferences"),
+        r#"{"profile":{"name":"kept"},"webrtc":{"multiple_routes_enabled":false,"ip_handling_policy":"default"}}"#,
+    )
+    .expect("the preference file must be written");
+    disable_non_proxied_udp(dir.path()).expect("the preference must be merged");
+    assert_eq!(
+        preferences(dir.path()),
+        serde_json::json!({
+            "profile": { "name": "kept" },
+            "webrtc": { "multiple_routes_enabled": false, "ip_handling_policy": "disable_non_proxied_udp" }
+        })
+    );
+}
+
+#[test]
+fn a_preference_file_that_is_not_a_json_object_is_refused_and_left_alone() {
+    for content in ["{\"webrtc\": ", "[1]", "{\"webrtc\": 1}"] {
+        let dir = tempfile::tempdir().expect("a temp profile directory");
+        let path = dir.path().join("Default").join("Preferences");
+        std::fs::create_dir_all(dir.path().join("Default")).expect("the profile directory must be made");
+        std::fs::write(&path, content).expect("the preference file must be written");
+        let error = disable_non_proxied_udp(dir.path()).expect_err("a broken preference file must be refused");
+        assert!(
+            error.to_string().contains("WebRTC preference"),
+            "the error must name the WebRTC preference for {content:?}, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file must still be there"),
+            content,
+            "a refused preference file must be left as it was"
+        );
+    }
+}
+
+/// The DevTools websocket address chromiumoxide reads from a launched Chrome's stderr.
+const WEBSOCKET: &str = "ws://127.0.0.1:41235/devtools/browser/5c1e0f6a-6a43-4f4a-9d0b-2b7b0f0e3a11";
+
+#[test]
+fn a_profile_chrome_wrote_its_devtools_port_into_is_confirmed() {
+    let dir = tempfile::tempdir().expect("a temp profile directory");
+    std::fs::write(
+        dir.path().join("DevToolsActivePort"),
+        "41235\n/devtools/browser/5c1e0f6a-6a43-4f4a-9d0b-2b7b0f0e3a11",
+    )
+    .expect("the port file must be written");
+    assert!(wrote_devtools_port(dir.path(), WEBSOCKET));
+}
+
+#[test]
+fn a_profile_chrome_did_not_write_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp profile directory");
+    disable_non_proxied_udp(dir.path()).expect("the preference must be written");
+    assert!(
+        !wrote_devtools_port(dir.path(), WEBSOCKET),
+        "a profile with no DevToolsActivePort was not opened by the launched Chrome"
+    );
+    for stale in [
+        "41236\n/devtools/browser/5c1e0f6a-6a43-4f4a-9d0b-2b7b0f0e3a11",
+        "41235\n/devtools/browser/00000000-6a43-4f4a-9d0b-2b7b0f0e3a11",
+        "41235",
+        "",
+    ] {
+        std::fs::write(dir.path().join("DevToolsActivePort"), stale).expect("the port file must be written");
+        assert!(
+            !wrote_devtools_port(dir.path(), WEBSOCKET),
+            "a port file another Chrome wrote must be refused: {stale:?}"
+        );
+    }
+}
+
+#[test]
+fn a_snap_chrome_gets_its_scratch_profile_in_the_snaps_common_directory() {
+    let home = std::path::Path::new("/home/runner");
+    let common = home.join("snap").join("chromium").join("common");
+    for executable in [
+        "/snap/bin/chromium",
+        "/snap/bin/chromium.chromedriver",
+        "/snap/chromium/current/usr/lib/chromium-browser/chrome",
+    ] {
+        assert_eq!(
+            snap_common_dir(std::path::Path::new(executable), home),
+            Some(common.clone()),
+            "{executable} runs the chromium snap"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_snap_chrome_gets_the_snaps_common_directory() {
+    let home = std::path::Path::new("/home/runner");
+    let dir = tempfile::tempdir().expect("a temp directory");
+    // ~keep The second target is the link setup-chrome made on CI, whose binary does not exist.
+    for (index, target) in ["/snap/bin/chromium", "/snap/chromium/current/usr/bin/chromium"]
+        .into_iter()
+        .enumerate()
+    {
+        let link = dir.path().join(format!("chromium-{index}"));
+        std::os::unix::fs::symlink(target, &link).expect("the link must be made");
+        assert_eq!(
+            snap_common_dir(&link, home),
+            Some(home.join("snap").join("chromium").join("common")),
+            "a link to {target} runs the chromium snap"
+        );
+    }
+}
+
+#[test]
+fn a_chrome_that_is_not_a_snap_gets_its_scratch_profile_in_the_temp_directory() {
+    let chrome = crate::types::executable_temp_file("not-a-snap");
+    assert_eq!(snap_common_dir(&chrome, std::path::Path::new("/home/runner")), None);
+    let dir = ScratchProfileDir::create("crawlberg-not-a-snap-test-", Some(&chrome))
+        .expect("the directory must be creatable");
+    let _ = std::fs::remove_file(&chrome);
+    assert!(
+        dir.path().starts_with(std::env::temp_dir()),
+        "a scratch profile for a Chrome that is not a snap must be in the temp directory: {}",
+        dir.path().display()
+    );
+}
+
+/// Run `in_child` in a forked copy of this process and return the wait status of that copy: 0
+/// when `in_child` returned. A copy that has not left within [`PROCESS_TEST_WAIT`] is killed, and
+/// the status is the one of that kill.
+///
+/// ~keep The copy has the one thread that forked, and leaves through `_exit`, so it never returns
+/// ~keep into the test harness and runs no exit function. The functions are declared here as
+/// ~keep `atexit` is in `list_live_profile`: the `libc` crate is no dependency on every unix.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn in_a_forked_process(in_child: impl FnOnce()) -> i32 {
+    unsafe extern "C" {
+        fn fork() -> i32;
+        fn _exit(code: i32) -> !;
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const NO_HANG: i32 = 1;
+    const KILL: i32 = 9;
+    // ~keep SAFETY: the forked copy runs `in_child` on its one thread and then leaves.
+    let forked = unsafe { fork() };
+    assert!(forked >= 0, "fork must work");
+    if forked == 0 {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(in_child));
+        // ~keep SAFETY: ends the forked copy at once.
+        unsafe { _exit(if outcome.is_ok() { 0 } else { 64 }) }
+    }
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    let mut status = 0;
+    // ~keep SAFETY: `forked` is a child of this process, not yet reaped, and `status` is writable.
+    while unsafe { waitpid(forked, &raw mut status, NO_HANG) } == 0 {
+        if std::time::Instant::now() >= deadline {
+            // ~keep SAFETY: as above.
+            unsafe {
+                kill(forked, KILL);
+                waitpid(forked, &raw mut status, 0);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    status
+}
+
+/// A process forked from the one that created a profile directory holds a copy of the directory's
+/// teardown, and of the one the exit hook makes from the list. Dropping both there leaves the
+/// parent's Chrome running and the directory in place, and the parent's own drop still removes it.
+///
+/// ~keep A `cat` blocked on its stdin stands in for the Chrome, as in
+/// ~keep `the_teardown_made_from_the_list_stops_the_recorded_chrome`.
+#[cfg(unix)]
+#[test]
+fn a_teardown_dropped_in_a_forked_process_leaves_its_parents_chrome_and_directory() {
+    let mut dir =
+        ScratchProfileDir::create("crawlberg-forked-teardown-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let mut chrome = std::process::Command::new("cat")
+        .args(["--", "-", &user_data_dir_flag(&path)])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cat must start");
+    let flag = user_data_dir_flag(&path);
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    while processes_naming(&mut sysinfo::System::new(), &flag).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    dir.record_chrome(chrome.id());
+    dir.0.as_mut().expect("the teardown is there").launched = LaunchedProcess::of(chrome.id());
+    let recorded = dir.teardown().chrome.is_some();
+    let (mut from_list, others): (Vec<_>, Vec<_>) = live_profile_teardowns_of(&live_profiles(), std::process::id())
+        .into_iter()
+        .partition(|teardown| teardown.dir == path);
+    // ~keep Forgotten, not dropped: a drop would tear down every live profile of this process.
+    others.into_iter().for_each(std::mem::forget);
+    let listed = from_list.len();
+
+    let status = in_a_forked_process(|| {
+        from_list.clear();
+        drop(dir.0.take());
+    });
+
+    let chrome_runs = chrome.try_wait().expect("the status must be readable").is_none();
+    let directory_there = path.is_dir();
+    from_list.into_iter().for_each(std::mem::forget);
+    let _ = chrome.kill();
+    let _ = chrome.wait();
+    drop(dir);
+    assert!(recorded, "the stand-in must be recorded as the directory's Chrome");
+    assert_eq!(listed, 1, "the listed directory must get one teardown");
+    assert_eq!(status, 0, "the forked process must drop both teardowns and leave");
+    assert!(
+        chrome_runs,
+        "a teardown dropped in a forked process must leave the Chrome of the parent running"
+    );
+    assert!(
+        directory_there,
+        "a teardown dropped in a forked process must leave the profile directory of the parent"
+    );
+    assert!(
+        wait_for_removal(&path),
+        "the process that created the directory must still remove it"
+    );
+}
+
+/// The teardown stops the launched process only while that process is a child of this one. A
+/// process with the recorded pid that this process did not start keeps running, and is not
+/// stopped by a signal on the way.
+///
+/// ~keep The stranger is a `sleep` that a shell started and left, so its parent is not this
+/// ~keep process. It stands for the process that got the pid of a Chrome that was reaped.
+#[cfg(unix)]
+#[test]
+fn the_teardown_leaves_a_launched_pid_that_is_no_child_of_this_process() {
+    let shell = std::process::Command::new("sh")
+        .args(["-c", "sleep 300 >/dev/null 2>&1 </dev/null & echo $!"])
+        .output()
+        .expect("sh must run");
+    let stranger: u32 = String::from_utf8_lossy(&shell.stdout)
+        .trim()
+        .parse()
+        .expect("sh must print the pid of its sleep");
+    let stranger_pid = Pid::from_u32(stranger);
+    let ran_before = ChromeFamily::running(&[stranger_pid], |_| {}) == 1;
+    let mut dir =
+        ScratchProfileDir::create("crawlberg-stranger-pid-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    let recorded = LaunchedProcess::of(stranger);
+    dir.0.as_mut().expect("the teardown is there").launched = recorded;
+
+    // ~keep Dropped here, not handed to a thread: the teardown has finished when the drop returns.
+    drop(dir.0.take());
+
+    let runs_after = ChromeFamily::running(&[stranger_pid], |_| {});
+    let stopped_after = stopped_count(stranger_pid);
+    let mut system = System::new();
+    ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[stranger_pid]));
+    if let Some(process) = system.process(stranger_pid) {
+        process.kill();
+    }
+    assert!(
+        ran_before,
+        "the stranger must run before the teardown, or the test shows nothing"
+    );
+    assert!(
+        recorded.is_some(),
+        "the stranger must be recorded as the launched process, or the test shows nothing"
+    );
+    assert_eq!(
+        (runs_after, stopped_after),
+        (1, 0),
+        "the teardown must not stop or kill a process that is no child of this process"
+    );
+    assert!(!path.exists(), "the teardown must still remove the directory");
+}
+
+/// A pool dropped in a process forked from the one that launched its Chrome leaves that Chrome
+/// running on its profile directory, and the parent's pool still shuts both down.
+#[cfg(unix)]
+#[test]
+fn a_pool_dropped_in_a_forked_process_leaves_its_parents_chrome_and_profile_directory() {
+    const TEST_NAME: &str = "a_pool_dropped_in_a_forked_process_leaves_its_parents_chrome_and_profile_directory";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime must build");
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    if expect_chrome_or_skip(TEST_NAME, runtime.block_on(pool.warm())).is_none() {
+        return;
+    }
+    let path = runtime.block_on(pool_profile_dir(&pool));
+    let mut copy = Some(Arc::clone(&pool));
+
+    // ~keep The forked copy holds the only two references of its own memory: both go here. The
+    // ~keep wait is for the thread that the profile directory hands its teardown to.
+    let status = in_a_forked_process(|| {
+        drop(copy.take());
+        drop(pool);
+        std::thread::sleep(Duration::from_secs(2));
+    });
+
+    let chrome_processes = chrome_process_count_for_profile(&path);
+    let directory_there = path.is_dir();
+    let parent_page = runtime.block_on(async {
+        let pool = copy.as_ref().expect("the parent holds its pool");
+        let page = pool.acquire_page().await?;
+        page.close().await;
+        Ok::<_, CrawlError>(())
+    });
+    if let Some(pool) = copy {
+        runtime.block_on(pool.shutdown());
+    }
+    assert_eq!(status, 0, "the forked process must drop its copy of the pool and leave");
+    assert!(
+        parent_page.is_ok(),
+        "the parent must still open and close a page after its forked copy drops: {parent_page:?}"
+    );
+    assert!(
+        chrome_processes > 0,
+        "a pool dropped in a forked process must leave the Chrome of the parent running"
+    );
+    assert!(
+        directory_there,
+        "a pool dropped in a forked process must leave the profile directory of the parent"
+    );
+    assert_profile_directory_is_gone_for_good(&path);
+    drop(runtime);
+}
+
+/// A kill of the browser in a process forked from the one that launched it leaves the Chrome
+/// running and the profile directory whole, and the parent's own kill still ends both.
+#[cfg(unix)]
+#[test]
+fn a_browser_killed_in_a_forked_process_leaves_its_parents_chrome_and_profile_directory() {
+    const TEST_NAME: &str = "a_browser_killed_in_a_forked_process_leaves_its_parents_chrome_and_profile_directory";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime must build");
+    let dir = ScratchProfileDir::create("crawlberg-forked-kill-test-", None).expect("the directory must be creatable");
+    let config = build_pool_launch_builder(dir.path(), &BrowserPoolConfig::default()).and_then(|builder| {
+        builder
+            .build()
+            .map_err(|error| CrawlError::browser_error(format!("invalid browser config: {error}")))
+    });
+    let Some(config) = expect_chrome_or_skip(TEST_NAME, config) else {
+        return;
+    };
+    let (browser, handler_handle, dir) = runtime
+        .block_on(async {
+            let (browser, handler, dir) = dir.launch(config).await?;
+            Ok::<_, chromiumoxide::error::CdpError>((browser, spawn_handler(handler), dir))
+        })
+        .expect("the Chrome must launch");
+    let path = dir.path().to_path_buf();
+    // ~keep A removal that loses to a Chrome that still writes can leave the directory: the
+    // ~keep marker shows that one was tried.
+    let marker = path.join("crawlberg-forked-kill-test-marker");
+    std::fs::write(&marker, b"").expect("the marker must be writable");
+    let mut launched = Some((browser, handler_handle));
+
+    let status = in_a_forked_process(|| {
+        let (browser, handler_handle) = launched.take().expect("the copy holds the browser");
+        let own = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the runtime of the forked process must build");
+        own.block_on(kill_browser(
+            browser,
+            handler_handle,
+            path.clone(),
+            Duration::from_secs(2),
+        ));
+    });
+
+    let chrome_processes = chrome_process_count_for_profile(&path);
+    let marker_there = marker.is_file();
+    if let Some((browser, handler_handle)) = launched {
+        runtime.block_on(kill_browser(
+            browser,
+            handler_handle,
+            path.clone(),
+            HANDLER_SHUTDOWN_TIMEOUT,
+        ));
+    }
+    drop(dir);
+    assert_eq!(
+        status, 0,
+        "the forked process must let go of its copy of the browser and leave"
+    );
+    assert!(
+        chrome_processes > 0,
+        "a kill in a forked process must leave the Chrome of the parent running"
+    );
+    assert!(
+        marker_there,
+        "a kill in a forked process must leave the profile directory of the parent whole"
+    );
+    assert_profile_directory_is_gone_for_good(&path);
+    drop(runtime);
+}
+
+/// The teardown stops the launched process only while the process with the recorded id is the one
+/// the launch started. Another child of this process that got the id keeps running, and is not
+/// stopped by a signal on the way (xberg-io/crawlberg#657).
+///
+/// ~keep The `sleep` is a live child of this process, so the parent test passes for it. The
+/// ~keep recorded start mark is one less than its own: it stands for the Chrome that had the
+/// ~keep id first, ended and was reaped.
+#[cfg(unix)]
+#[test]
+fn the_teardown_leaves_a_child_that_got_the_pid_of_the_launched_process() {
+    let mut reuser = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("sleep must start");
+    let reuser_pid = Pid::from_u32(reuser.id());
+    let now = LaunchedProcess::of(reuser.id());
+    let mut dir =
+        ScratchProfileDir::create("crawlberg-reused-pid-test-", None).expect("the directory must be creatable");
+    let path = dir.path().to_path_buf();
+    dir.0.as_mut().expect("the teardown is there").launched = now.map(|now| LaunchedProcess {
+        started: now.started - 1,
+        ..now
+    });
+
+    // ~keep Dropped here, not handed to a thread: the teardown has finished when the drop returns.
+    drop(dir.0.take());
+
+    let runs_after = ChromeFamily::running(&[reuser_pid], |_| {});
+    let stopped_after = stopped_count(reuser_pid);
+    let _ = reuser.kill();
+    let _ = reuser.wait();
+    assert!(
+        now.is_some(),
+        "the start mark of the child must be readable, or the test shows nothing"
+    );
+    assert_eq!(
+        (runs_after, stopped_after),
+        (1, 0),
+        "the teardown must not stop or kill a child that only has the process id of the launched process"
+    );
+    assert!(!path.exists(), "the teardown must still remove the directory");
+}
+
+/// A process forked while another thread holds the list of live profiles, as a launch does while
+/// it starts Chrome, lists a directory of its own at once: it has a list that nothing holds, with
+/// no directory of its parent in it (xberg-io/crawlberg#658).
+///
+/// ~keep The thread that holds the list does not exist in the forked process. With one list for
+/// ~keep both, the forked process waited on it until the test killed it.
+#[cfg(unix)]
+#[test]
+fn a_process_forked_while_the_list_is_held_lists_a_directory_of_its_own() {
+    const LIMIT: Duration = Duration::from_secs(5);
+    let (locked, wait) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _held = live_profiles();
+        let _ = locked.send(());
+        let _ = released.recv();
+    });
+    wait.recv().expect("the holder must take the list");
+
+    let started = std::time::Instant::now();
+    let status = in_a_forked_process(|| {
+        let listed = list_live_profile(
+            std::path::Path::new("/crawlberg-forked-list-test"),
+            &ProfileTurn::default(),
+        );
+        assert!(listed, "the forked process must list its directory");
+        assert_eq!(
+            live_profiles().len(),
+            1,
+            "the list of the forked process must hold its own directory alone"
+        );
+    });
+    let waited = started.elapsed();
+    drop(release);
+    holder.join().expect("the holder must end");
+
+    assert_eq!(
+        status, 0,
+        "the forked process must list a directory while its parent holds the list"
+    );
+    assert!(
+        waited < LIMIT,
+        "the forked process must not wait on the list of its parent: it took {waited:?}"
+    );
+}
+
+/// The CI cache of macOS keeps the bundle of Chrome under a name without `.app`.
+const UNNAMED_BUNDLE: &str = "/Users/runner/hostedtoolcache/setup-chrome/chrome/stable/arm64";
+
+/// The executable of the helper `kind` inside the Chrome bundle `bundle`, as macOS lays it out.
+fn helper_in(bundle: &str, kind: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "{bundle}/Contents/Frameworks/Google Chrome Framework.framework/Versions/155.0.1/Helpers/Google Chrome Helper{kind}.app/Contents/MacOS/Google Chrome Helper{kind}"
+    ))
+}
+
+/// A helper's executable lies in a bundle of its own inside the browser's bundle. The Chrome of
+/// the helper is the browser's bundle, also with a space in its path.
+#[test]
+fn a_helper_in_a_nested_bundle_runs_the_browsers_bundle() {
+    let bundle = "/Applications/My Tools/Google Chrome.app";
+    for kind in ["", " (Renderer)", " (GPU)"] {
+        assert_eq!(
+            outermost_bundle(&helper_in(bundle, kind)),
+            std::path::Path::new(bundle),
+            "the helper{kind} must name the bundle of its browser"
+        );
+    }
+    assert_eq!(
+        outermost_bundle(std::path::Path::new(
+            "/Applications/My Tools/Google Chrome.app/Contents/MacOS/Google Chrome"
+        )),
+        std::path::Path::new(bundle),
+        "the browser must name its own bundle"
+    );
+}
+
+/// A browser bundle whose directory is not named `.app` still holds the browser and every
+/// helper: the Chrome read from any one of them matches all of them.
+///
+/// ~keep A search for the `.app` name gave the bundle of the helper that was read. The teardown
+/// ~keep then left the browser and the two other kinds of helper: three processes on macOS CI.
+#[test]
+fn a_bundle_without_the_app_name_holds_its_browser_and_every_helper() {
+    let browser = std::path::PathBuf::from(format!("{UNNAMED_BUNDLE}/Contents/MacOS/Google Chrome for Testing"));
+    let family = [
+        browser,
+        helper_in(UNNAMED_BUNDLE, ""),
+        helper_in(UNNAMED_BUNDLE, " (Renderer)"),
+        helper_in(UNNAMED_BUNDLE, " (GPU)"),
+    ];
+    for read in &family {
+        let chrome = outermost_bundle(read);
+        assert_eq!(
+            chrome,
+            std::path::Path::new(UNNAMED_BUNDLE),
+            "{} must name the bundle of the browser",
+            read.display()
+        );
+        let outside: Vec<_> = family.iter().filter(|member| !member.starts_with(chrome)).collect();
+        assert!(
+            outside.is_empty(),
+            "the Chrome read from {} must hold every process of the launch, not {outside:?}",
+            read.display()
+        );
+    }
+}
+
+/// An executable in no bundle is its own Chrome, and a directory is a bundle only by its layout.
+#[test]
+fn an_executable_outside_a_bundle_is_its_own_chrome() {
+    for executable in [
+        "/opt/google/chrome/chrome",
+        "/home/user/my chrome/chrome-headless-shell",
+        "/srv/Contents/chrome",
+        "/srv/tools.app/chrome",
+    ] {
+        let executable = std::path::Path::new(executable);
+        assert_eq!(outermost_bundle(executable), executable);
+    }
+    assert_eq!(
+        outermost_bundle(std::path::Path::new(
+            "/Users/me/Contents/Chromium.app/Contents/MacOS/Chromium"
+        )),
+        std::path::Path::new("/Users/me/Contents/Chromium.app"),
+        "a directory named Contents above the bundle is not a bundle"
+    );
+}
+
+/// The path of a link names no bundle. The path the link leads to, which is the one the process
+/// table gives, names the bundle.
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_bundled_executable_names_the_bundle_once_followed() {
+    let root = tempfile::tempdir().expect("the directory must be creatable");
+    let root_path = root.path().canonicalize().expect("the directory must resolve");
+    let bundle = root_path.join("Chrome Cache");
+    let executable = bundle.join("Contents/MacOS/Chromium");
+    std::fs::create_dir_all(executable.parent().expect("the executable has a parent"))
+        .expect("the bundle must be creatable");
+    std::fs::write(&executable, b"").expect("the executable must be writable");
+    let link = root_path.join("chromium");
+    std::os::unix::fs::symlink(&executable, &link).expect("the link must be creatable");
+
+    assert_eq!(outermost_bundle(&link), link, "the link itself lies in no bundle");
+    let followed = link.canonicalize().expect("the link must resolve");
+    assert_eq!(outermost_bundle(&followed), bundle);
+}
+
+/// A profile directory and the config of a launch on it whose "Chrome" is a script that sleeps,
+/// whatever its arguments. The script lies in the returned directory.
+#[cfg(unix)]
+fn a_listed_launch_of_a_sleeping_script(prefix: &str) -> (tempfile::TempDir, ScratchProfileDir, BrowserConfig) {
+    a_listed_launch_of_a_script(prefix, "#!/bin/sh\nexec sleep 300\n")
+}
+
+/// A profile directory and the config of a launch on it whose "Chrome" is a script with `text`.
+/// The script lies in the returned directory.
+#[cfg(unix)]
+fn a_listed_launch_of_a_script(prefix: &str, text: &str) -> (tempfile::TempDir, ScratchProfileDir, BrowserConfig) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("the directory of the script must be creatable");
+    let script = root.path().join("chrome-stand-in.sh");
+    std::fs::write(&script, text).expect("the script must be writable");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("the script must be executable");
+    let dir = ScratchProfileDir::create(prefix, None).expect("the directory must be creatable");
+    let config = BrowserConfig::builder()
+        .no_sandbox()
+        .user_data_dir(dir.path())
+        .chrome_executable(&script)
+        .build()
+        .expect("the config names its executable");
+    (root, dir, config)
+}
+
+/// Wait up to [`PROCESS_TEST_WAIT`] until the process `pid` has ended. Returns whether it has.
+#[cfg(unix)]
+fn ended_within_the_wait(pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    let deadline = std::time::Instant::now() + PROCESS_TEST_WAIT;
+    loop {
+        let mut system = System::new();
+        ChromeFamily::refresh(&mut system, ProcessesToUpdate::Some(&[pid]));
+        if !ChromeFamily::is_running(&system, pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A launch whose process the process table does not show stops that process through its handle
+/// and fails. Recorded with no start mark, the process was one that no teardown stopped: the
+/// binding's Chrome ran on after its engine was gone (xberg-io/crawlberg#594).
+///
+/// ~keep The read is made to fail here; the process is a script that sleeps, with no process tree.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launch_whose_process_cannot_be_read_stops_it_and_fails() {
+    let (_root, mut dir, config) = a_listed_launch_of_a_sleeping_script("crawlberg-unread-launch-test-");
+    let path = dir.path().to_path_buf();
+    let mut asked = None;
+
+    let outcome = start_listed_chrome_reading(&path, &config, |pid| {
+        asked = Some(pid);
+        None
+    });
+
+    let ended = asked.map(ended_within_the_wait);
+    let recorded = live_profiles().get(&path).map(|profile| profile.launched);
+    let error = match outcome {
+        Ok((mut child, _)) => {
+            let _ = child.start_kill();
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    // ~keep Dropped here, not handed to a thread: the teardown has finished when the drop returns.
+    drop(dir.0.take());
+    assert_eq!(
+        ended,
+        Some(true),
+        "the launch must start the process, ask for it, and stop it when the answer is none"
+    );
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("it was stopped right after its start")
+                && error.contains("On Linux, run this program where the `/proc` of its own process id namespace")
+                && error.contains("On macOS, let the sandbox profile allow")),
+        "the launch must fail, say that the Chrome was stopped and name what the user can do, got {error:?}"
+    );
+    assert_eq!(
+        recorded,
+        Some(None),
+        "a launch that failed must record no process for the teardown"
+    );
+    assert!(!path.exists(), "the teardown must still remove the directory");
+}
+
+/// A launch records the process it started, with its start mark, in the list and for its caller,
+/// and the teardown of the directory stops that process.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launch_records_the_process_it_started_and_the_teardown_stops_it() {
+    let (_root, mut dir, config) = a_listed_launch_of_a_sleeping_script("crawlberg-read-launch-test-");
+    let path = dir.path().to_path_buf();
+
+    let (child, launched) = start_listed_chrome(&path, &config).expect("the script must start");
+    let started = child.id();
+    let listed = live_profiles().get(&path).and_then(|profile| profile.launched);
+    dir.0.as_mut().expect("the teardown is there").launched = launched;
+    // ~keep Dropped here, not handed to a thread: the teardown has finished when the drop returns.
+    drop(dir.0.take());
+
+    let ended = started.map(ended_within_the_wait);
+    drop(child);
+    assert!(started.is_some(), "the started process must have an id");
+    assert_eq!(
+        launched.map(|launched| launched.pid),
+        started,
+        "the launch must return the process it started"
+    );
+    assert_eq!(listed, launched, "the list must hold the same process");
+    assert_eq!(ended, Some(true), "the teardown must stop the recorded process");
+    assert!(!path.exists(), "the teardown must remove the directory");
+}
+
+/// The teardown still knows the launched process after the boot time of the system has moved, as
+/// it does with every step of the wall clock, and stops it. A start time that holds the boot
+/// time no longer matched its record, and the teardown left the Chrome running
+/// (xberg-io/crawlberg#594).
+///
+/// ~keep A step of the clock needs privileges, so the process files are a copy that the test
+/// ~keep owns: the `stat` file of a live child, and a `stat` file of the system whose `btime`
+/// ~keep line moves by 90 seconds between the record and the teardown.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_teardown_stops_the_launched_process_after_the_boot_time_moved() {
+    let mut chrome = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("sleep must start");
+    let pid = chrome.id();
+    let files = tempfile::Builder::new()
+        .prefix("crawlberg-moved-boot-time-test-")
+        .tempdir()
+        .expect("the directory of the process files must be creatable");
+    let of_the_process = files.path().join(pid.to_string());
+    std::fs::create_dir(&of_the_process).expect("the directory of the process must be creatable");
+    std::fs::copy(format!("/proc/{pid}/stat"), of_the_process.join("stat")).expect("the child must be readable");
+    let of_the_system = files.path().join("stat");
+    std::fs::write(&of_the_system, "cpu  1 2 3 4\nbtime 1700000000\n").expect("the boot time must be writable");
+    let start = |pid: u32| start_ticks_under(files.path(), pid);
+
+    let recorded = LaunchedProcess::of_reading(pid, start);
+    std::fs::write(&of_the_system, "cpu  1 2 3 4\nbtime 1700000090\n").expect("the boot time must be writable");
+    if let Some(recorded) = recorded {
+        stop_launched_family_reading(files.path(), recorded, start);
+    }
+
+    let ended = ended_within_the_wait(pid);
+    let _ = chrome.kill();
+    let _ = chrome.wait();
+    assert!(
+        recorded.is_some(),
+        "the copied process file must be readable, or the test shows nothing"
+    );
+    assert!(
+        ended,
+        "the teardown must stop the launched process after the boot time has moved"
+    );
+}
+
+/// The start ticks are field 22 of the process's `stat` line, counted from the end of the program
+/// name: a name with spaces and parentheses of its own moves no field.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_start_ticks_are_read_after_a_program_name_with_spaces_and_parentheses() {
+    let after_name = "S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20 21";
+
+    assert_eq!(
+        start_ticks(format!("77 (chrome) {after_name}").as_bytes()),
+        Some(424_242)
+    );
+    assert_eq!(
+        start_ticks(format!("77 (a) b (c) 1 2 3 4 5 6 7 8 9) {after_name}").as_bytes()),
+        Some(424_242)
+    );
+    assert_eq!(
+        start_ticks(b"77 (chrome) S 1 2"),
+        None,
+        "a line that ends early has no field 22"
+    );
+    assert_eq!(start_ticks(b"77 chrome S 1 2"), None, "a line with no name is not read");
+}
+
+/// A launch whose Chrome has ended before its process is read reports that exit, with its status.
+/// macOS no longer shows such a process, and the launch then said that the process table does not
+/// show the Chrome, which hid the cause.
+///
+/// ~keep The read waits here until the script has ended, and then finds no process.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launch_whose_chrome_ended_before_the_read_reports_its_exit() {
+    let (_root, mut dir, config) = a_listed_launch_of_a_script("crawlberg-ended-launch-test-", "#!/bin/sh\nexit 3\n");
+    let path = dir.path().to_path_buf();
+    let mut ended = None;
+
+    let outcome = start_listed_chrome_reading(&path, &config, |pid| {
+        ended = Some(ended_within_the_wait(pid));
+        None
+    });
+
+    let error = match outcome {
+        Ok((mut child, _)) => {
+            let _ = child.start_kill();
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    // ~keep Dropped here, not handed to a thread: the teardown has finished when the drop returns.
+    drop(dir.0.take());
+    assert_eq!(
+        ended,
+        Some(true),
+        "the script must have ended before the read returns, or the test shows nothing"
+    );
+    assert!(
+        error.as_deref().is_some_and(|error| error.contains("ended at once")
+            && error.contains("exit status: 3")
+            && !error.contains("process table")),
+        "the launch must fail with the exit of its Chrome, got {error:?}"
+    );
+}
+
+/// What the test's subscriber prints, for [`the_exit_hook_warns_when_the_list_stays_locked`].
+struct PrintedLines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for PrintedLines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut lines = match self.0.lock() {
+            Ok(lines) => lines,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        lines.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The exit hook waits for the list of live profiles only for its limit. When the list stays
+/// locked, it tears down nothing and warns that a Chrome can be left.
+///
+/// ~keep The list is one of the test's own, held by the test's thread, so the hook's wait runs
+/// ~keep on another thread, with a subscriber that keeps what it prints.
+#[test]
+fn the_exit_hook_warns_when_the_list_stays_locked() {
+    let list = ProfileList::default();
+    let printed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Arc::clone(&printed);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || PrintedLines(Arc::clone(&writer)))
+        .finish();
+
+    let held = list.lock().expect("a new list is free");
+    let waited_from = std::time::Instant::now();
+    let left = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tracing::subscriber::with_default(subscriber, || teardowns_at_exit(&list, PROFILE_LIST_EXIT_WAIT).len())
+            })
+            .join()
+    });
+    let waited = waited_from.elapsed();
+    drop(held);
+
+    let printed = String::from_utf8_lossy(&printed.lock().expect("the writer does not panic")).into_owned();
+    assert_eq!(left.ok(), Some(0), "a locked list gives the hook no teardown");
+    assert!(
+        waited >= PROFILE_LIST_EXIT_WAIT,
+        "the hook must wait for the list for its limit, waited {waited:?}"
+    );
+    assert!(
+        printed.contains("the list of Chrome profiles stayed locked at exit"),
+        "the hook must warn that the list stayed locked, printed {printed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_closed_cdp_socket_ends_its_handler_without_another_command() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind CDP socket");
+    let address = listener.local_addr().expect("CDP address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept CDP socket");
+        let mut socket = async_tungstenite::tokio::accept_async(stream)
+            .await
+            .expect("accept WebSocket");
+        let message = socket.next().await.expect("discovery command").expect("valid command");
+        let command: serde_json::Value =
+            serde_json::from_str(message.to_text().expect("text command")).expect("command JSON");
+        assert_eq!(command["method"], "Target.setDiscoverTargets");
+        socket
+            .send(async_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({"id": command["id"], "result": {}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("answer discovery");
+        socket
+            .send(async_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .expect("close socket");
+        let _ = socket.next().await;
+    });
+    let (browser, mut handler) = Browser::connect(format!("ws://{address}")).await.expect("connect CDP");
+    let ended = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = handler.next().await {
+            event.expect("the orderly close must not be a transport error");
+        }
+    })
+    .await;
+    server.abort();
+    drop(browser);
+    assert!(
+        ended.is_ok(),
+        "a Close frame must end the handler without a new command"
+    );
+}
+
+#[tokio::test]
+async fn a_closed_cdp_socket_cancels_a_command_waiting_for_its_response() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind CDP socket");
+    let address = listener.local_addr().expect("CDP address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept CDP socket");
+        let mut socket = async_tungstenite::tokio::accept_async(stream)
+            .await
+            .expect("accept WebSocket");
+        for expected in ["Target.setDiscoverTargets", "Browser.getVersion"] {
+            let message = socket.next().await.expect("CDP command").expect("valid command");
+            let command: serde_json::Value =
+                serde_json::from_str(message.to_text().expect("text command")).expect("command JSON");
+            assert_eq!(command["method"], expected);
+            if expected == "Target.setDiscoverTargets" {
+                socket
+                    .send(async_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"id": command["id"], "result": {}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("answer discovery");
+            }
+        }
+        socket
+            .send(async_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .expect("close socket");
+        let _ = socket.next().await;
+    });
+    let (browser, handler) = Browser::connect(format!("ws://{address}")).await.expect("connect CDP");
+    let handler = spawn_handler(handler);
+    let response = tokio::time::timeout(Duration::from_secs(2), browser.version()).await;
+    server.abort();
+    let ended = tokio::time::timeout(Duration::from_secs(2), handler).await;
+    assert!(
+        matches!(response, Ok(Err(chromiumoxide::error::CdpError::ChannelSendError(_)))),
+        "the unanswered command must be canceled, got {response:?}"
+    );
+    assert!(matches!(ended, Ok(Ok(()))), "the handler must end, got {ended:?}");
+}
+
+#[cfg(feature = "browser")]
+#[tokio::test(flavor = "multi_thread")]
+async fn should_refetch_both_inflight_pages_after_the_pooled_browser_crashes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let site = MockServer::start().await;
+    Mock::given(path("/warmup"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<p>warmup</p>", "text/html"))
+        .mount(&site)
+        .await;
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::clone(&arrivals);
+    Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(move |request: &wiremock::Request| {
+            // ~keep Only the two pages count. A full Chrome also asks for the icon of the tab,
+            // ~keep which made the count 6 and let the crash come with one page loading.
+            if matches!(request.url.path(), "/one" | "/two") {
+                arrived.fetch_add(1, Ordering::SeqCst);
+            }
+            ResponseTemplate::new(200)
+                .set_body_raw("<p>recovered</p>", "text/html")
+                .set_delay(Duration::from_millis(500))
+        })
+        .with_priority(10)
+        .mount(&site)
+        .await;
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let config = crate::CrawlConfig {
+        browser: crate::BrowserConfig {
+            mode: crate::BrowserMode::Always,
+            session_affinity: false,
+            ..Default::default()
+        },
+        browser_pool: Some(Arc::clone(&pool)),
+        retry_count: 2,
+        retry_codes: vec![429, 503],
+        retry_initial_delay_ms: 10,
+        retry_max_delay_ms: 20,
+        ..crate::CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let engine = crate::create_engine(Some(config)).expect("engine");
+    crate::scrape(&engine, &format!("{}/warmup", site.uri()))
+        .await
+        .expect("warmup");
+    let browser = Arc::clone(&pool.state.lock().await.as_ref().expect("launched browser").browser);
+    let first_engine = engine.clone();
+    let first_url = format!("{}/one", site.uri());
+    let first = tokio::spawn(async move { crate::scrape(&first_engine, &first_url).await });
+    let second_url = format!("{}/two", site.uri());
+    let second = tokio::spawn(async move { crate::scrape(&engine, &second_url).await });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while arrivals.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both pages must be loading before the crash");
+    let _ = browser
+        .execute(chromiumoxide::cdp::browser_protocol::browser::CrashParams::default())
+        .await;
+    for task in [first, second] {
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("fetch deadline")
+            .expect("fetch task")
+            .expect("fetch recovered");
+        assert_eq!(result.status_code, 200);
+    }
+    assert_eq!(
+        arrivals.load(Ordering::SeqCst),
+        4,
+        "each page is fetched once before and once after the crash"
+    );
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn should_keep_a_pages_original_handler_after_the_pool_relaunches() {
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let original = pool.acquire_page().await.expect("first page");
+    let end = original.handler_end.clone();
+    let browser = Arc::clone(&pool.state.lock().await.as_ref().expect("browser state").browser);
+    let _ = browser
+        .execute(chromiumoxide::cdp::browser_protocol::browser::CrashParams::default())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), end.ended())
+        .await
+        .expect("original handler must report the crash");
+    let replacement = pool.acquire_page().await.expect("replacement page");
+    assert!(end.has_ended());
+    assert!(!replacement.handler_end.has_ended());
+    assert!(Arc::ptr_eq(&end.0, &original.handler_end.0));
+    assert!(!Arc::ptr_eq(&end.0, &replacement.handler_end.0));
+    replacement.close().await;
+    original.close().await;
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stalled_or_cancelled_close_preserves_other_live_pages_and_the_browser_generation() {
+    for cancelled in [false, true] {
+        let pool = BrowserPool::new(BrowserPoolConfig::default());
+        let config = crate::types::CrawlConfig::builder()
+            .allow_private_networks(true)
+            .build();
+        let Some(held) = expect_chrome_or_skip(
+            "a_stalled_or_cancelled_close_preserves_other_live_pages_and_the_browser_generation",
+            pool.acquire_page_with_config(&config).await,
+        ) else {
+            return;
+        };
+        let generation = pool.state.lock().await.as_ref().expect("running browser").generation;
+        let close = tokio::spawn(std::future::pending::<()>());
+        let abort = close.abort_handle();
+        if cancelled {
+            abort.abort();
+        }
+        pool.state
+            .lock()
+            .await
+            .as_ref()
+            .expect("running browser")
+            .pending_closes
+            .lock()
+            .expect("pending registry")
+            .push(close);
+        let next = tokio::time::timeout(Duration::from_secs(15), pool.acquire_page_with_config(&config))
+            .await
+            .expect("another context can open")
+            .expect("next page");
+        let held_result = held.page().evaluate("21 * 2").await;
+        abort.abort();
+        let actual_generation = pool.state.lock().await.as_ref().expect("running browser").generation;
+        next.close().await;
+        held.close().await;
+        pool.shutdown().await;
+        let held_value = held_result
+            .expect("a stalled close must not disconnect a page another fetch owns")
+            .into_value::<u64>()
+            .expect("held page result");
+        assert_eq!(held_value, 42);
+        assert_eq!(
+            actual_generation, generation,
+            "a stalled or cancelled close is not failure of the browser security controller"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_page_retains_its_permit_until_its_context_is_disposed() {
+    use chromiumoxide::cdp::browser_protocol::target::GetBrowserContextsParams;
+    let pool = BrowserPool::new(BrowserPoolConfig {
+        max_pages: 1,
+        ..BrowserPoolConfig::default()
+    });
+    if expect_chrome_or_skip(
+        "a_dropped_page_retains_its_permit_until_its_context_is_disposed",
+        pool.warm().await,
+    )
+    .is_none()
+    {
+        return;
+    }
+    let (browser, pending) = {
+        let state = pool.state.lock().await;
+        let state = state.as_ref().expect("warm browser");
+        (Arc::clone(&state.browser), Arc::clone(&state.pending_closes))
+    };
+    let original = browser
+        .execute(GetBrowserContextsParams::default())
+        .await
+        .expect("original contexts")
+        .result
+        .browser_context_ids;
+    let page = pool.acquire_page().await.expect("page");
+    assert_eq!(pool.page_semaphore.available_permits(), 0);
+    drop(page);
+    let before_cleanup = pool.page_semaphore.available_permits();
+    await_pending_closes(&pending, Duration::from_secs(10)).await;
+    assert_eq!(pool.page_semaphore.available_permits(), 1);
+    let remaining = browser
+        .execute(GetBrowserContextsParams::default())
+        .await
+        .expect("remaining contexts")
+        .result
+        .browser_context_ids;
+    pool.shutdown().await;
+    assert_eq!(
+        before_cleanup, 0,
+        "Drop must retain the permit before its asynchronous close starts"
+    );
+    assert_eq!(
+        remaining, original,
+        "the dropped page must leave no browser context behind"
+    );
+}
+
+/// A page that is parked for its site when Chrome dies belongs to the dead Chrome. The next fetch
+/// of the site must open a page on the new Chrome. With no retry configured, a fetch that took
+/// the parked page would fail.
+#[cfg(feature = "browser")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_parked_on_a_crashed_browser_is_not_used_for_the_next_fetch() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let site = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<p>parked</p>", "text/html"))
+        .mount(&site)
+        .await;
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let config = crate::CrawlConfig {
+        browser: crate::BrowserConfig {
+            mode: crate::BrowserMode::Always,
+            session_affinity: true,
+            ..Default::default()
+        },
+        browser_pool: Some(Arc::clone(&pool)),
+        browser_session_pool: Some(Arc::new(crate::browser_session_pool::BrowserSessionPool::new())),
+        retry_count: 0,
+        ..crate::CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let engine = crate::create_engine(Some(config)).expect("engine");
+    crate::scrape(&engine, &format!("{}/first", site.uri()))
+        .await
+        .expect("the first fetch parks its page");
+    let (browser, end) = {
+        let state = pool.state.lock().await;
+        let state = state.as_ref().expect("launched browser");
+        (Arc::clone(&state.browser), state.handler_end.clone())
+    };
+    let _ = browser
+        .execute(chromiumoxide::cdp::browser_protocol::browser::CrashParams::default())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), end.ended())
+        .await
+        .expect("the handler must report the crash");
+    let second = tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::scrape(&engine, &format!("{}/second", site.uri())),
+    )
+    .await
+    .expect("the second fetch must end");
+    let status = second.map(|page| page.status_code);
+    pool.shutdown().await;
+    assert!(
+        matches!(status, Ok(200)),
+        "the fetch after the crash must use a page of the new Chrome, got {status:?}"
+    );
+}

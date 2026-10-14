@@ -1,12 +1,15 @@
 //! Link extraction and classification from HTML documents.
 
-use tl::VDom;
-use url::Url;
+use std::borrow::Cow;
+
+use url::{Position, Url};
 
 use crate::types::{LinkInfo, LinkType};
 
-use super::get_attr;
-use super::selectors::{SEL_A_HREF, SEL_BASE_HREF};
+use super::raw_text::MaskedHtml;
+use super::real_tags::{RealTags, write_start_tag};
+use super::selectors::SEL_A_HREF;
+use super::{fetchable_address, get_attr, get_url_attr, has_link_qualifier};
 
 /// Document file extensions used for link classification.
 static DOCUMENT_EXTENSIONS: &[&str] = &[
@@ -14,9 +17,15 @@ static DOCUMENT_EXTENSIONS: &[&str] = &[
     ".tar", ".gz", ".rar",
 ];
 
-/// Classify a link as internal, external, anchor, or document.
-pub(crate) fn classify_link(href: &str, base_url: &Url) -> LinkType {
-    if href.starts_with('#') {
+/// Classify a link as internal, external, anchor, or document. `resolved` is the address `href`
+/// names on the page at `document_url`.
+///
+/// ~keep A link is an anchor when it has a fragment and names the page it is on: the URL
+/// ~keep standard compares the two addresses without their fragments. The written `href` cannot
+/// ~keep decide it. `#part` names another page when a `<base>` moves the base address, and
+/// ~keep `page.html#part` names the same page when the page is `page.html`.
+pub(crate) fn classify_link(href: &str, resolved: &Url, document_url: &Url) -> LinkType {
+    if resolved.fragment().is_some() && resolved[..Position::AfterQuery] == document_url[..Position::AfterQuery] {
         return LinkType::Anchor;
     }
 
@@ -27,40 +36,41 @@ pub(crate) fn classify_link(href: &str, base_url: &Url) -> LinkType {
         }
     }
 
-    if let Ok(resolved) = base_url.join(href) {
-        if resolved.host_str() != base_url.host_str() {
-            return LinkType::External;
-        }
-        LinkType::Internal
-    } else if href.starts_with("http://") || href.starts_with("https://") {
-        if let Ok(u) = Url::parse(href)
-            && u.host_str() != base_url.host_str()
-        {
-            return LinkType::External;
-        }
-        LinkType::Internal
-    } else {
-        LinkType::Internal
+    if resolved.host_str() != document_url.host_str() {
+        return LinkType::External;
     }
+    LinkType::Internal
 }
 
-/// Extract all links from a parsed HTML document.
-pub(crate) fn extract_links(dom: &VDom<'_>, base_url: &Url) -> Vec<LinkInfo> {
+/// The URL a document's relative references resolve against: `base_href`, the decoded `href` of
+/// its first `<base>` in tree order that has one (see [`MaskedHtml::base_href`]), joined to the
+/// document URL, or the document URL itself when there is none, it does not parse, or its scheme
+/// is `data` or `javascript` (the HTML frozen base URL steps).
+pub(crate) fn effective_base_url(base_href: Option<&str>, document_url: &Url) -> Url {
+    base_href
+        // ~keep A `<base href>` is often site-relative (e.g. "/en/"); resolve it against
+        // the document URL instead of requiring it to already be absolute.
+        .and_then(|href| crate::net::userinfo::resolve(document_url, href))
+        .filter(|base| !matches!(base.scheme(), "data" | "javascript"))
+        .unwrap_or_else(|| document_url.clone())
+}
+
+/// Extract all links from `page`, the document at `document_url`. Each link resolves against
+/// the document's base URL from [`effective_base_url`] and is classified against `document_url`.
+///
+/// ~keep The page is parsed by tl a second time, on its own, rather than reusing the caller's
+/// ~keep already-parsed document: tl and html5ever's tokenizer can read a malformed `<a>` tag's
+/// ~keep boundary differently (#294), so every real `<a>` start tag is rewritten into
+/// ~keep unambiguous form, as html5ever read it while masking the page, before tl parses it for
+/// ~keep the link's text, `rel` and qualifiers. A well-formed `<a>` tag rewrites to itself, so
+/// ~keep this changes nothing for one.
+pub(crate) fn extract_links(page: &MaskedHtml<'_>, document_url: &Url) -> Vec<LinkInfo> {
+    let base_url = &effective_base_url(page.base_href.as_deref(), document_url);
+    let canonical = canonicalize_anchor_tags(&page.text, &page.url_tags);
+    let Ok(dom) = super::parse_html(&canonical) else {
+        return Vec::new();
+    };
     let parser = dom.parser();
-
-    let effective_base = dom
-        .query_selector(SEL_BASE_HREF)
-        .and_then(|mut iter| {
-            iter.next()
-                .and_then(|h| h.get(parser))
-                .and_then(|n| n.as_tag())
-                .and_then(|tag| get_attr(tag, "href"))
-                // ~keep A `<base href>` is often site-relative (e.g. "/en/"); resolve it against
-                // the document URL instead of requiring it to already be absolute.
-                .and_then(|href| base_url.join(href).ok())
-        })
-        .unwrap_or_else(|| base_url.clone());
-
     let mut links = Vec::new();
 
     if let Some(iter) = dom.query_selector(SEL_A_HREF) {
@@ -69,35 +79,30 @@ pub(crate) fn extract_links(dom: &VDom<'_>, base_url: &Url) -> Vec<LinkInfo> {
                 continue;
             };
 
-            let href = get_attr(tag, "href").unwrap_or("").trim();
-            if href.is_empty() {
+            let Some(href) = get_url_attr(tag, "href") else {
                 continue;
-            }
-
-            if href.starts_with("mailto:")
-                || href.starts_with("javascript:")
-                || href.starts_with("tel:")
-                || href.starts_with("data:")
-            {
-                continue;
-            }
+            };
+            let href = href.as_ref();
 
             // ~keep `Url::join` already resolves protocol-relative ("//host/path") references
             // per the WHATWG URL spec, so no special-casing is needed here.
-            let link_type = classify_link(href, &effective_base);
-
-            let resolved_url = if let Ok(u) = effective_base.join(href) {
-                u.to_string()
-            } else {
-                href.to_owned()
+            // ~keep The scheme comes from the parsed URL, not a prefix test: the parser matches it
+            // ~keep in any case and drops tabs and newlines, so `java&#9;script:` is `javascript:`.
+            // ~keep Only `http` and `https` are kept: the crawler can fetch neither `mailto:`,
+            // ~keep `tel:` nor the inline schemes, and no more than these two can name a `file:`,
+            // ~keep `blob:` or other address the crawler cannot reach either.
+            let Some(resolved_url) = fetchable_address(href, base_url) else {
+                continue;
             };
 
-            let rel = get_attr(tag, "rel").map(String::from);
-            let nofollow = rel.as_ref().map(|r| r.contains("nofollow")).unwrap_or(false);
+            let link_type = classify_link(href, &resolved_url, document_url);
+            let rel = get_attr(tag, "rel").map(Cow::into_owned);
+            let nofollow = has_link_qualifier(tag, "nofollow");
             let text = tag.inner_text(parser).trim().to_owned();
 
             links.push(LinkInfo {
-                url: resolved_url,
+                original_url: resolve_original_url(href, base_url, &resolved_url),
+                url: resolved_url.into(),
                 text,
                 link_type,
                 rel,
@@ -105,19 +110,341 @@ pub(crate) fn extract_links(dom: &VDom<'_>, base_url: &Url) -> Vec<LinkInfo> {
             });
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if super::immediate_meta_refresh(&dom).is_none()
+        && let Some(target) = super::detect_meta_refresh(&dom)
+        && let Some(resolved) = fetchable_address(&target, base_url)
+        && !links.iter().any(|link| link.url == resolved.as_str())
+    {
+        let link_type = classify_link(&target, &resolved, document_url);
+        links.push(LinkInfo {
+            original_url: resolve_original_url(&target, base_url, &resolved),
+            url: resolved.into(),
+            text: String::new(),
+            link_type,
+            rel: None,
+            nofollow: false,
+        });
+    }
     links
+}
+
+// ~keep Url::join normalizes the source spelling that this provenance field must preserve.
+fn resolve_original_url(href: &str, base: &Url, resolved: &Url) -> String {
+    use url::Position;
+    let reference = href
+        .split_once(':')
+        .filter(|(scheme, rest)| scheme.eq_ignore_ascii_case(base.scheme()) && !starts_with_authority(rest))
+        .map_or(href, |(_, rest)| rest);
+    let origin = &base[..Position::BeforePath];
+    let original = if reference.is_empty() {
+        base[..Position::BeforeFragment].to_owned()
+    } else if starts_with_authority(reference) {
+        format!("{}:{reference}", base.scheme())
+    } else if Url::parse(reference).is_ok_and(|url| url.has_host()) {
+        reference.to_owned()
+    } else if reference.starts_with(['/', '\\']) {
+        format!("{origin}{reference}")
+    } else if reference.starts_with('?') {
+        format!("{}{reference}", &base[..Position::AfterPath])
+    } else if reference.starts_with('#') {
+        format!("{}{reference}", &base[..Position::BeforeFragment])
+    } else {
+        let directory = base.path().rsplit_once('/').map_or("", |(directory, _)| directory);
+        format!("{origin}{directory}/{reference}")
+    };
+    if base
+        .join(href)
+        .is_ok_and(|url| crate::net::userinfo::has_userinfo(&url))
+    {
+        remove_original_userinfo(&original).unwrap_or_else(|| resolved.as_str().to_owned())
+    } else {
+        original
+    }
+}
+
+fn starts_with_authority(reference: &str) -> bool {
+    reference
+        .as_bytes()
+        .get(..2)
+        .is_some_and(|prefix| prefix.iter().all(|byte| matches!(byte, b'/' | b'\\')))
+}
+
+fn remove_original_userinfo(original: &str) -> Option<String> {
+    let parsed = Url::parse(original).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let after_scheme = &original[original.find(':')? + 1..];
+    let authority = after_scheme.strip_prefix("//")?;
+    let start = original.len() - authority.len();
+    let authority_end = original[start..]
+        .find(['/', '?', '#', '\\'])
+        .map_or(original.len(), |end| start + end);
+    let separator = original[start..authority_end].rfind('@')? + start;
+    Some(format!("{}{}", &original[..start], &original[separator + 1..]))
+}
+
+/// Rewrite every real `<a>` start tag of `tags` in `html` into unambiguous form: its name lower-cased, each
+/// attribute once in source order, double-quoted, as html5ever's tokenizer reads it.
+///
+/// A malformed tag such as `<a href=b ="x>one</a><a href="y">two</a>` makes tl read a different
+/// tag boundary, or none at all, than a real HTML parser does, so the rewritten tag is what tl
+/// parses instead. Every byte outside a rewritten tag is kept.
+fn canonicalize_anchor_tags<'h>(html: &'h str, tags: &RealTags) -> Cow<'h, str> {
+    let mut out = String::new();
+    let mut cursor = 0;
+    let mut written = String::new();
+    for tag in tags.iter() {
+        if tag.name != "a" {
+            continue;
+        }
+        written.clear();
+        write_start_tag(&mut written, &tag, &[]);
+        if html[tag.span.clone()] != written {
+            out.push_str(&html[cursor..tag.span.start]);
+            out.push_str(&written);
+            cursor = tag.span.end;
+        }
+    }
+    if cursor == 0 {
+        return Cow::Borrowed(html);
+    }
+    out.push_str(&html[cursor..]);
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use tl::ParserOptions;
-
     use super::*;
 
-    fn extract(html: &str, base: &str) -> Vec<LinkInfo> {
-        let dom = tl::parse(html, ParserOptions::default()).expect("valid HTML");
-        let base_url = Url::parse(base).expect("valid base URL");
-        extract_links(&dom, &base_url)
+    fn extract(html: &str, document_url: &str) -> Vec<LinkInfo> {
+        let page = crate::html::mask_raw_text_markup(html);
+        let document_url = Url::parse(document_url).expect("valid document URL");
+        extract_links(&page, &document_url)
+    }
+
+    /// The type of each link of `html` served at `document_url`, with the resolved address.
+    fn link_types(html: &str, document_url: &str) -> Vec<(String, LinkType)> {
+        extract(html, document_url)
+            .into_iter()
+            .map(|link| (link.url, link.link_type))
+            .collect()
+    }
+
+    #[test]
+    fn should_resolve_original_link_text_without_changing_path_spelling() {
+        let cases = [
+            ("/t/naïve", "https://example.com/t/naïve"),
+            ("/t/raw space", "https://example.com/t/raw space"),
+            ("/t/b\\s", "https://example.com/t/b\\s"),
+            ("/t/d/%2e%2e/up", "https://example.com/t/d/%2e%2e/up"),
+            ("../next", "https://example.com/docs/../next"),
+            ("https:child", "https://example.com/docs/child"),
+            ("https:/child", "https://example.com/child"),
+            (r"https:\child", r"https://example.com\child"),
+            (r"\child", r"https://example.com\child"),
+            ("https:", "https://example.com/docs/page?old=1"),
+            (r"https:\\other.test/path", r"https:\\other.test/path"),
+            (r"https:/\other.test/path", r"https:/\other.test/path"),
+            (r"https:\/other.test/path", r"https:\/other.test/path"),
+            ("?q=raw space", "https://example.com/docs/page?q=raw space"),
+            ("#part", "https://example.com/docs/page?old=1#part"),
+            ("//other.test/raw space", "https://other.test/raw space"),
+            (r"\\other.test/path", r"https:\\other.test/path"),
+            (r"/\other.test/path", r"https:/\other.test/path"),
+            (r"\/other.test/path", r"https:\/other.test/path"),
+            ("https://user:secret@other.test/naïve", "https://other.test/naïve"),
+        ];
+        for (href, expected) in cases {
+            let html = format!("<a href=\"{href}\">link</a>");
+            let links = extract(&html, "https://example.com/docs/page?old=1");
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].original_url, expected, "href: {href}");
+        }
+        let links = extract(
+            r#"<base href="/other/"><a href="naïve">link</a>"#,
+            "https://example.com/docs/page",
+        );
+        assert_eq!(links[0].original_url, "https://example.com/other/naïve");
+    }
+
+    #[test]
+    fn should_remove_credentials_from_original_link_addresses() {
+        let cases = [
+            ("//user:secret@other.test/naïve", "https://other.test/naïve"),
+            (r"https:\\user:secret@other.test/naïve", "https://other.test/na%C3%AFve"),
+            ("HTTPS://user:secret@OTHER.test/naïve", "HTTPS://OTHER.test/naïve"),
+            ("https://user:secret@other.test/a@b", "https://other.test/a@b"),
+        ];
+        for (href, expected) in cases {
+            let links = extract(&format!("<a href=\"{href}\">link</a>"), "https://example.com/");
+            assert_eq!(links.len(), 1);
+            assert_eq!(links[0].original_url, expected);
+        }
+    }
+
+    #[test]
+    fn should_redact_backslash_authorities_without_changing_query_or_fragment() {
+        for (href, expected) in [
+            (r"/\user:pass@other.test/x?y=://z@w", "http://other.test/x?y=://z@w"),
+            (
+                r"http:\\user:pass@other.test\x?y=://z@w",
+                "http://other.test/x?y=://z@w",
+            ),
+            (
+                r"http:/\user:pass@other.test/x#f=://z@w",
+                "http://other.test/x#f=://z@w",
+            ),
+            (
+                r"http:\/user:pass@other.test/x?y=://z@w",
+                "http://other.test/x?y=://z@w",
+            ),
+            (
+                r"http:////user:pass@other.test/x?y=://z@w",
+                "http://other.test/x?y=://z@w",
+            ),
+            (
+                r"http://first@user:pass@other.test/x?y=://z@w",
+                "http://other.test/x?y=://z@w",
+            ),
+        ] {
+            let links = extract(&format!("<a href=\"{href}\">link</a>"), "http://example.com/");
+            assert_eq!(links.len(), 1, "{href}");
+            assert_eq!(links[0].original_url, expected, "{href}");
+            assert!(!links[0].url.contains("user:pass"), "{href}");
+        }
+    }
+
+    #[test]
+    fn should_remove_base_credentials_from_original_relative_link_addresses() {
+        let links = extract(
+            r#"<base href="https://user:secret@other.test/docs/"><a href="naïve">link</a>"#,
+            "https://example.com/",
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].original_url, "https://other.test/docs/naïve");
+        let base = Url::parse("https://user:secret@other.test/docs/").expect("base URL");
+        let resolved = fetchable_address("naïve", &base).expect("fetchable link");
+        assert_eq!(
+            resolve_original_url("naïve", &base, &resolved),
+            "https://other.test/docs/naïve"
+        );
+    }
+
+    /// The base URL of `html` served at `document_url`.
+    fn base_of(html: &str, document_url: &Url) -> String {
+        let page = crate::html::mask_raw_text_markup(html);
+        effective_base_url(page.base_href.as_deref(), document_url).into()
+    }
+
+    /// The pre-fix behaviour: tl parses `html` directly, with no canonicalization pass first.
+    fn extract_raw_tl_only(html: &str) -> Vec<String> {
+        let dom = crate::html::parse_html(html).expect("valid HTML");
+        let parser = dom.parser();
+        let mut hrefs = Vec::new();
+        if let Some(iter) = dom.query_selector(SEL_A_HREF) {
+            for handle in iter {
+                let Some(tag) = handle.get(parser).and_then(|n| n.as_tag()) else {
+                    continue;
+                };
+                if let Some(href) = get_url_attr(tag, "href") {
+                    hrefs.push(href.into_owned());
+                }
+            }
+        }
+        hrefs
+    }
+
+    #[test]
+    fn a_decoded_quote_in_the_value_does_not_break_the_rewritten_tag() {
+        // ~keep `&quot;` decodes to a literal `"`; writing it back unencoded into the new double
+        // ~keep quotes would end the value there and truncate the address, losing what follows.
+        let html = r#"<a href="a&quot;b">x</a>"#;
+        let links = extract(html, "https://example.com/");
+        assert_eq!(links.len(), 1, "expected exactly one link, got {links:?}");
+        assert_eq!(links[0].url, "https://example.com/a%22b");
+    }
+
+    #[test]
+    fn finds_a_link_an_unterminated_quote_hid_from_the_raw_tl_parse() {
+        // ~keep #294's reproduction (bank/triage-op4/report.md): the unterminated `href="broken`
+        // ~keep makes tl read everything up to the next literal `"` -- the second link's own
+        // ~keep opening quote -- as part of the first value, so tl finds no `<a>` at all here.
+        // ~keep html5ever reads the same bytes the way a browser does: one `<a>` start tag ending
+        // ~keep at the first real `>`, with a garbled `href` and "real" as its text. Extraction now
+        // ~keep reports that one tag instead of silently dropping the whole line.
+        let html = r#"<a href="broken>x</a> <a href="/rel/page.html">real</a>"#;
+        assert_eq!(
+            extract_raw_tl_only(html),
+            Vec::<String>::new(),
+            "control: tl alone still finds nothing here"
+        );
+        let links = extract(html, "https://example.com/");
+        assert_eq!(links.len(), 1, "expected the one tag html5ever reads, got {links:?}");
+        assert_eq!(links[0].text, "real");
+    }
+
+    #[test]
+    fn a_stray_equals_and_quote_do_not_merge_two_links() {
+        // ~keep The malformed-tag fixture from the open html5ever tag-scan stack (#292): a real
+        // ~keep HTML parser ends the first `<a>` at the `>` right after `="x`, so the two links
+        // ~keep keep their own addresses instead of the second's `href` extending the first's.
+        let html = r#"<a href=b ="x>one</a><a href="y">two</a>"#;
+        let links = extract(html, "https://example.com/dir/");
+        let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://example.com/dir/b", "https://example.com/dir/y"]);
+        assert_eq!(links[0].text, "one");
+        assert_eq!(links[1].text, "two");
+    }
+
+    #[test]
+    fn a_malformed_attribute_name_is_left_out_of_the_rewritten_tag() {
+        // ~keep html5ever's attribute-name state treats a `"` as a parse error but still appends
+        // ~keep it to the name (only whitespace, `/`, `>` and `=` end the name), so `x"y` is a
+        // ~keep real attribute name here. Writing it back unfiltered would put an unescaped `"`
+        // ~keep inside the tag, which reopens exactly the tag-boundary ambiguity this rewrite
+        // ~keep exists to remove: tl would read the embedded `"` as starting a new attribute value.
+        let html = r#"<a x"y="1" href="/ok">z</a>"#;
+        let page = crate::html::mask_raw_text_markup(html);
+        let tag = page.url_tags.iter().find(|tag| tag.name == "a").expect("one tag");
+        assert_eq!(
+            tag.attrs.len(),
+            2,
+            "expected html5ever to read two attributes, got {:?}",
+            tag.attrs
+                .iter()
+                .map(|a| (&*a.name, a.value.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &*tag.attrs[0].name, "x\"y",
+            "the malformed name html5ever actually read"
+        );
+
+        let mut out = String::new();
+        write_start_tag(&mut out, &tag, &[]);
+        assert_eq!(
+            out, r#"<a href="/ok">"#,
+            "the malformed attribute name must not reach the rewritten tag"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_a_tag_is_still_found() {
+        let html = r#"<A HREF="/docs/x.html">y</A>"#;
+        let links = extract(html, "https://example.com/");
+        assert_eq!(links.len(), 1, "expected exactly one link, got {links:?}");
+        assert_eq!(links[0].url, "https://example.com/docs/x.html");
+    }
+
+    #[test]
+    fn an_entity_encoded_address_still_resolves() {
+        // ~keep A browser maps 128-159 through Windows-1252, so &#150; is an en dash, not U+0096.
+        let html = r#"<a href="p&#150;q&amp;r=1">x</a>"#;
+        let links = extract(html, "https://example.com/d/");
+        assert_eq!(links.len(), 1, "expected exactly one link, got {links:?}");
+        assert_eq!(links[0].url, "https://example.com/d/p%E2%80%93q&r=1");
     }
 
     #[test]
@@ -169,21 +496,110 @@ mod tests {
     }
 
     #[test]
-    fn classifies_fragment_only_href_as_anchor() {
-        let base_url = Url::parse("https://example.com/page").expect("valid base URL");
+    fn an_encoded_script_address_is_skipped_like_a_plain_one() {
+        let html = r#"<a href="&#106;avascript&#58;alert(1)">x</a><a href="ok.html">ok</a>"#;
+        let links = extract(html, "https://example.com/dir/page");
+        let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://example.com/dir/ok.html"]);
+    }
+
+    #[test]
+    fn a_skipped_scheme_is_read_as_the_url_parser_reads_it() {
+        let html = r#"<a href="JavaScript:alert(1)">a</a><a href="&#74;avascript:alert(1)">b</a>
+            <a href="java&#9;script:alert(1)">c</a><a href="MAILTO:x@example.com">d</a>
+            <a href="Tel:+1">e</a><a href="&#68;ata:text/html,x">f</a><a href="ok.html">ok</a>"#;
+        let links = extract(html, "https://example.com/dir/page");
+        let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://example.com/dir/ok.html"]);
+    }
+
+    #[test]
+    fn schemes_the_crawler_cannot_fetch_are_skipped() {
+        let html = concat!(
+            r#"<a href="file:///etc/passwd">a</a><a href="blob:https://example.com/x">b</a>"#,
+            r#"<a href="ftp://example.com/f">c</a><a href="ok.html">ok</a>"#,
+        );
+        let links = extract(html, "https://example.com/dir/page");
+        let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(urls, ["https://example.com/dir/ok.html"]);
+    }
+
+    #[test]
+    fn a_link_to_the_page_itself_with_a_fragment_is_an_anchor_however_it_is_written() {
+        let html = concat!(
+            r##"<a href="#section-1">a</a><a href="#">b</a><a href="page?q=1#x">c</a>"##,
+            r##"<a href="/dir/page?q=1#y">d</a><a href="https://EXAMPLE.com:443/dir/./page?q=1#z">e</a>"##,
+        );
+        let types: Vec<LinkType> = link_types(html, "https://example.com/dir/page?q=1")
+            .into_iter()
+            .map(|(_, link_type)| link_type)
+            .collect();
+        assert_eq!(types, vec![LinkType::Anchor; 5]);
+    }
+
+    #[test]
+    fn a_link_to_the_page_itself_without_a_fragment_is_not_an_anchor() {
         assert_eq!(
-            classify_link("#section-1", &base_url),
-            LinkType::Anchor,
-            "a fragment-only href should classify as Anchor"
+            link_types(
+                r#"<a href="page">a</a><a href="/dir/page">b</a>"#,
+                "https://example.com/dir/page#top"
+            ),
+            [
+                ("https://example.com/dir/page".to_owned(), LinkType::Internal),
+                ("https://example.com/dir/page".to_owned(), LinkType::Internal),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_with_a_fragment_to_another_address_is_not_an_anchor() {
+        assert_eq!(
+            link_types(
+                r##"<a href="other#x">a</a><a href="page?q=2#x">b</a><a href="page/#x">c</a><a href="Page#x">d</a>"##,
+                "https://example.com/dir/page"
+            ),
+            [
+                ("https://example.com/dir/other#x".to_owned(), LinkType::Internal),
+                ("https://example.com/dir/page?q=2#x".to_owned(), LinkType::Internal),
+                ("https://example.com/dir/page/#x".to_owned(), LinkType::Internal),
+                ("https://example.com/dir/Page#x".to_owned(), LinkType::Internal),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fragment_only_href_on_a_page_with_a_base_names_the_base_address() {
+        let html = r##"<base href="/other/"><a href="#part">a</a><a href="/dir/page#top">b</a>"##;
+        assert_eq!(
+            link_types(html, "https://example.com/dir/page"),
+            [
+                ("https://example.com/other/#part".to_owned(), LinkType::Internal),
+                ("https://example.com/dir/page#top".to_owned(), LinkType::Anchor),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_base_on_another_host_does_not_make_that_host_internal() {
+        let html = concat!(
+            r#"<base href="https://cdn.example/assets/">"#,
+            r##"<a href="x.html">a</a><a href="https://example.com/home">b</a><a href="#part">c</a>"##,
+        );
+        assert_eq!(
+            link_types(html, "https://example.com/page"),
+            [
+                ("https://cdn.example/assets/x.html".to_owned(), LinkType::External),
+                ("https://example.com/home".to_owned(), LinkType::Internal),
+                ("https://cdn.example/assets/#part".to_owned(), LinkType::External),
+            ]
         );
     }
 
     #[test]
     fn classifies_pdf_extension_as_document() {
-        let base_url = Url::parse("https://example.com/page").expect("valid base URL");
         assert_eq!(
-            classify_link("/files/report.pdf", &base_url),
-            LinkType::Document,
+            link_types(r#"<a href="/files/report.pdf">a</a>"#, "https://example.com/page"),
+            [("https://example.com/files/report.pdf".to_owned(), LinkType::Document)],
             "a PDF href should classify as Document"
         );
     }
@@ -197,5 +613,46 @@ mod tests {
             "absolute base href should still resolve relative hrefs, got {}",
             links[0].url
         );
+    }
+
+    #[test]
+    fn a_data_or_javascript_base_falls_back_to_the_document_url() {
+        let document_url = Url::parse("https://example.com/dir/page.html").expect("valid document URL");
+        for (href, expected) in [
+            (" DATA:text/html,x ", "https://example.com/dir/page.html"),
+            ("\t JavaScript:alert(1)// \n", "https://example.com/dir/page.html"),
+            ("JAVASCRIPT://example.org/", "https://example.com/dir/page.html"),
+            ("/other/", "https://example.com/other/"),
+            ("https://cdn.example/assets/", "https://cdn.example/assets/"),
+        ] {
+            let html = format!(r#"<base href="{href}">"#);
+            assert_eq!(base_of(&html, &document_url), expected, "for base {href:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_whose_href_does_not_resolve_is_dropped() {
+        let links = extract(
+            r#"<a href="http://[not-an-address/">broken</a><a href="/ok">ok</a>"#,
+            "https://example.com/page",
+        );
+        assert_eq!(
+            links.iter().map(|link| link.url.as_str()).collect::<Vec<_>>(),
+            ["https://example.com/ok"],
+            "only the href that resolves may be returned, got {links:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_and_a_base_href_lose_their_userinfo() {
+        let links = extract(
+            r#"<a href="http://user:s3cret@example.com/a">a</a>"#,
+            "https://example.com/page",
+        );
+        assert_eq!(links[0].url, "http://example.com/a");
+
+        let html = r#"<base href="http://user:s3cret@example.com/dir/"><a href="page.html">link</a>"#;
+        let document = Url::parse("https://example.com/").expect("valid base URL");
+        assert_eq!(base_of(html, &document), "http://example.com/dir/");
     }
 }

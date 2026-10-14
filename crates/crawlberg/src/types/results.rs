@@ -32,7 +32,7 @@ pub struct BrowserExtras {
 /// When the crawler encounters non-HTML content and `download_documents` is
 /// enabled, it downloads the raw bytes and populates this struct instead of
 /// skipping the resource.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct DownloadedDocument {
     /// The URL the document was fetched from.
@@ -52,6 +52,7 @@ pub struct DownloadedDocument {
     pub content_hash: Box<str>,
     /// Selected response headers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[cfg_attr(alef, alef(sensitive))]
     pub headers: HashMap<Box<str>, Box<str>>,
     /// True when `content` (or the file at `content_path`) was truncated to
     /// `document_max_size`; `size` still reports the original, untruncated length.
@@ -63,6 +64,40 @@ pub struct DownloadedDocument {
     /// Base64-encoded copy of `content`, populated only when
     /// `document_content_encoding` was set to `Base64`.
     pub content_base64: Option<String>,
+}
+
+impl std::fmt::Debug for DownloadedDocument {
+    /// Redacted: `headers` can carry `Set-Cookie` or an echoed `Authorization`. Header
+    /// names stay visible; a sensitive value prints as `***`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ~keep Destructuring `Self` exhaustively is deliberate: a field added to the struct then
+        // fails to compile here instead of being silently dropped from the output, which is the
+        // failure mode a hand-written `Debug` otherwise has.
+        let Self {
+            url,
+            mime_type,
+            content,
+            size,
+            filename,
+            content_hash,
+            headers,
+            truncated,
+            content_path,
+            content_base64,
+        } = self;
+        f.debug_struct("DownloadedDocument")
+            .field("url", url)
+            .field("mime_type", mime_type)
+            .field("content", content)
+            .field("size", size)
+            .field("filename", filename)
+            .field("content_hash", content_hash)
+            .field("headers", &crate::net::redact::RedactedHeaders(headers))
+            .field("truncated", truncated)
+            .field("content_path", content_path)
+            .field("content_base64", content_base64)
+            .finish()
+    }
 }
 
 /// Result of executing a sequence of page interaction actions.
@@ -85,6 +120,10 @@ pub struct InteractionResult {
     /// Populated only when a `PageAction::Screenshot` action actually ran, so
     /// callers that never request a screenshot do not pay the encoding cost.
     pub screenshot_base64: Option<String>,
+    /// URLs of the requests the page sent during the session that the SSRF policy refused,
+    /// including during the extra wait, without their credentials, each listed once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssrf_refused_urls: Vec<String>,
 }
 
 /// Result from a single page action execution.
@@ -138,7 +177,7 @@ pub struct ScrapeResult {
     pub noindex_detected: bool,
     /// Whether a nofollow directive was detected.
     pub nofollow_detected: bool,
-    /// The X-Robots-Tag header value, if present.
+    /// The X-Robots-Tag header values, joined with `, ` when the response sent more than one.
     pub x_robots_tag: Option<String>,
     /// Whether the content is a PDF.
     pub is_pdf: bool,
@@ -180,12 +219,49 @@ pub struct ScrapeResult {
     /// populated when `BrowserBackend::Native` was used for this request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser: Option<BrowserExtras>,
+    /// URLs of the requests the page sent in browser mode that the SSRF policy refused, without
+    /// their credentials, each listed once. The page is kept; only the refused requests failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssrf_refused_urls: Vec<String>,
 }
 
 /// The result of crawling a single page during a crawl operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
+// ~keep The constructor of v1.10.3: the generated bindings keep it, and every field after it is
+// ~keep optional there. Add a new field at the END of the struct and leave this list alone.
+#[cfg_attr(
+    alef,
+    alef(legacy_constructor_fields = [
+        "url",
+        "normalized_url",
+        "status_code",
+        "content_type",
+        "html",
+        "body_size",
+        "metadata",
+        "links",
+        "images",
+        "feeds",
+        "json_ld",
+        "depth",
+        "stayed_on_domain",
+        "was_skipped",
+        "is_pdf",
+        "detected_charset",
+        "markdown",
+        "extracted_data",
+        "extraction_meta",
+        "downloaded_document",
+        "browser_used",
+        "final_url",
+        "redirect_count",
+        "noindex_detected",
+        "nofollow_detected",
+        "ssrf_refused_urls"
+    ])
+)]
 pub struct CrawlPageResult {
     /// The original URL of the page.
     pub url: String,
@@ -238,6 +314,22 @@ pub struct CrawlPageResult {
     /// Redirect hops taken to reach `final_url` from `url`.
     #[serde(default)]
     pub redirect_count: usize,
+    /// Whether the page asked not to be indexed, by its robots meta tag or `X-Robots-Tag`
+    /// header. The page is still crawled and its links still followed.
+    #[serde(default)]
+    pub noindex_detected: bool,
+    /// Whether the page asked that its links not be followed, by its robots meta tag or
+    /// `X-Robots-Tag` header. When the crawl respects robots, its links are not followed.
+    #[serde(default)]
+    pub nofollow_detected: bool,
+    /// URLs of the requests the page sent in browser mode that the SSRF policy refused, without
+    /// their credentials, each listed once. The page is kept; only the refused requests failed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssrf_refused_urls: Vec<String>,
+    /// Seed address as supplied, or the discovered link address resolved against its base.
+    /// Preserves source spelling through redirects; URL credentials are removed. <!-- ~keep -->
+    #[serde(default)]
+    pub original_url: String,
 }
 
 /// The result of a multi-page crawl operation.
@@ -480,7 +572,7 @@ pub struct CachedPage {
     pub status_code: u16,
     /// `Content-Type` header captured from the original response.
     pub content_type: String,
-    /// Raw response body stored verbatim in the cache.
+    /// The response body as text, decoded with the character set of the page.
     pub body: String,
     /// `ETag` header value, if any. Sent back as `If-None-Match` to revalidate this entry.
     pub etag: Option<String>,
@@ -502,4 +594,92 @@ pub struct CachedPage {
     /// never be served without first revalidating it against the origin.
     #[serde(default)]
     pub must_revalidate: bool,
+    /// The character set `body` was decoded with, as `detected_charset` reports it.
+    ///
+    /// `None` for a page that declares no character set and is UTF-8.
+    pub charset: Option<String>,
+    /// Whether `body` is the text of the page, decoded with the character set of the page.
+    ///
+    /// False for an entry that an earlier release stored. The body of such an entry is a lossy UTF-8 read
+    /// of the bytes, so a page in another character set has lost its letters. The cache layer
+    /// does not serve an entry that is not decoded; it fetches the page again and replaces it.
+    ///
+    /// `CachedPage::default()` sets it to false. A `CrawlCache` that builds its own entries must
+    /// set it to true for a body it stored as decoded text.
+    #[serde(default)]
+    pub decoded: bool,
+}
+
+#[cfg(test)]
+mod downloaded_document_debug_tests {
+    use super::{CrawlPageResult, DownloadedDocument, ScrapeResult};
+
+    const SESSION_COOKIE: &str = "sid=fake-session-value-not-a-real-secret";
+    const BEARER_TOKEN: &str = "Bearer fake-token-not-a-real-secret";
+
+    fn document_with_sensitive_headers() -> DownloadedDocument {
+        DownloadedDocument {
+            url: "https://example.com/report.pdf".to_owned(),
+            mime_type: "application/pdf".into(),
+            headers: std::collections::HashMap::from([
+                ("Set-Cookie".into(), SESSION_COOKIE.into()),
+                ("authorization".into(), BEARER_TOKEN.into()),
+                ("content-type".into(), "application/pdf".into()),
+            ]),
+            ..DownloadedDocument::default()
+        }
+    }
+
+    fn assert_headers_redacted(rendered: &str) {
+        assert!(
+            !rendered.contains(SESSION_COOKIE),
+            "Set-Cookie value must not reach Debug output, got {rendered}"
+        );
+        assert!(
+            !rendered.contains(BEARER_TOKEN),
+            "Authorization value must not reach Debug output, got {rendered}"
+        );
+        assert!(
+            rendered.contains(r#""Set-Cookie": "***""#),
+            "Set-Cookie name must stay visible with a redacted value, got {rendered}"
+        );
+        assert!(
+            rendered.contains(r#""authorization": "***""#),
+            "Authorization name must stay visible with a redacted value, got {rendered}"
+        );
+        assert!(
+            rendered.contains(r#""content-type": "application/pdf""#),
+            "a non-sensitive header value must stay visible, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn downloaded_document_debug_redacts_sensitive_header_values() {
+        let document = document_with_sensitive_headers();
+        for rendered in [format!("{document:?}"), format!("{document:#?}")] {
+            assert_headers_redacted(&rendered);
+        }
+    }
+
+    #[test]
+    fn scrape_result_debug_redacts_its_documents_sensitive_header_values() {
+        let result = ScrapeResult {
+            downloaded_document: Some(document_with_sensitive_headers()),
+            ..ScrapeResult::default()
+        };
+        for rendered in [format!("{result:?}"), format!("{result:#?}")] {
+            assert_headers_redacted(&rendered);
+        }
+    }
+
+    #[test]
+    fn crawl_page_result_debug_redacts_its_documents_sensitive_header_values() {
+        let result = CrawlPageResult {
+            downloaded_document: Some(document_with_sensitive_headers()),
+            ..CrawlPageResult::default()
+        };
+        for rendered in [format!("{result:?}"), format!("{result:#?}")] {
+            assert_headers_redacted(&rendered);
+        }
+    }
 }

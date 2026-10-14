@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 
 use crate::error::CrawlError;
+use crate::http::should_retry_error;
 use crate::types::{
     AttemptOutcome, BudgetExhausted, CrawlConfig, EscalationBudget, EscalationReason, RetryDirective, RetryPolicy,
 };
@@ -23,8 +24,9 @@ use crate::types::{
 /// |---|---|
 /// | `WafBlocked` | `Escalate { reason: WafBlocked }` |
 /// | `Forbidden` | `Escalate { reason: WafBlocked }` (403 treated as block) |
-/// | `RateLimited` | `Retry { backoff_ms: min(initial * 2^attempt, max_backoff_ms) }` |
-/// | `ServerError`, `BadGateway`, `Timeout` | `Retry` up to `max_retries`, then `Stop` |
+/// | `RateLimited`, `ServerError`, `BadGateway`, `Timeout`, with `retry_codes` empty | `Retry { backoff_ms: min(initial * 2^attempt, max_backoff_ms) }` up to `max_retries`, then `Stop` |
+/// | the same, with `retry_codes` listing the status the error was raised for | `Retry` up to `max_retries`, then `Stop` |
+/// | the same, with `retry_codes` not listing it (a timeout without a response has no status) | `Stop` |
 /// | `Dns`, `Ssl`, `Connection`, `InvalidConfig`, `Unsupported` | `Stop` (permanent) |
 /// | other, with a status in `retry_codes` | `Retry` up to `max_retries`, then `Stop` |
 /// | other | `Stop` |
@@ -49,8 +51,8 @@ impl SimpleRetryPolicy {
     }
 
     /// Build the policy from a [`CrawlConfig`]: `max_retries` comes from `retry_count`,
-    /// the backoff bounds from `retry_initial_delay_ms`/`retry_max_delay_ms`, and successful
-    /// responses whose status is in `retry_codes` are retried the same as a retryable error.
+    /// the backoff bounds from `retry_initial_delay_ms`/`retry_max_delay_ms`, and `retry_codes`
+    /// both gates the retryable errors and retries a successful response whose status it lists.
     ///
     /// ~keep This is the fix for the case where `retry_count=0` still produced retries:
     /// ~keep the dispatch loop previously always built `SimpleRetryPolicy::new()` (hardcoded
@@ -88,8 +90,8 @@ impl SimpleRetryPolicy {
 
     /// Decide what a successful (non-error) attempt means: retry only when its status is
     /// one of `retry_codes` — a status that made it here was not classified as a
-    /// `CrawlError` (see `crate::tower::service::status_error`), so this is the only place
-    /// e.g. an unmapped 504 can still honour a configured `retry_codes` entry.
+    /// `CrawlError` (see `crate::http::status_error`), so this is the only place
+    /// e.g. an unmapped 425 can still honour a configured `retry_codes` entry.
     fn decide_success(&self, outcome: &AttemptOutcome) -> RetryDirective {
         let Some(status) = outcome.status else {
             return RetryDirective::Stop;
@@ -129,7 +131,7 @@ impl RetryPolicy for SimpleRetryPolicy {
             | CrawlError::ServerError { .. }
             | CrawlError::BadGateway { .. }
             | CrawlError::Timeout { .. } => {
-                if outcome.attempt >= self.max_retries {
+                if outcome.attempt >= self.max_retries || !should_retry_error(error, &self.retry_codes) {
                     RetryDirective::Stop
                 } else {
                     let backoff = compute_backoff_ms(outcome.attempt, self.initial_backoff_ms, self.max_backoff_ms);
@@ -145,6 +147,7 @@ impl RetryPolicy for SimpleRetryPolicy {
             | CrawlError::Unauthorized { .. }
             | CrawlError::Gone { .. }
             | CrawlError::DataLoss { .. }
+            | CrawlError::ConversionFailed { .. }
             | CrawlError::BrowserError { .. }
             | CrawlError::BrowserTimeout { .. }
             | CrawlError::SsrfPolicyViolation { .. }
@@ -267,10 +270,7 @@ mod tests {
     #[tokio::test]
     async fn waf_blocked_escalates() {
         let policy = SimpleRetryPolicy::new();
-        let err = CrawlError::WafBlocked {
-            vendor: "cloudflare".into(),
-            message: "cloudflare detected".into(),
-        };
+        let err = CrawlError::waf_blocked("cloudflare", "cloudflare detected");
         let directive = policy.decide(&outcome_with_error(err, 0)).await;
         assert!(matches!(directive, RetryDirective::Escalate { .. }));
     }
@@ -278,10 +278,7 @@ mod tests {
     #[tokio::test]
     async fn waf_blocked_escalation_carries_vendor() {
         let policy = SimpleRetryPolicy::new();
-        let err = CrawlError::WafBlocked {
-            vendor: "cloudflare".into(),
-            message: "challenge".into(),
-        };
+        let err = CrawlError::waf_blocked("cloudflare", "challenge");
         let outcome = outcome_with_error(err, 0);
         match policy.decide(&outcome).await {
             RetryDirective::Escalate {
@@ -313,6 +310,14 @@ mod tests {
             ),
             other => panic!("expected Retry, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_conversion_is_not_retried() {
+        let policy = SimpleRetryPolicy::new();
+        let err = CrawlError::conversion_failed("could not convert https://example.com/ to Markdown: refused");
+        let directive = policy.decide(&outcome_with_error(err, 0)).await;
+        assert_eq!(directive, RetryDirective::Stop);
     }
 
     #[tokio::test]
@@ -397,6 +402,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_initial_backoff_ms_overrides_the_attempt_zero_delay() {
+        let policy = SimpleRetryPolicy::new().with_initial_backoff_ms(250);
+        let err = CrawlError::rate_limited("429");
+        let directive = policy.decide(&outcome_with_error(err, 0)).await;
+        match directive {
+            RetryDirective::Retry { backoff_ms } => assert_eq!(
+                backoff_ms, 250,
+                "attempt=0 must back off for exactly 2^0 * 250 = 250ms, got {backoff_ms}"
+            ),
+            other => panic!("expected Retry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn unlimited_budget_always_ok() {
         let budget = UnlimitedBudget;
         for cents in [0u32, 1, 1_000, u32::MAX] {
@@ -447,7 +466,7 @@ mod tests {
             ..CrawlConfig::default()
         };
         let policy = SimpleRetryPolicy::from_config(&config);
-        let err = CrawlError::server_error("service unavailable");
+        let err = crate::http::status_error(503, "https://example.com/").expect("503 is an error");
         let directive = policy.decide(&outcome_with_error(err, 0)).await;
         assert_eq!(
             directive,
@@ -457,17 +476,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn from_config_retries_an_error_only_when_retry_codes_list_its_status() {
+        let config = CrawlConfig {
+            retry_count: 3,
+            retry_codes: vec![429, 503],
+            ..CrawlConfig::default()
+        };
+        let policy = SimpleRetryPolicy::from_config(&config);
+        let from_status = |status| crate::http::status_error(status, "https://example.com/").expect("an error status");
+        let unlisted = policy.decide(&outcome_with_error(from_status(500), 0)).await;
+        assert_eq!(unlisted, RetryDirective::Stop, "a 500 is not in retry_codes [429, 503]");
+        let listed = policy.decide(&outcome_with_error(from_status(503), 0)).await;
+        assert!(
+            matches!(listed, RetryDirective::Retry { .. }),
+            "a 503 is in retry_codes, got {listed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn from_config_retries_a_successful_response_whose_status_is_in_retry_codes() {
         let config = CrawlConfig {
             retry_count: 2,
-            retry_codes: vec![504],
+            retry_codes: vec![425],
             ..CrawlConfig::default()
         };
         let policy = SimpleRetryPolicy::from_config(&config);
         let outcome = AttemptOutcome {
             attempt: 0,
             url: Arc::from("https://example.com/"),
-            status: Some(504),
+            status: Some(425),
             error: None,
             waf_signal: None,
             body_size: 0,
@@ -478,7 +515,7 @@ mod tests {
         let directive = policy.decide(&outcome).await;
         assert!(
             matches!(directive, RetryDirective::Retry { .. }),
-            "a 504 listed in retry_codes must retry even though it carries no CrawlError, got {directive:?}"
+            "a 425 listed in retry_codes must retry even though it carries no CrawlError, got {directive:?}"
         );
     }
 
@@ -493,7 +530,7 @@ mod tests {
         let outcome = AttemptOutcome {
             attempt: 0,
             url: Arc::from("https://example.com/"),
-            status: Some(504),
+            status: Some(425),
             error: None,
             waf_signal: None,
             body_size: 0,

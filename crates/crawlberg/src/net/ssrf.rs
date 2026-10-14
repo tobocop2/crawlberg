@@ -7,6 +7,8 @@
 //! ever exposed is re-exported here unchanged, because these names are part of the
 //! binding-generator surface.
 
+#[cfg(test)]
+mod cases;
 mod error;
 mod matcher;
 mod policy;
@@ -18,12 +20,17 @@ pub use policy::SsrfPolicy;
 pub use validate::validate_url;
 
 // ~keep Each re-export is gated to its only consumer -- `net::resolver` (non-wasm only) and the
-// ~keep `net::browser_policy` deny-list parity test. Ungated, either is an unused import in the
-// ~keep builds that lack that consumer, which -D warnings rejects.
+// ~keep `net::browser_policy` deny-list and named-scheme parity tests. Ungated, either is an
+// ~keep unused import in the builds that lack that consumer, which -D warnings rejects.
+#[cfg(test)]
+pub(crate) use validate::classify_private_ip;
 #[cfg(all(test, feature = "browser-native"))]
-pub(crate) use validate::DEFAULT_DENY_NET_CIDRS;
+pub(crate) use validate::{DEFAULT_DENY_NET_RULES, NAMED_SCHEMES};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use validate::{classify_private_ip, is_ip_permitted};
+pub(crate) use validate::{custom_denial_reason, denial_reason, validate_remote_resolution};
+
+#[cfg(test)]
+pub(crate) use cases::EMBEDDED_IPV4_CASES;
 
 #[cfg(test)]
 mod tests {
@@ -36,6 +43,7 @@ mod tests {
         let policy = SsrfPolicy::default();
         assert!(policy.deny_private);
         assert!(policy.allowlist.is_empty());
+        assert!(policy.denylist.is_empty());
         assert_eq!(policy.max_redirects, 5);
         assert_eq!(policy.scheme_allowlist, vec!["http", "https"]);
     }
@@ -212,6 +220,22 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_policy_round_trips_a_populated_denylist() {
+        let mut policy = SsrfPolicy::default();
+        policy
+            .denylist
+            .push(HostMatcher::cidr("203.0.113.0/24").expect("literal CIDR is valid"));
+
+        let encoded = serde_json::to_string(&policy).expect("policy must serialize");
+        let decoded: SsrfPolicy = serde_json::from_str(&encoded).expect("policy must deserialize");
+
+        assert_eq!(
+            decoded.denylist, policy.denylist,
+            "denylist must survive a JSON round trip"
+        );
+    }
+
+    #[test]
     fn test_default_policy_deny_private_true() {
         let policy = SsrfPolicy::default();
         assert!(policy.deny_private);
@@ -227,7 +251,7 @@ mod tests {
     #[test]
     fn test_classify_ipv4_loopback() {
         assert_eq!(
-            classify_private_ip(IpAddr::V4("127.0.0.1".parse().unwrap())),
+            classify_private_ip(IpAddr::V4("127.0.0.1".parse().unwrap()), &[]),
             "loopback"
         );
     }
@@ -235,7 +259,7 @@ mod tests {
     #[test]
     fn test_classify_ipv4_private_10() {
         assert_eq!(
-            classify_private_ip(IpAddr::V4("10.0.0.1".parse().unwrap())),
+            classify_private_ip(IpAddr::V4("10.0.0.1".parse().unwrap()), &[]),
             "private_network"
         );
     }
@@ -243,7 +267,7 @@ mod tests {
     #[test]
     fn test_classify_ipv4_private_172() {
         assert_eq!(
-            classify_private_ip(IpAddr::V4("172.16.0.1".parse().unwrap())),
+            classify_private_ip(IpAddr::V4("172.16.0.1".parse().unwrap()), &[]),
             "private_network"
         );
     }
@@ -251,7 +275,7 @@ mod tests {
     #[test]
     fn test_classify_ipv4_private_192() {
         assert_eq!(
-            classify_private_ip(IpAddr::V4("192.168.0.1".parse().unwrap())),
+            classify_private_ip(IpAddr::V4("192.168.0.1".parse().unwrap()), &[]),
             "private_network"
         );
     }
@@ -259,20 +283,20 @@ mod tests {
     #[test]
     fn test_classify_ipv4_link_local() {
         assert_eq!(
-            classify_private_ip(IpAddr::V4("169.254.1.1".parse().unwrap())),
+            classify_private_ip(IpAddr::V4("169.254.1.1".parse().unwrap()), &[]),
             "link_local"
         );
     }
 
     #[test]
     fn test_classify_ipv6_loopback() {
-        assert_eq!(classify_private_ip(IpAddr::V6("::1".parse().unwrap())), "loopback");
+        assert_eq!(classify_private_ip(IpAddr::V6("::1".parse().unwrap()), &[]), "loopback");
     }
 
     #[test]
     fn test_classify_ipv6_link_local() {
         assert_eq!(
-            classify_private_ip(IpAddr::V6("fe80::1".parse().unwrap())),
+            classify_private_ip(IpAddr::V6("fe80::1".parse().unwrap()), &[]),
             "link_local"
         );
     }
@@ -280,14 +304,40 @@ mod tests {
     #[test]
     fn test_classify_ipv6_unique_local() {
         assert_eq!(
-            classify_private_ip(IpAddr::V6("fc00::1".parse().unwrap())),
+            classify_private_ip(IpAddr::V6("fc00::1".parse().unwrap()), &[]),
             "unique_local"
         );
     }
 
     #[test]
+    fn should_name_every_address_in_the_fe80_and_fc00_prefixes_by_its_prefix() {
+        // ~keep fe80::/10 spans fe80..=febf and fc00::/7 spans fc00..=fdff. RFC 4193 randomises
+        // the unique-local global id, so fd12:: is the common case rather than fd00::. The
+        // fe80::1 and fc00::1 rows are guards -- they passed before the range fix; the other
+        // four are the coverage.
+        for (literal, expected) in [
+            ("fe80::1", "link_local"),
+            ("feaa::1", "link_local"),
+            ("febf:ffff::1", "link_local"),
+            ("fc00::1", "unique_local"),
+            ("fd12::1", "unique_local"),
+            ("fdff:ffff::1", "unique_local"),
+        ] {
+            let ip = IpAddr::V6(literal.parse().expect("valid IPv6 literal"));
+            assert_eq!(
+                classify_private_ip(ip, &[]),
+                expected,
+                "{literal} must be classified as {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn test_classify_ipv6_multicast() {
-        assert_eq!(classify_private_ip(IpAddr::V6("ff00::1".parse().unwrap())), "multicast");
+        assert_eq!(
+            classify_private_ip(IpAddr::V6("ff00::1".parse().unwrap()), &[]),
+            "multicast"
+        );
     }
 
     #[tokio::test]
@@ -383,7 +433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_url_rejects_shared_address_space() {
+    async fn validate_url_rejects_shared_address_space_as_private_network() {
         let policy = SsrfPolicy::default();
         for host in ["100.100.100.200", "100.64.0.1", "100.127.255.254"] {
             let url = format!("http://{host}/").parse::<url::Url>().unwrap();
@@ -391,8 +441,13 @@ mod tests {
                 .await
                 .expect_err("RFC 6598 shared address space must be denied");
             assert!(
-                matches!(err, SsrfError::DeniedByPolicy { .. }),
-                "expected DeniedByPolicy for RFC 6598 address {host}, got {err:?}"
+                matches!(
+                    err,
+                    SsrfError::DeniedByPolicy {
+                        reason: "private_network"
+                    }
+                ),
+                "expected a private_network denial for RFC 6598 address {host}, got {err:?}"
             );
         }
     }
@@ -417,6 +472,35 @@ mod tests {
             matches!(err, SsrfError::DeniedByPolicy { reason: "multicast" }),
             "expected DeniedByPolicy multicast, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_url_rejects_the_reserved_range_and_broadcast() {
+        let policy = SsrfPolicy::default();
+        for host in ["240.0.0.1", "250.1.2.3", "255.255.255.254", "255.255.255.255"] {
+            let url = format!("http://{host}/").parse::<url::Url>().unwrap();
+            let err = validate_url(&url, &policy)
+                .await
+                .expect_err("240.0.0.0/4 must be denied");
+            assert!(
+                matches!(
+                    err,
+                    SsrfError::DeniedByPolicy {
+                        reason: "private_network"
+                    }
+                ),
+                "expected DeniedByPolicy private_network for {host}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_url_permits_the_address_just_below_the_reserved_and_multicast_ranges() {
+        let policy = SsrfPolicy::default();
+        let url = "http://223.255.255.1/".parse::<url::Url>().unwrap();
+        validate_url(&url, &policy)
+            .await
+            .expect("223.255.255.1 is outside 224.0.0.0/4 and 240.0.0.0/4 and must be permitted");
     }
 
     #[tokio::test]
@@ -546,6 +630,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_denylist_wins_over_allowlist_and_private_network_opt_out() {
+        let denied = HostMatcher::cidr("203.0.113.0/24").expect("literal CIDR is valid");
+        let policy = SsrfPolicy {
+            deny_private: false,
+            allowlist: vec![denied.clone()],
+            denylist: vec![denied],
+            ..SsrfPolicy::default()
+        };
+        let url = "http://203.0.113.7/".parse::<url::Url>().expect("valid URL");
+
+        let error = validate_url(&url, &policy)
+            .await
+            .expect_err("a configured denial must not be weakened by either permissive setting");
+
+        assert!(
+            matches!(
+                error,
+                SsrfError::DeniedByPolicy {
+                    reason: "configured_network"
+                }
+            ),
+            "configured denial must report configured_network, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_denylist_extends_instead_of_replacing_default_denials() {
+        let policy = SsrfPolicy {
+            denylist: vec![HostMatcher::cidr("203.0.113.0/24").expect("literal CIDR is valid")],
+            ..SsrfPolicy::default()
+        };
+        let url = "http://10.0.0.7/".parse::<url::Url>().expect("valid URL");
+
+        let error = validate_url(&url, &policy)
+            .await
+            .expect_err("adding a custom network must leave built-in denials active");
+
+        assert!(
+            matches!(
+                error,
+                SsrfError::DeniedByPolicy {
+                    reason: "private_network"
+                }
+            ),
+            "the built-in denial must retain its reason, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_denylist_checks_an_ipv4_address_embedded_in_ipv6() {
+        let policy = SsrfPolicy {
+            deny_private: false,
+            denylist: vec![HostMatcher::cidr("203.0.113.0/24").expect("literal CIDR is valid")],
+            ..SsrfPolicy::default()
+        };
+        let url = "http://[::ffff:203.0.113.7]/".parse::<url::Url>().expect("valid URL");
+
+        let error = validate_url(&url, &policy)
+            .await
+            .expect_err("the embedded IPv4 address falls inside the configured denial");
+
+        assert!(
+            matches!(
+                error,
+                SsrfError::DeniedByPolicy {
+                    reason: "configured_network"
+                }
+            ),
+            "embedded configured denial must report configured_network, got {error:?}"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn configured_denylist_checks_addresses_behind_an_allowlisted_hostname() {
+        let policy = SsrfPolicy {
+            deny_private: false,
+            allowlist: vec![HostMatcher::exact("localhost")],
+            denylist: ["127.0.0.0/8", "::1/128"]
+                .into_iter()
+                .map(|cidr| HostMatcher::cidr(cidr).expect("literal CIDR is valid"))
+                .collect(),
+            ..SsrfPolicy::default()
+        };
+        let url = "http://localhost/".parse::<url::Url>().expect("valid URL");
+
+        let error = validate_url(&url, &policy)
+            .await
+            .expect_err("a hostname allowlist must not bypass configured network denials");
+
+        assert!(
+            matches!(
+                error,
+                SsrfError::DeniedByPolicy {
+                    reason: "configured_network"
+                }
+            ),
+            "resolved configured denial must report configured_network, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_url_exact_allowlist_does_not_match_literal_ip() {
         // ~keep Exact matchers are hostname-only; CIDR is required for literal IP allowlisting.
         let mut policy = SsrfPolicy::default();
@@ -592,6 +778,7 @@ mod tests {
         unsafe { std::env::set_var("CRAWLBERG_ALLOW_PRIVATE_NETWORK", "true") };
         let policy = SsrfPolicy::from_env();
         unsafe { std::env::remove_var("CRAWLBERG_ALLOW_PRIVATE_NETWORK") };
+        assert!(policy.denylist.is_empty(), "the environment must not add deny networks");
         let url = "http://10.0.0.1/".parse::<url::Url>().unwrap();
         validate_url(&url, &policy)
             .await
@@ -654,6 +841,7 @@ mod tests {
         assert!(policy.deny_private, "deny_private must default to true");
         assert_eq!(policy.max_redirects, 5, "max_redirects must default to 5");
         assert!(policy.allowlist.is_empty(), "allowlist must default to empty");
+        assert!(policy.denylist.is_empty(), "denylist must default to empty");
         assert!(
             policy.scheme_allowlist == vec!["http", "https"],
             "scheme_allowlist must default to http/https"
@@ -732,6 +920,149 @@ mod tests {
         assert!(
             matches!(err, SsrfError::DeniedByPolicy { reason: "loopback" }),
             "expected loopback denial for a NAT64-embedded loopback address, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_checks_the_ipv4_address_embedded_in_each_ipv6_form() {
+        let mut mismatches = Vec::new();
+        for &(literal, expected) in EMBEDDED_IPV4_CASES {
+            let url = format!("http://[{literal}]/").parse::<url::Url>().expect("valid URL");
+            let actual = match validate_url(&url, &SsrfPolicy::default()).await {
+                Ok(()) => None,
+                Err(SsrfError::DeniedByPolicy { reason }) => Some(reason),
+                Err(other) => panic!("{literal}: expected a policy decision, got {other:?}"),
+            };
+            if actual != expected {
+                mismatches.push(format!("{literal}: expected {expected:?}, got {actual:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "policy decisions differ:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_url_checks_embedded_ipv4_under_an_allowlisted_ipv6_prefix() {
+        // ~keep An allowlist entry for the local-use NAT64 prefix must not admit the private
+        // addresses inside it; an entry for the IPv4 range still does.
+        let policy_for = |cidr: &str| SsrfPolicy {
+            allowlist: vec![HostMatcher::cidr(cidr).expect("literal CIDR is valid")],
+            ..SsrfPolicy::default()
+        };
+        let url = "http://[64:ff9b:1::10.0.0.5]/".parse::<url::Url>().expect("valid URL");
+
+        let err = validate_url(&url, &policy_for("64:ff9b:1::/48"))
+            .await
+            .expect_err("the IPv6 prefix entry must not permit an embedded private address");
+        assert!(
+            matches!(
+                err,
+                SsrfError::DeniedByPolicy {
+                    reason: "private_network"
+                }
+            ),
+            "expected a private_network denial, got {err:?}"
+        );
+        validate_url(&url, &policy_for("10.0.0.0/8"))
+            .await
+            .expect("an IPv4 allowlist entry must permit the embedded address");
+    }
+
+    #[tokio::test]
+    async fn the_denial_reason_names_the_candidate_the_allowlist_did_not_admit() {
+        // ~keep fe80::5efe:10.0.0.5 is denied twice over: as link-local, and for the 10.0.0.5 its
+        // ISATAP identifier carries. With fe80::/10 allowlisted only the second denial stands, so
+        // the reason must be private_network. Classifying against an empty allowlist reports
+        // link_local -- an address this policy explicitly permits.
+        let policy = SsrfPolicy {
+            allowlist: vec![HostMatcher::cidr("fe80::/10").expect("literal CIDR is valid")],
+            ..SsrfPolicy::default()
+        };
+        let url = "http://[fe80::5efe:10.0.0.5]/".parse::<url::Url>().expect("valid URL");
+
+        let err = validate_url(&url, &policy)
+            .await
+            .expect_err("the embedded private address must still be denied");
+        assert!(
+            matches!(
+                err,
+                SsrfError::DeniedByPolicy {
+                    reason: "private_network"
+                }
+            ),
+            "the reason must name the embedded address, not the allowlisted prefix, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowlisted_ipv6_loopback_or_unspecified_address_is_not_read_as_ipv4() {
+        // ~keep `::1` and `::` sit inside the IPv4-compatible range `::/96`, where they would read
+        // as 0.0.0.1 and 0.0.0.0. They are the IPv6 loopback and unspecified addresses, so an
+        // allowlist entry for them must admit them rather than be overruled by that reading.
+        for (literal, cidr) in [("::1", "::1/128"), ("::", "::/128")] {
+            let policy = SsrfPolicy {
+                allowlist: vec![HostMatcher::cidr(cidr).expect("literal CIDR is valid")],
+                ..SsrfPolicy::default()
+            };
+            let url = format!("http://[{literal}]/").parse::<url::Url>().expect("valid URL");
+            validate_url(&url, &policy)
+                .await
+                .unwrap_or_else(|e| panic!("{literal} must be permitted under {cidr}, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn every_denial_reason_is_one_the_ssrf_docs_list() {
+        // ~keep The reason strings are a public contract: the SSRF docs list them for callers to
+        // match on. Every other test compares a reason with a literal or with the browser
+        // crate's copy, so renaming one in the code and those tests at once passed. This test
+        // makes the docs the second party to a rename, in both directions.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs-site/src/content/docs/concepts/ssrf-defense.md"
+        );
+        let doc = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let sentence = doc
+            .split("`reason` is one of")
+            .nth(1)
+            .and_then(|rest| rest.split(".\n").next())
+            .expect("the SSRF docs list the denial reasons");
+        let documented: std::collections::BTreeSet<&str> = sentence
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter_map(|span| span.strip_prefix('"')?.strip_suffix('"'))
+            .filter(|reason| !reason.starts_with("disallowed scheme"))
+            .collect();
+        let mut produced: std::collections::BTreeSet<&str> = validate::DEFAULT_DENY_NET_RULES
+            .iter()
+            .map(|(_, reason)| *reason)
+            .collect();
+        produced.insert("configured_network");
+        assert_eq!(
+            documented.len(),
+            7,
+            "expected seven documented reasons, parsed {documented:?}"
+        );
+        assert_eq!(
+            produced, documented,
+            "the denial reasons the deny-list produces differ from the ones the SSRF docs list"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn validate_url_refuses_a_hostname_that_resolves_to_loopback() {
+        let url = "http://localhost/".parse::<url::Url>().expect("valid URL");
+        let err = validate_url(&url, &SsrfPolicy::default())
+            .await
+            .expect_err("localhost resolves to loopback and must be refused");
+        assert!(
+            matches!(err, SsrfError::DeniedByPolicy { reason: "loopback" }),
+            "expected a loopback denial, got {err:?}"
         );
     }
 

@@ -4,17 +4,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tl::ParserOptions;
 use url::Url;
 
+use crate::helpers::PathPattern;
 use crate::html::{
-    HtmlExtraction, detect_charset, extract_page_data, is_binary_content_type, is_binary_url, is_html_content,
-    is_pdf_content, is_pdf_url,
+    HtmlExtraction, PageScan, decode_page, extract_page_data, is_binary_content_type, is_binary_url, is_html_content,
+    is_pdf_content, is_pdf_url, mask_raw_text_markup,
 };
+use crate::tower::BodyText;
 use crate::types::*;
-use regex::Regex;
 
 use crate::helpers::RobotsOutcome;
+use crate::scrape::RobotsDirectives;
 use crate::traits::*;
 
 /// Fallback URL used when a fetched URL fails to parse during extraction.
@@ -31,9 +32,13 @@ pub(super) static FALLBACK_URL: std::sync::LazyLock<Url> =
 pub(super) struct LoopContext<'a> {
     /// ~keep `Arc` rather than a borrowed slice: `fetch_and_extract` is spawned into a
     /// ~keep `JoinSet` and must own a redirect-hop policy of its own (see `FetchResult`'s
-    /// ~keep `final_url`), so each spawn needs a cheap, `'static` clone of the exclude list.
-    pub(super) exclude_regexes: Arc<[Regex]>,
-    pub(super) include_regexes: &'a [Regex],
+    /// ~keep `final_url`), so each spawn needs a cheap, `'static` clone of these lists.
+    ///
+    /// ~keep `regex::Regex::clone` allocates a fresh, cold cache pool per copy, so holding
+    /// these as slices and rebuilding an `Arc` per spawn rebuilt every pattern's cache
+    /// once per fetch.
+    pub(super) exclude_regexes: Arc<[PathPattern]>,
+    pub(super) include_regexes: Arc<[PathPattern]>,
     pub(super) robots: &'a RobotsOutcome,
     pub(super) base_host: &'a str,
     pub(super) base_host_suffix: &'a str,
@@ -41,6 +46,19 @@ pub(super) struct LoopContext<'a> {
     pub(super) max_pages: usize,
     pub(super) start_time: Instant,
     pub(super) tx: &'a Option<tokio::sync::mpsc::Sender<CrawlEvent>>,
+}
+
+/// Whether this is a streaming crawl whose receiver has been dropped.
+pub(super) fn receiver_gone(tx: &Option<tokio::sync::mpsc::Sender<CrawlEvent>>) -> bool {
+    tx.as_ref().is_some_and(tokio::sync::mpsc::Sender::is_closed)
+}
+
+/// Resolve once a streaming crawl's receiver is dropped; never for a non-streaming crawl.
+pub(super) async fn receiver_closed(tx: &Option<tokio::sync::mpsc::Sender<CrawlEvent>>) {
+    match tx {
+        Some(sender) => sender.closed().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The page whose links are being discovered, as link discovery sees it.
@@ -63,6 +81,8 @@ pub(super) struct FetchResult {
     pub(super) body_bytes: Vec<u8>,
     pub(super) headers: HashMap<String, Vec<String>>,
     pub(super) extraction: HtmlExtraction,
+    /// The page's own `noindex` / `nofollow`, from its `X-Robots-Tag` headers and meta tags.
+    pub(super) robots: RobotsDirectives,
     pub(super) is_binary: bool,
     pub(super) is_pdf: bool,
     pub(super) detected_charset: Option<String>,
@@ -72,6 +92,10 @@ pub(super) struct FetchResult {
     pub(super) final_url: String,
     /// Redirect hops taken to reach `final_url` from `entry.url`.
     pub(super) redirect_count: usize,
+    /// The URLs the browser's SSRF check refused for requests the page sent.
+    pub(super) ssrf_refused_urls: Vec<String>,
+    /// The extraction's read of `body`, taken by the markdown conversion so the page is read once.
+    pub(super) page_scan: Option<PageScan>,
 }
 
 /// What a spawned frontier fetch produced.
@@ -90,16 +114,19 @@ pub(super) enum FetchOutcome {
 
 /// Result of blocking HTML extraction within a fetch task.
 pub(super) struct PageExtraction {
-    /// The page body, re-decoded with `detected_charset` when a non-UTF-8 encoding
-    /// was detected (see [`blocking_extract_page`]). This is the body extraction,
+    /// The page body, decoded with `detected_charset` when the page is not UTF-8
+    /// (see [`blocking_extract_page`]). This is the body extraction,
     /// markdown conversion, and the final `CrawlPageResult::html` must all use —
     /// never the caller's original UTF-8-lossy `body`.
     pub(super) body: String,
     pub(super) body_bytes: Vec<u8>,
     pub(super) extraction: HtmlExtraction,
+    pub(super) robots: RobotsDirectives,
     pub(super) is_binary: bool,
     pub(super) is_pdf: bool,
     pub(super) detected_charset: Option<String>,
+    /// The read of `body` the extraction used, kept for the markdown.
+    pub(super) page_scan: PageScan,
 }
 
 /// Mutable state accumulated during a crawl.
@@ -172,52 +199,81 @@ impl CrawlState {
     }
 }
 
+/// The body of a fetched page, as the fetch returned it.
+pub(super) struct FetchedBody {
+    pub(super) body: String,
+    pub(super) body_bytes: Vec<u8>,
+    /// Whether `body` is the text of the page already. See [`BodyText`].
+    pub(super) body_text: BodyText,
+}
+
 /// Perform HTML extraction in a blocking context.
 ///
-/// `tl::parse` borrows the input string, so this must run via `spawn_blocking`.
+/// The parsed document borrows the input string, so this must run via `spawn_blocking`.
 ///
-/// ~keep Re-decodes `body` from `body_bytes` using the detected charset (mirrors
-/// `scrape_from_crawl_response` in `scrape.rs`) *before* parsing, so extraction,
+/// ~keep Decides the character set of the page from `body_bytes` and decodes them (as
+/// `scrape_from_crawl_response` in `scrape.rs` does) *before* parsing, so extraction,
 /// markdown conversion, and the `html` field the caller reports downstream all see
-/// correctly decoded text instead of `crawl()`'s original UTF-8-lossy fallback body.
-/// `detect_charset` runs on `body_bytes` (not `body`) so a byte-order mark or non-ASCII
-/// meta tag survives even when `body` is already lossy-mangled.
+/// the text of the page instead of `crawl()`'s original UTF-8-lossy fallback body.
+/// `body_text` says whether `body` is that text already, as the body of a browser is.
+///
+/// `page_scan` is the redirect check's read of `body`, reused unless the decode replaced it.
 pub(super) fn blocking_extract_page(
     url: &str,
     content_type: &str,
-    body: String,
-    body_bytes: Vec<u8>,
+    header_robots: RobotsDirectives,
+    user_agent: &str,
+    fetched: FetchedBody,
+    page_scan: Option<PageScan>,
 ) -> PageExtraction {
+    let FetchedBody {
+        body,
+        body_bytes,
+        body_text,
+    } = fetched;
     let parsed_url = Url::parse(url).unwrap_or_else(|_| FALLBACK_URL.clone());
 
-    let detected_charset = detect_charset(content_type, &body_bytes);
-    let body = match detected_charset.as_deref() {
-        Some(charset) => crate::http::redecode_with_charset(charset, &body_bytes).unwrap_or(body),
-        None => body,
+    let (text, detected_charset) = decode_page(&body_text, content_type, url, &body_bytes);
+    let (body, page_scan) = match text {
+        Some(text) => (text, None),
+        None => (body, page_scan),
     };
 
     let is_binary = is_binary_content_type(content_type) || is_binary_url(url);
     let is_pdf = is_pdf_content(content_type, &body) || is_pdf_url(url);
     let is_html = is_html_content(content_type, &body);
 
-    let extraction = if let Ok(doc) = tl::parse(&body, ParserOptions::default()) {
-        extract_page_data(&doc, &body, &parsed_url, is_html && !is_binary && !is_pdf, false)
+    // ~keep Parse the masked source, never `body`: `tl` reads the contents of raw-text elements
+    // ~keep as markup, which both invents tags and hides real ones.
+    let parsed_html = match page_scan {
+        Some(page_scan) => page_scan.attach(&body),
+        None => mask_raw_text_markup(&body),
+    };
+    let (extraction, robots) = if let Ok(doc) = crate::html::parse_html(&parsed_html.text) {
+        (
+            extract_page_data(&doc, &parsed_html, &parsed_url, is_html && !is_binary && !is_pdf, false),
+            header_robots.with_meta_tags(&doc, user_agent),
+        )
     } else {
-        HtmlExtraction {
+        let extraction = HtmlExtraction {
             metadata: PageMetadata::default(),
             links: Vec::new(),
             images: Vec::new(),
             feeds: Vec::new(),
             json_ld: Vec::new(),
-        }
+        };
+        (extraction, header_robots)
     };
 
+    let page_scan = parsed_html.detach();
     PageExtraction {
         body,
         body_bytes,
         extraction,
+        robots,
         is_binary,
         is_pdf,
         detected_charset,
+        page_scan,
     }
 }

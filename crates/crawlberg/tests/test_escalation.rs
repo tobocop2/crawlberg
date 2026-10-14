@@ -33,6 +33,7 @@ impl CountingMockProvider {
                 content_type: "text/html".into(),
                 body: format!("<html><body>{body}</body></html>"),
                 body_bytes: format!("<html><body>{body}</body></html>").into_bytes(),
+                body_kind: crawlberg::BypassBody::Bytes,
                 headers: Default::default(),
                 final_url: String::new(),
                 cost_usd: Some(0.0015),
@@ -566,5 +567,271 @@ async fn content_density_populated_for_html_response() {
     assert!(
         observed > 0.2 && observed < 0.8,
         "expected content_density in (0.2, 0.8) for an HTML body with real text, got {observed}"
+    );
+}
+
+// --- crawlberg#169: a challenge served with 503/429 must escalate, not be retried blindly ---
+
+/// A config that lists the challenge statuses in `retry_codes` and retries fast, so the
+/// escalate-vs-retry choice is actually contested rather than decided by an empty allowlist.
+fn contested_retry_config(strategy: EscalationStrategy, provider: Arc<CountingMockProvider>) -> CrawlConfig {
+    CrawlConfig {
+        retry_count: 3,
+        retry_codes: vec![429, 503],
+        retry_initial_delay_ms: 1,
+        retry_max_delay_ms: 5,
+        ..config_with(strategy, Some(provider))
+    }
+}
+
+/// A Cloudflare challenge served with 503 escalates to the next tier on the first attempt,
+/// even though 503 is in `retry_codes`.
+///
+/// Escalation and retry are different directives and only one can be returned: re-issuing the
+/// identical JS-less request reproduces the challenge, so the retry budget would be spent for
+/// nothing and the browser tier never reached. The single-request assertion is what pins that
+/// choice — without it the test would pass on a policy that retried three times first.
+#[tokio::test]
+async fn a_503_cloudflare_challenge_escalates_instead_of_being_retried() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/chl"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("server", "cloudflare")
+                .insert_header("content-type", "text/html")
+                .set_body_string(
+                    "<html><head><title>Just a moment...</title></head><body>\
+                     <script src=\"/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1\"></script>\
+                     </body></html>",
+                ),
+        )
+        .mount(&mock)
+        .await;
+
+    let provider = CountingMockProvider::new("vendor-fetched content");
+    let engine = build_engine(contested_retry_config(EscalationStrategy::BypassOnly, provider.clone()));
+
+    let result = engine.scrape(&format!("{}/chl", mock.uri())).await.unwrap();
+    let markdown = markdown_content(&result);
+    assert!(
+        markdown.contains("vendor-fetched content"),
+        "a 503 challenge must be served from the escalated tier, got: {markdown:?}"
+    );
+    assert_eq!(provider.calls(), 1, "the bypass tier must be reached exactly once");
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        1,
+        "the challenge must not be re-requested before escalating"
+    );
+}
+
+/// The same for a 429 challenge, and for a vendor identified by a response header alone —
+/// which also proves the header check runs before any body is read.
+#[tokio::test]
+async fn a_429_datadome_challenge_escalates_from_its_headers_alone() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dd"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-datadome", "blocked")
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html></html>"),
+        )
+        .mount(&mock)
+        .await;
+
+    let provider = CountingMockProvider::new("datadome bypassed");
+    let engine = build_engine(contested_retry_config(EscalationStrategy::BypassOnly, provider.clone()));
+
+    let result = engine.scrape(&format!("{}/dd", mock.uri())).await.unwrap();
+    let markdown = markdown_content(&result);
+    assert!(
+        markdown.contains("datadome bypassed"),
+        "a 429 challenge must be served from the escalated tier, got: {markdown:?}"
+    );
+    assert_eq!(provider.calls(), 1, "the bypass tier must be reached exactly once");
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        1,
+        "the challenge must not be re-requested before escalating"
+    );
+}
+
+/// Guard, not a red-green test: a 503 that carries no WAF fingerprint must keep the
+/// crawlberg#84 behaviour exactly — retried for as long as `retry_codes` allows, never
+/// escalated, and surfaced as a `ServerError`. It passes with and without the
+/// challenge-status change; its job is to fail if that change ever widens to plain 503s.
+///
+/// ~keep The request count is the assertion that matters. A version of this test that only
+/// checked the error variant would also pass if the 503 escalated first and the bypass tier
+/// then failed.
+#[tokio::test]
+async fn a_503_without_a_waf_signal_is_retried_and_never_escalates() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/plain"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html><body><h1>Service Unavailable</h1></body></html>"),
+        )
+        .mount(&mock)
+        .await;
+
+    let provider = CountingMockProvider::new("must not be used");
+    let engine = build_engine(contested_retry_config(EscalationStrategy::BypassOnly, provider.clone()));
+
+    let error = engine.scrape(&format!("{}/plain", mock.uri())).await.unwrap_err();
+    assert!(
+        matches!(error, CrawlError::ServerError { .. }),
+        "a plain 503 must stay a ServerError, got: {error:?}"
+    );
+    assert_eq!(provider.calls(), 0, "a plain 503 must not escalate");
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        4,
+        "retry_count=3 with 503 in retry_codes must send 4 requests"
+    );
+}
+
+/// A 503 whose only WAF evidence is the CDN's own `server` header is the origin failing, not
+/// an interstitial, so it is retried like any other 503 instead of escalating (crawlberg#197).
+///
+/// ~keep The request count and `provider.calls()` are the assertions that matter: checking
+/// only the error variant would also pass if the 503 escalated and the bypass tier then failed.
+#[tokio::test]
+async fn a_503_whose_only_waf_evidence_is_cdn_presence_is_retried_and_never_escalates() {
+    let mock = MockServer::start().await;
+    let fronted = [
+        ("/akamai", "AkamaiGHost"),
+        ("/incapsula", "Incapsula"),
+        ("/bigip", "BIG-IP"),
+    ];
+    for (route, server) in fronted {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("server", server)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html><body><h1>Service Unavailable</h1></body></html>"),
+            )
+            .mount(&mock)
+            .await;
+    }
+
+    let provider = CountingMockProvider::new("must not be used");
+    let engine = build_engine(contested_retry_config(EscalationStrategy::BypassOnly, provider.clone()));
+
+    for (route, server) in fronted {
+        let error = engine.scrape(&format!("{}{route}", mock.uri())).await.unwrap_err();
+        assert!(
+            matches!(error, CrawlError::ServerError { .. }),
+            "a 503 behind {server} must stay a ServerError, got: {error:?}"
+        );
+    }
+
+    assert_eq!(provider.calls(), 0, "a 503 behind a CDN must not escalate");
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        12,
+        "retry_count=3 with 503 in retry_codes must send 4 requests for each of the 3 routes"
+    );
+}
+
+/// A retry policy written outside the crate reads the HTTP status of a failed attempt from
+/// `AttemptOutcome::status`, so it can tell a 503 from a 500 without parsing the error. A plain
+/// 403 and a response refused as a WAF block carry their status too (crawlberg#133): a block
+/// refused from a 403, 429, 503 or 2xx reports that status, not `None`.
+#[tokio::test]
+async fn custom_retry_policy_reads_the_status_of_a_failed_attempt() {
+    use std::sync::Mutex;
+
+    /// The status the policy saw, and whether the attempt ended as a WAF block.
+    type Seen = (Option<u16>, bool);
+
+    #[derive(Debug)]
+    struct StatusRecordingPolicy(Arc<Mutex<Vec<Seen>>>);
+
+    #[async_trait::async_trait]
+    impl RetryPolicy for StatusRecordingPolicy {
+        async fn decide(&self, outcome: &AttemptOutcome) -> RetryDirective {
+            let Some(error) = &outcome.error else {
+                panic!("each attempt here fails: {outcome:?}");
+            };
+            let blocked = matches!(error, CrawlError::WafBlocked { .. });
+            self.0.lock().unwrap().push((outcome.status, blocked));
+            RetryDirective::Stop
+        }
+
+        fn name(&self) -> &'static str {
+            "status_recording"
+        }
+    }
+
+    let mock = MockServer::start().await;
+    let routes = [
+        ("/unavailable", ResponseTemplate::new(503)),
+        ("/broken", ResponseTemplate::new(500)),
+        ("/forbidden", ResponseTemplate::new(403)),
+        (
+            "/blocked-403",
+            ResponseTemplate::new(403).set_body_string("<html>cf-chl- challenge</html>"),
+        ),
+        (
+            "/blocked-429",
+            ResponseTemplate::new(429)
+                .append_header("x-px-block", "1")
+                .set_body_string("<html>px-captcha</html>"),
+        ),
+        (
+            "/blocked-503",
+            ResponseTemplate::new(503)
+                .append_header("x-datadome", "blocked")
+                .set_body_string("<html>challenge</html>"),
+        ),
+        (
+            "/blocked-202",
+            ResponseTemplate::new(202)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html>cf-chl- x</html>"),
+        ),
+    ];
+    for (route, response) in &routes {
+        Mock::given(method("GET"))
+            .and(path(*route))
+            .respond_with(response.clone())
+            .mount(&mock)
+            .await;
+    }
+
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let config = CrawlConfig {
+        dispatch: Some(DispatchProfile {
+            retry_policy: Some(Arc::new(StatusRecordingPolicy(recorded.clone()))),
+            ..DispatchProfile::default()
+        }),
+        ..allow_private_config()
+    };
+    let engine = build_engine(config);
+    for (route, _) in &routes {
+        let result = engine.scrape(&format!("{}{route}", mock.uri())).await;
+        assert!(result.is_err(), "{route} must fail, got {result:?}");
+    }
+
+    assert_eq!(
+        *recorded.lock().unwrap(),
+        vec![
+            (Some(503), false),
+            (Some(500), false),
+            (Some(403), false),
+            (Some(403), true),
+            (Some(429), true),
+            (Some(503), true),
+            (Some(202), true),
+        ],
+        "each failed attempt must reach the policy once, with the status of the response that ended it"
     );
 }

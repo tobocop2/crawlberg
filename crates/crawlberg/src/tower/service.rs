@@ -8,8 +8,9 @@ use std::task::{Context, Poll};
 
 use tower::Service;
 
-use super::types::{CrawlRequest, CrawlResponse};
+use super::types::{CrawlRequest, CrawlResponse, ResponseBody};
 use crate::error::{CrawlError, classify_reqwest_error};
+use crate::net::credentials::seed_host_headers;
 use crate::net::ssrf::validate_url;
 use crate::types::CrawlConfig;
 
@@ -18,6 +19,9 @@ use crate::types::CrawlConfig;
 pub struct HttpFetchService {
     client: reqwest::Client,
     config: Arc<CrawlConfig>,
+    /// The cookies of the crawl this service fetches for, when that crawl keeps cookies.
+    #[cfg(feature = "browser")]
+    crawl_cookies: Option<Arc<crate::browser::CrawlCookies>>,
 }
 
 impl HttpFetchService {
@@ -25,8 +29,33 @@ impl HttpFetchService {
         Self {
             client,
             config: Arc::new(config),
+            #[cfg(feature = "browser")]
+            crawl_cookies: None,
         }
     }
+
+    /// Fetch for the crawl that has `crawl_cookies`: each response reports the cookies it set
+    /// there as soon as its headers arrive.
+    #[cfg(feature = "browser")]
+    pub(crate) fn for_crawl(mut self, crawl_cookies: Option<Arc<crate::browser::CrawlCookies>>) -> Self {
+        self.crawl_cookies = crawl_cookies;
+        self
+    }
+}
+
+/// The `User-Agent` value this request will actually send.
+///
+/// ~keep `crawl_req.headers` wins when it already names one -- set explicitly by a caller
+/// (`RedirectPolicy::admits`, pinning the agent it picked for this hop) or by the UA rotation
+/// layer upstream of this service. Callers that need to judge robots rules against the agent a
+/// request actually sent (crawlberg#423) must read this same value back off the response
+/// (`CrawlResponse::sent_user_agent`) rather than recomputing the engine's configured default.
+fn resolved_user_agent(config: &CrawlConfig, crawl_req: &CrawlRequest) -> String {
+    crawl_req
+        .headers
+        .get("user-agent")
+        .cloned()
+        .unwrap_or_else(|| crate::helpers::default_robots_user_agent(config).to_owned())
 }
 
 /// Helper to apply auth and custom headers to a request builder.
@@ -34,44 +63,22 @@ fn apply_headers(
     mut req: reqwest::RequestBuilder,
     config: &CrawlConfig,
     crawl_req: &CrawlRequest,
+    url: &url::Url,
+    sent_user_agent: &str,
 ) -> reqwest::RequestBuilder {
     if !crawl_req.headers.contains_key("user-agent") {
-        if let Some(ref ua) = config.user_agent {
-            req = req.header(reqwest::header::USER_AGENT, ua.as_str());
-        } else {
-            req = req.header(
-                reqwest::header::USER_AGENT,
-                concat!("crawlberg/", env!("CARGO_PKG_VERSION")),
-            );
-        }
+        req = req.header(reqwest::header::USER_AGENT, sent_user_agent);
     }
 
-    // ~keep Withhold configured credentials once a redirect chain has left its origin host;
-    // ~keep reqwest's own cross-host stripping never runs because we follow redirects manually.
-    if let Some(ref auth) = config.auth {
-        if crawl_req.is_on_origin_host() {
-            match auth {
-                crate::types::AuthConfig::Basic { username, password } => {
-                    req = req.basic_auth(username, Some(password));
-                }
-                crate::types::AuthConfig::Bearer { token } => {
-                    req = req.bearer_auth(token);
-                }
-                crate::types::AuthConfig::Header { name, value } => {
-                    req = req.header(name.as_str(), value.as_str());
-                }
-            }
-        } else {
-            tracing::debug!(
-                origin = crawl_req.origin_host.as_deref().unwrap_or(""),
-                target = crawl_req.domain().unwrap_or_default(),
-                "withholding configured credentials from a cross-host redirect hop"
-            );
+    // ~keep A `user-agent` custom header is already reflected in `sent_user_agent`
+    // (`default_robots_user_agent` reads it, crawlberg#423), which the branch above already
+    // set on the request; re-adding it here would append a second, redundant `User-Agent`
+    // header line rather than replacing the first one.
+    for (name, value) in seed_host_headers(config, url) {
+        if name.eq_ignore_ascii_case("user-agent") {
+            continue;
         }
-    }
-
-    for (k, v) in &config.custom_headers {
-        req = req.header(k.as_str(), v.as_str());
+        req = req.header(name.as_str(), value.as_str());
     }
 
     for (k, v) in &crawl_req.headers {
@@ -92,9 +99,6 @@ const REDIRECT_STATUS_MAX: u16 = 400;
 /// chunked body, so only a clearly truncated transfer is reported.
 const CONTENT_LENGTH_SHORTFALL_TOLERANCE: usize = 100;
 
-/// Largest 2xx body still treated as a possible WAF challenge page rather than real content.
-const WAF_CHALLENGE_MAX_BODY_LEN: usize = 5000;
-
 /// Whether a status is a redirect that `do_fetch` returns to the caller unclassified.
 fn is_redirect_status(status: u16) -> bool {
     (REDIRECT_STATUS_MIN..REDIRECT_STATUS_MAX).contains(&status)
@@ -111,29 +115,6 @@ fn content_type_of(resp: &reqwest::Response) -> String {
         .to_owned()
 }
 
-/// Collect response headers into a lowercase-keyed multi-map, dropping non-UTF-8 values.
-fn collect_headers(resp: &reqwest::Response) -> HashMap<String, Vec<String>> {
-    let mut headers: HashMap<String, Vec<String>> = HashMap::new();
-    for (name, value) in resp.headers().iter() {
-        if let Ok(v) = value.to_str() {
-            headers
-                .entry(name.as_str().to_lowercase())
-                .or_default()
-                .push(v.to_string());
-        }
-    }
-    headers
-}
-
-/// Read the lowercase `server` header, or an empty string when absent.
-fn server_header(headers: &HashMap<String, Vec<String>>) -> String {
-    headers
-        .get("server")
-        .and_then(|v| v.first())
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default()
-}
-
 /// Build the `CrawlResponse` for a 3xx without classifying it; a failed body read yields an
 /// empty body rather than an error, because the caller only needs the status and headers.
 async fn read_redirect_response(
@@ -142,51 +123,13 @@ async fn read_redirect_response(
     status: u16,
     content_type: String,
     headers: HashMap<String, Vec<String>>,
+    sent_user_agent: String,
 ) -> CrawlResponse {
     let (body_bytes, _) = crate::http::read_body_bounded(resp, crate::http::effective_max_body_size(config))
         .await
         .unwrap_or_default();
-    let body = String::from_utf8_lossy(&body_bytes).into_owned();
-    CrawlResponse {
-        status,
-        content_type,
-        body,
-        body_bytes,
-        headers,
-    }
-}
-
-/// Classify a 403 as a WAF block when the body or headers carry a vendor fingerprint.
-async fn forbidden_error(
-    resp: reqwest::Response,
-    headers: &HashMap<String, Vec<String>>,
-    config: &CrawlConfig,
-) -> CrawlError {
-    let server = server_header(headers);
-    let body = crate::http::read_text_bounded(resp, crate::http::effective_max_body_size(config)).await;
-    if crate::http::is_waf_blocked(&server, &body, headers) {
-        let vendor = crate::http::detect_waf_vendor(&server, &body.to_lowercase());
-        return CrawlError::WafBlocked {
-            message: format!("waf/blocked detected: {vendor}"),
-            vendor,
-        };
-    }
-    CrawlError::forbidden("forbidden")
-}
-
-/// Map a status code that needs no body inspection onto its error, if it is an error at all.
-fn status_error(status: u16, url: &str) -> Option<CrawlError> {
-    match status {
-        401 => Some(CrawlError::unauthorized("unauthorized")),
-        404 => Some(CrawlError::not_found(format!("not_found: {url}"))),
-        408 => Some(CrawlError::timeout("timeout")),
-        410 => Some(CrawlError::gone("gone")),
-        429 => Some(CrawlError::rate_limited("rate_limited")),
-        500 => Some(CrawlError::server_error("server_error")),
-        502 => Some(CrawlError::bad_gateway("bad_gateway")),
-        503 => Some(CrawlError::server_error("service unavailable")),
-        _ => None,
-    }
+    CrawlResponse::new(status, content_type, headers, ResponseBody::Bytes(body_bytes))
+        .with_sent_user_agent(Some(sent_user_agent))
 }
 
 /// Whether an error chain names a truncated or failed body transfer rather than a transport fault.
@@ -203,13 +146,15 @@ fn is_body_error_chain(chain: &str) -> bool {
 
 /// Classify a failed body read as data loss where the chain says so, else as a transport error.
 fn classify_body_read_error(e: reqwest::Error) -> CrawlError {
+    if e.is_timeout() {
+        return classify_reqwest_error(e);
+    }
     let chain = crate::error::error_chain_string(&e);
     let is_body_error = is_body_error_chain(&chain);
     #[cfg(not(target_arch = "wasm32"))]
     let is_body_error = is_body_error || e.is_body();
     if is_body_error {
-        let message = format!("data_loss: {e}");
-        CrawlError::data_loss_with_source(message, e)
+        CrawlError::data_loss_with_source(e.to_string(), e)
     } else {
         classify_reqwest_error(e)
     }
@@ -232,29 +177,10 @@ fn content_length_shortfall_error(
         .and_then(|s| s.parse::<usize>().ok())?;
     if body_len < expected && expected - body_len > CONTENT_LENGTH_SHORTFALL_TOLERANCE {
         return Some(CrawlError::data_loss(format!(
-            "data_loss: expected {expected} bytes, got {body_len}"
+            "expected {expected} bytes, got {body_len}"
         )));
     }
     None
-}
-
-/// Classify a short 2xx body as a WAF challenge page when it carries a vendor fingerprint.
-///
-/// ~keep Some WAFs return 200 challenge pages, so short 2xx bodies still need WAF classification.
-#[cfg(not(target_arch = "wasm32"))]
-fn waf_error_for_success(status: u16, body: &str, headers: &HashMap<String, Vec<String>>) -> Option<CrawlError> {
-    if status != 200 || body.len() >= WAF_CHALLENGE_MAX_BODY_LEN {
-        return None;
-    }
-    let server = server_header(headers);
-    if !crate::http::is_waf_blocked(&server, body, headers) {
-        return None;
-    }
-    let vendor = crate::http::detect_waf_vendor(&server, &body.to_lowercase());
-    Some(CrawlError::WafBlocked {
-        message: format!("waf/blocked detected on 2xx (body): {vendor}"),
-        vendor,
-    })
 }
 
 /// Perform a single HTTP fetch (no retry, no redirect following) with SSRF validation.
@@ -268,61 +194,82 @@ fn waf_error_for_success(status: u16, body: &str, headers: &HashMap<String, Vec<
 /// validation of redirect targets is performed by `follow_redirects` before it
 /// calls `fetch_response` with the next hop URL (which re-enters `do_fetch` and
 /// re-validates the new URL here).
-async fn do_fetch(
-    client: &reqwest::Client,
-    config: &CrawlConfig,
-    req: &CrawlRequest,
-) -> Result<CrawlResponse, CrawlError> {
+async fn do_fetch(service: &HttpFetchService, req: &CrawlRequest) -> Result<CrawlResponse, CrawlError> {
+    let (client, config) = (&service.client, &*service.config);
     let url =
         url::Url::parse(&req.url).map_err(|e| CrawlError::ssrf_violation(&req.url, format!("invalid URL: {e}")))?;
 
+    crate::net::userinfo::refuse(&url)?;
     validate_url(&url, &config.ssrf)
         .await
         .map_err(|e| CrawlError::ssrf_violation(req.url.clone(), e.to_string()))?;
 
-    let http_req = apply_headers(client.get(url.to_string()), config, req);
+    let sent_user_agent = resolved_user_agent(config, req);
+    let client = crate::http::request_client(client, config, &url)?;
+    let http_req = apply_headers(client.get(url.to_string()), config, req, &url, &sent_user_agent);
 
     // ~keep reqwest uses Policy::none(); redirect following is explicit and policy-checked by callers.
-    let resp = http_req.send().await.map_err(classify_reqwest_error)?;
+    let resp = crate::http::send_with_cookies(http_req, config)
+        .await
+        .map_err(classify_reqwest_error)?;
 
+    crate::http::validate_content_encoding(resp.headers())?;
     let status = resp.status().as_u16();
     let content_type = content_type_of(&resp);
-    let headers = collect_headers(&resp);
+    let headers = crate::http::build_headers_map(resp.headers());
+
+    // ~keep The crawl's cookies are the one source a browser page reads, and this is the one place
+    // ~keep a response fetched without the browser arrives. It reports the cookies it set here,
+    // ~keep before its status can turn it into an error, a redirect, a retry or a browser fetch
+    // ~keep of the same address: none of those can read the crawl's cookies first.
+    #[cfg(feature = "browser")]
+    if let Some(crawl_cookies) = service.crawl_cookies.as_deref() {
+        crawl_cookies.forget_set_without_browser(url.as_str(), &headers);
+    }
 
     // ~keep Return 3xx responses as-is so redirect handling stays caller-owned.
     if is_redirect_status(status) {
-        return Ok(read_redirect_response(resp, config, status, content_type, headers).await);
+        return Ok(read_redirect_response(resp, config, status, content_type, headers, sent_user_agent).await);
     }
 
-    if status == 403 {
-        return Err(forbidden_error(resp, &headers, config).await);
+    // ~keep Shares `http::challenge_status_error` with `http::fetch_one_hop` rather than keeping
+    // a second copy: the two copies had already drifted. The one that stood here classified
+    // every response as if it were a 403 and showed the classifier only the `server` header, so
+    // a 403 identified by any other header came back as vendor "unknown".
+    if crate::http::is_challenge_status(status) {
+        return Err(crate::http::challenge_status_error(
+            status,
+            &req.url,
+            &headers,
+            resp,
+            crate::http::effective_max_body_size(config),
+        )
+        .await);
     }
-    if let Some(error) = status_error(status, &req.url) {
+    if let Some(error) = crate::http::status_error(status, &req.url) {
         return Err(error);
     }
 
+    let response_url = resp.url().clone();
     let (body_vec, hit_cap) = crate::http::read_body_bounded(resp, crate::http::effective_max_body_size(config))
         .await
-        .map_err(classify_body_read_error)?;
+        .map_err(|error| classify_body_read_error(error.with_url(response_url)))?;
 
     if let Some(error) = content_length_shortfall_error(&headers, body_vec.len(), hit_cap) {
         return Err(error);
     }
 
-    let body = String::from_utf8_lossy(&body_vec).into_owned();
+    let response = CrawlResponse::new(status, content_type, headers, ResponseBody::Bytes(body_vec))
+        .with_sent_user_agent(Some(sent_user_agent));
 
+    // ~keep The same 2xx decision `http::fetch_one_hop` makes, so the engine's crawl and the plain
+    // fetch refuse exactly the same responses (crawlberg#231).
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(error) = waf_error_for_success(status, &body, &headers) {
+    if let Some(error) = crate::http::waf_2xx_error(status, &response.body_bytes, &response.body, &response.headers) {
         return Err(error);
     }
 
-    Ok(CrawlResponse {
-        status,
-        content_type,
-        body,
-        body_bytes: body_vec,
-        headers,
-    })
+    Ok(response)
 }
 
 impl Service<CrawlRequest> for HttpFetchService {
@@ -335,8 +282,7 @@ impl Service<CrawlRequest> for HttpFetchService {
     }
 
     fn call(&mut self, req: CrawlRequest) -> Self::Future {
-        let client = self.client.clone();
-        let config = self.config.clone();
+        let service = self.clone();
 
         // ~keep A single fetch attempt only: retries are owned by the dispatch loop
         // ~keep (`engine::fetch::run_dispatch_loop`, via `SimpleRetryPolicy::from_config`), which
@@ -347,7 +293,7 @@ impl Service<CrawlRequest> for HttpFetchService {
         // ~keep `tower::Service` consumer of `HttpFetchService` that bypasses the dispatch loop
         // ~keep now gets no retries at all; wrap it in its own retry middleware (e.g. a
         // ~keep `tower::retry::Retry` layer) if it needs them.
-        Box::pin(async move { do_fetch(&client, &config, &req).await })
+        Box::pin(async move { do_fetch(&service, &req).await })
     }
 }
 
@@ -355,66 +301,88 @@ impl Service<CrawlRequest> for HttpFetchService {
 mod tests {
     use super::*;
 
-    /// Status → error mapping captured from the pre-extraction `do_fetch` match, so the
-    /// extraction into [`status_error`] can be shown to be behavior-preserving.
-    fn expected_status_mapping() -> Vec<(u16, Option<&'static str>)> {
-        vec![
-            (200, None),
-            (201, None),
-            (204, None),
-            (400, None),
-            (401, Some("unauthorized")),
-            (402, None),
-            (403, None),
-            (404, Some("not_found")),
-            (405, None),
-            (408, Some("timeout")),
-            (409, None),
-            (410, Some("gone")),
-            (418, None),
-            (429, Some("rate_limited")),
-            (451, None),
-            (500, Some("server_error")),
-            (501, None),
-            (502, Some("bad_gateway")),
-            (503, Some("service_unavailable")),
-            (504, None),
-        ]
+    async fn truncated_body_reqwest_error() -> reqwest::Error {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener must bind");
+        let address = listener.local_addr().expect("listener must have an address");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 500000\r\n\r\ntruncated")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("response headers must arrive")
+            .bytes()
+            .await
+            .expect_err("the truncated body must fail")
     }
 
-    fn error_tag(error: &CrawlError) -> &'static str {
-        match error {
-            CrawlError::Unauthorized { .. } => "unauthorized",
-            CrawlError::NotFound { .. } => "not_found",
-            CrawlError::Timeout { .. } => "timeout",
-            CrawlError::Gone { .. } => "gone",
-            CrawlError::RateLimited { .. } => "rate_limited",
-            CrawlError::ServerError { message, .. } if message == "service unavailable" => "service_unavailable",
-            CrawlError::ServerError { .. } => "server_error",
-            CrawlError::BadGateway { .. } => "bad_gateway",
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+    #[tokio::test]
+    async fn a_tower_body_error_renders_one_prefix_and_keeps_its_source() {
+        let raw_error = truncated_body_reqwest_error().await;
+        let raw_message = raw_error.to_string();
+        let error = classify_body_read_error(raw_error);
+
+        assert_eq!(error.to_string(), format!("data_loss: {raw_message}"));
+
+        use std::error::Error as _;
+        let source = error.source().expect("data loss must expose its source");
+        let original = source.source().expect("the source wrapper must expose reqwest's error");
+        assert!(original.downcast_ref::<reqwest::Error>().is_some());
     }
 
-    #[test]
-    fn status_error_maps_exactly_the_codes_the_fetch_path_classified() {
-        for (status, expected) in expected_status_mapping() {
-            let actual = status_error(status, "https://example.com/x");
-            assert_eq!(
-                actual.as_ref().map(error_tag),
-                expected,
-                "status {status} mapped to {actual:?}"
-            );
-        }
-    }
+    #[tokio::test]
+    async fn a_request_url_with_userinfo_is_refused_before_the_network() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[test]
-    fn status_error_embeds_the_requested_url_in_the_not_found_message() {
-        let error = status_error(404, "https://example.com/missing").expect("404 is an error");
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&mock)
+            .await;
+        let config = CrawlConfig::builder().allow_private_networks(true).build();
+        let client = crate::http::build_client(&config).expect("client must build");
+        let service = HttpFetchService::new(client, config);
+
+        let credentialed = CrawlRequest {
+            url: mock.uri().replacen("http://", "http://user:TOWER-PW-8b2c@", 1) + "/in",
+            headers: std::collections::HashMap::new(),
+            tier: None,
+        };
+        let error = do_fetch(&service, &credentialed)
+            .await
+            .map(|_| ())
+            .expect_err("a URL with userinfo must be refused");
+        let text = error.to_string();
         assert!(
-            matches!(&error, CrawlError::NotFound { message, .. } if message == "not_found: https://example.com/missing"),
-            "got {error:?}"
+            !text.contains("TOWER-PW-8b2c"),
+            "the error must not print the password: {text}"
         );
+
+        do_fetch(&service, &CrawlRequest::new(format!("{}/out", mock.uri())))
+            .await
+            .expect("the same URL without userinfo must be fetched");
+        let paths: Vec<String> = mock
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .into_iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(paths, ["/out"], "only the URL without userinfo may reach the network");
     }
 
     #[test]
@@ -482,9 +450,16 @@ mod tests {
         let error = content_length_shortfall_error(&headers, body_len, false).expect("data loss expected");
         assert!(
             matches!(&error, CrawlError::DataLoss { message, .. }
-                if message == &format!("data_loss: expected 1000 bytes, got {body_len}")),
+                if message == &format!("expected 1000 bytes, got {body_len}")),
             "got {error:?}"
         );
+        assert_eq!(
+            error.to_string(),
+            format!("data_loss: expected 1000 bytes, got {body_len}")
+        );
+
+        use std::error::Error as _;
+        assert!(error.source().is_none(), "a measured shortfall has no underlying error");
     }
 
     #[test]

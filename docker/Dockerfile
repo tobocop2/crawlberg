@@ -15,12 +15,14 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/crawlberg-chromiumoxide/ vendor/crawlberg-chromiumoxide/
 
 COPY crates/crawlberg/ crates/crawlberg/
+COPY crates/crawlberg-robots/ crates/crawlberg-robots/
 COPY crates/crawlberg-cli/ crates/crawlberg-cli/
+COPY crates/crawlberg-browser/ crates/crawlberg-browser/
 
-RUN sed -i 's|^members = .*|members = ["crates/crawlberg", "crates/crawlberg-cli"]|' Cargo.toml && \
-    sed -i '/^exclude/,/^\]/d' Cargo.toml
+RUN sed -i -z 's|members = \[[^]]*\]|members = ["crates/crawlberg", "crates/crawlberg-cli"]|' Cargo.toml
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

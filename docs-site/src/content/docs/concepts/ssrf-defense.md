@@ -16,25 +16,57 @@ asset download, and link-following enqueue.
 | Link-local | 169.254.0.0/16 (incl. AWS/GCP metadata 169.254.169.254), fe80::/10 |
 | Unspecified | 0.0.0.0/8 |
 | Multicast | 224.0.0.0/4, ff00::/8 |
+| Reserved | 240.0.0.0/4 (incl. broadcast 255.255.255.255) |
 | IPv6 unique-local | fc00::/7 |
+| IPv6 forms that embed an IPv4 address | IPv4-mapped (::ffff:0:0/96), IPv4-compatible (::/96), IPv4-translated (::ffff:0:0:0/96), NAT64 (64:ff9b::/96), 6to4 (2002::/16), Teredo (2001:0::/32, where the address is stored inverted) and ISATAP (interface identifier 0000:5efe or 0200:5efe): the embedded IPv4 address is checked against the rows above |
+| IPv6 local-use NAT64 (64:ff9b:1::/48, RFC 8215) | The IPv4 address is read from the last 32 bits, where a /96 network prefix puts it, and checked against the rows above. A reading whose last three octets are zero is skipped when the prefix bytes after the /48 are not all zero, because that is how the unused bits of a /48, /56 or /64 network read |
 | Non-http/https schemes | file, ftp, gopher, … |
 
 DNS rebinding is mitigated: if a hostname resolves to a mix of public and
 denied IPs, the request is refused.
 
+### What the IPv6 rows do not cover
+
+The embedded-IPv4 rows above cover the forms that fix the address at a known position. Three
+gaps remain, and an egress restriction outside the process is the only defence against them:
+
+- **A NAT64 network-specific prefix.** RFC 6052 allows a translator to sit on any prefix the
+  operator chooses, not only `64:ff9b::/96` or `64:ff9b:1::/48`. Crawlberg does not discover
+  the local prefix (RFC 7050 would), so an address under a custom prefix is checked as IPv6
+  only. Add the deployment's translator prefix to `SsrfPolicy::denylist` to refuse that range.
+- **A dotted quad in the low 32 bits under an arbitrary prefix.** `2001:db8::a00:5` carries
+  `10.0.0.5` in its last 32 bits but is not any of the forms above, so it is not unwrapped.
+  Unwrapping every address that way would refuse public addresses whose last 32 bits happen to
+  read as private, on every prefix rather than just inside `64:ff9b:1::/48`.
+- **A /48, /56 or /64 network inside the local-use NAT64 prefix.** Only the /96 position is
+  read, so an address that one of those networks encodes, such as `64:ff9b:1:a00:0:500::`
+  (`10.0.0.5` after a /48 prefix), is checked as IPv6 only. Reading those positions as well
+  refused every destination on some /96 networks, because their prefix bytes read as a private
+  address. The skip rule above also permits a /96 network's destinations `0.0.0.0`, `10.0.0.0`,
+  `127.0.0.0` and the other addresses whose last three octets are zero, when the network's
+  prefix bytes are not all zero. [Issue #174](https://github.com/xberg-io/crawlberg/issues/174)
+  proposes a configured prefix length that would close both.
+
 :::caution[WebAssembly: hostnames are not checked]
 On `wasm32` targets — `crawlberg-wasm`, including its `pkg/nodejs` build — there is no DNS
 resolution available to the crawler. `validate_url` only checks a **literal IP** host against
-the policy; a domain name is always permitted, regardless of `deny_private`. In a browser this
-gap is covered by same-origin/CORS. **Under Node.js, `fetch` enforces no CORS**, so a Node
-service embedding the wasm binding can be driven to internal hosts by domain name even with
-`deny_private = true`. Do not rely on `deny_private` to stop this in Node — enforce egress
-restrictions (network policy, firewall, proxy allowlist) outside the process.
+the policy; a domain name is always permitted, regardless of `deny_private` or `denylist`. In a
+browser this gap is covered by same-origin/CORS. **Under Node.js, `fetch` enforces no CORS**, so a
+Node service embedding the wasm binding can be driven to internal hosts by domain name even with
+`deny_private = true` or a matching custom range. Do not rely on the in-process policy to stop
+this in Node — enforce egress restrictions (network policy, firewall, proxy allowlist) outside
+the process.
 :::
 
-Each 30x `Location` is re-resolved and re-validated against the same policy
-before the next hop is taken. Up to `SsrfPolicy::max_redirects` (default 5)
-hops are followed.
+A request to a [non-http/https scheme](#what-is-refused) is refused. A
+redirect is different: when a 30x `Location`, a `Refresh` header, or a
+`<meta http-equiv="refresh">` tag names one, the crawl does not follow it.
+The chain ends there, and the redirect response itself is returned as the
+page, with no SSRF error.
+
+A `Location` that names a web address is re-resolved and re-validated
+against the same policy before the next hop is taken. Up to
+`SsrfPolicy::max_redirects` (default 5) hops are followed.
 
 ## Opting out
 
@@ -125,6 +157,56 @@ Allowlist entries permit access regardless of the default denylist. A
 mismatch between hostname allowlist and resolved IPs (e.g. `Exact("svc.internal")`
 resolves to a public IP) still permits the request — the allowlist trusts the host string.
 
+### Proxies and external browsers
+
+An upstream proxy or a browser on another machine performs the connection's final DNS lookup
+outside Crawlberg. A local lookup cannot bind that remote process to the addresses the policy
+checked, so hostname traffic fails closed whenever an IP denial could be evaded:
+
+- With `deny_private = true`, an ordinary hostname is refused. Add an `Exact` or `Suffix`
+  allowlist entry only when the operator trusts that hostname's remote DNS result. A CIDR entry
+  cannot authorize remote DNS because Crawlberg never sees the resulting address.
+- With `deny_private = false`, ordinary hostnames are permitted unless a custom `denylist` is set.
+- A custom `denylist` always takes precedence. An upstream or external browser cannot resolve any
+  hostname while one is configured, even when the hostname is allowlisted or private networks are
+  enabled. Literal IP URLs remain available when their address passes the policy.
+
+This applies to configured and environment HTTP proxies, proxy providers, Chrome upstream proxies,
+and an external `browser.endpoint`. Direct connections still use Crawlberg's policy resolver, which
+checks the addresses used by the connection. To keep remote hostname resolution, use explicit
+hostname allowlists for the built-in policy, disable `deny_private`, or enforce equivalent egress
+policy at the proxy/browser boundary.
+
+## Additional denied networks
+
+Deployments can add public or private IP ranges that must never be reached. These ranges extend
+the built-in deny-list; they still apply when `deny_private` is false and take precedence over
+hostname and CIDR allowlist entries. Hostnames are resolved when this list is non-empty so a name
+allowlist cannot bypass a configured network denial. IPv4 addresses embedded in IPv6 are checked
+against these ranges in the same way as the built-in list.
+
+```rust
+use crawlberg::{CrawlConfigBuilder, HostMatcher};
+
+let config = CrawlConfigBuilder::default()
+    .ssrf_denylist_cidr(HostMatcher::cidr("203.0.113.0/24")?)
+    .build();
+# Ok::<(), crawlberg::SsrfError>(())
+```
+
+Only CIDR matchers are accepted in `denylist`; exact and suffix hostname matchers are rejected by
+configuration validation. The JSON form uses the same tagged CIDR representation as `allowlist`:
+
+```json
+{"ssrf": {"denylist": [
+  {"type": "cidr", "value": "203.0.113.0/24"}
+]}}
+```
+
+A hostname cannot be checked against a custom address denylist when its final DNS lookup happens
+outside Crawlberg. As described above, Crawlberg therefore refuses every hostname on that route
+when `denylist` is non-empty.
+
 ## What happens when a request is refused
 
 Errors are typed:
@@ -136,9 +218,20 @@ pub enum CrawlError {
 }
 ```
 
-`url` is the refused URL (original input or the redirect target that failed).
+`url` is the refused URL (original input or the redirect target that failed), with
+its user name and password each replaced by `***`. An address that holds an `@` but does not
+parse to a URL with a host, such as `user:token@host`, is replaced whole with
+`[address hidden: it may carry credentials]`. A call that starts from such an address is
+refused before it starts: `url` is `(unparseable URL)`, and `reason` begins with
+`"invalid URL: "`.
 `reason` is one of `"loopback"`, `"private_network"`, `"link_local"`,
-`"unique_local"`, `"multicast"`, `"unspecified"`, or `"disallowed scheme: <scheme>"`.
+`"unique_local"`, `"multicast"`, `"unspecified"`, `"configured_network"`, or
+`"disallowed scheme: <scheme>"`.
+`<scheme>` names the scheme only when it is on a fixed list of known ones, such as
+`ftp` or `file`. An unlisted scheme, including one an address without a scheme
+parses into (`user:token@host` parses with scheme `user`), gives
+`"disallowed scheme: unrecognized"` instead. This keeps a credential from a
+scheme-less address out of the reason.
 
 The default retry policy classifies `SsrfPolicyViolation` as permanent —
 the crawler will not retry the request.
@@ -157,6 +250,11 @@ browser-specific extras are kept:
   fixtures.
 - A `localhost`/`.localhost` string short-circuit runs before DNS to mitigate
   rebinding through the browser's resolver.
+
+Standalone `crawlberg-browser` uses `DefaultSsrfValidator`, which also refuses remote hostname
+resolution while private-network denial is enabled. A custom `SsrfValidator` inherits a
+fail-closed `validate_remote_resolution` implementation; an embedding that intentionally permits
+an upstream proxy to resolve hostnames must override that method explicitly.
 
 This is the same mitigation chain that fixed GHSA-8v6v-g4rh-jmcm.
 

@@ -119,6 +119,13 @@ impl CrawlConfigBuilder {
         self
     }
 
+    /// Set whether `include_paths`/`exclude_paths` match against the full URL
+    /// (`scheme://host[:port]/path?query`). Takes precedence over `path_patterns_match_query`.
+    pub fn path_patterns_match_url(mut self, value: bool) -> Self {
+        self.inner.path_patterns_match_url = value;
+        self
+    }
+
     /// Set whether the crawl-dedup key includes the (sorted) query string.
     pub fn dedup_include_query(mut self, value: bool) -> Self {
         self.inner.dedup_include_query = value;
@@ -318,6 +325,7 @@ impl CrawlConfigBuilder {
     /// When `false` (default), they are denied unless explicitly allowlisted.
     pub fn allow_private_networks(mut self, allow: bool) -> Self {
         self.inner.ssrf.deny_private = !allow;
+        self.inner.ssrf_deny_private_explicit = Some(!allow);
         self
     }
 
@@ -337,6 +345,16 @@ impl CrawlConfigBuilder {
     /// ```
     pub fn ssrf_allowlist_host(mut self, matcher: HostMatcher) -> Self {
         self.inner.ssrf.allowlist.push(matcher);
+        self
+    }
+
+    /// Add an IP range to the SSRF policy denylist.
+    ///
+    /// ~keep Configured denials take precedence over the allowlist and
+    /// [`allow_private_networks`](Self::allow_private_networks). Build the argument with
+    /// [`HostMatcher::cidr`]; configuration validation rejects hostname variants.
+    pub fn ssrf_denylist_cidr(mut self, matcher: HostMatcher) -> Self {
+        self.inner.ssrf.denylist.push(matcher);
         self
     }
 
@@ -431,5 +449,92 @@ impl DispatchProfileBuilder {
     /// Consume the builder and produce a [`DispatchProfile`].
     pub fn build(self) -> DispatchProfile {
         self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_private_networks_pins_the_caller_choice() {
+        let denied = CrawlConfig::builder().allow_private_networks(false).build();
+        let allowed = CrawlConfig::builder().allow_private_networks(true).build();
+
+        assert_eq!(
+            (denied.ssrf.deny_private, denied.ssrf_deny_private_explicit),
+            (true, Some(true)),
+            "allow_private_networks(false) must pin private-network denial"
+        );
+        assert_eq!(
+            (allowed.ssrf.deny_private, allowed.ssrf_deny_private_explicit),
+            (false, Some(false)),
+            "allow_private_networks(true) must pin private-network access"
+        );
+    }
+
+    #[test]
+    fn ssrf_denylist_cidr_reaches_the_built_config() {
+        let denied = HostMatcher::cidr("203.0.113.0/24").expect("literal CIDR is valid");
+        let config = CrawlConfig::builder().ssrf_denylist_cidr(denied.clone()).build();
+
+        assert_eq!(
+            config.ssrf.denylist,
+            vec![denied],
+            "ssrf_denylist_cidr must append the configured network"
+        );
+    }
+
+    // ~keep These three setters had zero call sites anywhere in `crates/` or `e2e/` before
+    // ~keep this module: replacing each body with `let _ = value;` left the whole suite green.
+    // ~keep Each test picks a value distinct from `CrawlConfig::default()` and reads it back
+    // ~keep off the built config, so a setter that silently drops its argument shows up as a
+    // ~keep value equal to the default rather than the one passed in.
+
+    #[test]
+    fn retry_initial_delay_ms_reaches_the_built_config() {
+        let config = CrawlConfig::builder().retry_initial_delay_ms(4_242).build();
+        assert_eq!(
+            config.retry_initial_delay_ms, 4_242,
+            "retry_initial_delay_ms(4242) must set CrawlConfig::retry_initial_delay_ms, got {}",
+            config.retry_initial_delay_ms
+        );
+        assert_ne!(
+            config.retry_initial_delay_ms,
+            CrawlConfig::default().retry_initial_delay_ms,
+            "the chosen test value must differ from the default, or this test cannot tell a \
+             working setter from a dropped argument"
+        );
+    }
+
+    #[test]
+    fn retry_max_delay_ms_reaches_the_built_config() {
+        let config = CrawlConfig::builder().retry_max_delay_ms(123_456).build();
+        assert_eq!(
+            config.retry_max_delay_ms, 123_456,
+            "retry_max_delay_ms(123456) must set CrawlConfig::retry_max_delay_ms, got {}",
+            config.retry_max_delay_ms
+        );
+        assert_ne!(
+            config.retry_max_delay_ms,
+            CrawlConfig::default().retry_max_delay_ms,
+            "the chosen test value must differ from the default, or this test cannot tell a \
+             working setter from a dropped argument"
+        );
+    }
+
+    #[test]
+    fn rate_limit_jitter_ratio_reaches_the_built_config() {
+        let config = CrawlConfig::builder().rate_limit_jitter_ratio(0.37).build();
+        assert!(
+            (config.rate_limit_jitter_ratio - 0.37).abs() < f64::EPSILON,
+            "rate_limit_jitter_ratio(0.37) must set CrawlConfig::rate_limit_jitter_ratio, got {}",
+            config.rate_limit_jitter_ratio
+        );
+        assert!(
+            (config.rate_limit_jitter_ratio - CrawlConfig::default().rate_limit_jitter_ratio).abs() > f64::EPSILON,
+            "the chosen test value must differ from the default, or this test cannot tell a \
+             working setter from a dropped argument"
+        );
     }
 }

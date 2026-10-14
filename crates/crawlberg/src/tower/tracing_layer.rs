@@ -186,17 +186,22 @@ mod tests {
         let _guard = tracing::subscriber::set_default(CapturingSubscriber { sink: sink.clone() });
 
         let inner = service_fn(|_req: CrawlRequest| async {
-            Ok::<_, CrawlError>(CrawlResponse {
-                status: 200,
-                content_type: String::new(),
-                body: String::new(),
-                body_bytes: Vec::new(),
-                headers: std::collections::HashMap::new(),
-            })
+            Ok::<_, CrawlError>(CrawlResponse::new(
+                200,
+                String::new(),
+                std::collections::HashMap::new(),
+                crate::tower::ResponseBody::Bytes(Vec::new()),
+            ))
         });
         let svc = CrawlTracingLayer::new().layer(inner);
 
-        let req = CrawlRequest::new("http://user:hunter2@example.com/page");
+        // ~keep A struct literal, not `CrawlRequest::new`, which asserts that admission already
+        // ~keep took the userinfo off. This span redacts anyway, as the last guard.
+        let req = CrawlRequest {
+            url: "http://user:hunter2@example.com/page".to_owned(),
+            headers: std::collections::HashMap::new(),
+            tier: None,
+        };
         svc.oneshot(req).await.expect("stubbed inner service always succeeds");
 
         let recorded = sink.lock().expect("sink mutex must not be poisoned");

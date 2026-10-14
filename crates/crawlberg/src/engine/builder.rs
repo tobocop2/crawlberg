@@ -37,10 +37,15 @@ pub struct CrawlEngineBuilder {
     config: Option<CrawlConfig>,
     frontier: Option<Arc<dyn Frontier>>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
+    /// The limiter of the browser paths, when it is not the decision of `build`: the one of
+    /// another engine, shared through `politeness`.
+    #[cfg(any(feature = "browser", feature = "browser-native"))]
+    browser_rate_limiter: Option<Arc<dyn RateLimiter>>,
     store: Option<Arc<dyn CrawlStore>>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
     strategy: Option<Arc<dyn CrawlStrategy>>,
     content_filter: Option<Arc<dyn ContentFilter>>,
+    document_filter: Option<Arc<crate::document::DocumentFilter>>,
     cache: Option<Arc<dyn CrawlCache>>,
     #[cfg(not(target_arch = "wasm32"))]
     event_sink: Option<Arc<dyn EventSink>>,
@@ -50,6 +55,8 @@ pub struct CrawlEngineBuilder {
     #[cfg(all(not(target_arch = "wasm32"), feature = "browser-native"))]
     native_executor: Option<Arc<crawlberg_browser::adapter::NativeBrowserExecutor>>,
     proxy_provider: Option<Arc<dyn crate::ProxyProvider>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    robots_cache: Option<Arc<super::robots_cache::RobotsCache>>,
 }
 
 impl CrawlEngineBuilder {
@@ -59,10 +66,13 @@ impl CrawlEngineBuilder {
             config: None,
             frontier: None,
             rate_limiter: None,
+            #[cfg(any(feature = "browser", feature = "browser-native"))]
+            browser_rate_limiter: None,
             store: None,
             event_emitter: None,
             strategy: None,
             content_filter: None,
+            document_filter: None,
             cache: None,
             #[cfg(not(target_arch = "wasm32"))]
             event_sink: None,
@@ -72,7 +82,21 @@ impl CrawlEngineBuilder {
             #[cfg(all(not(target_arch = "wasm32"), feature = "browser-native"))]
             native_executor: None,
             proxy_provider: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            robots_cache: None,
         }
+    }
+
+    /// Share the rate limiter and the robots.txt cache of another engine.
+    #[cfg(feature = "api")]
+    pub(crate) fn politeness(mut self, politeness: super::Politeness) -> Self {
+        self.rate_limiter = Some(politeness.rate_limiter);
+        #[cfg(any(feature = "browser", feature = "browser-native"))]
+        {
+            self.browser_rate_limiter = Some(politeness.browser_rate_limiter);
+        }
+        self.robots_cache = Some(politeness.robots_cache);
+        self
     }
 
     /// Set the crawl configuration.
@@ -88,10 +112,16 @@ impl CrawlEngineBuilder {
         self
     }
 
-    /// Set the rate limiter implementation.
+    /// Set the rate limiter implementation. Every fetch takes a turn of it, in HTTP mode and in
+    /// browser mode alike.
     #[allow(dead_code)]
     pub fn rate_limiter(mut self, rate_limiter: impl RateLimiter + 'static) -> Self {
-        self.rate_limiter = Some(Arc::new(rate_limiter));
+        let rate_limiter: Arc<dyn RateLimiter> = Arc::new(rate_limiter);
+        #[cfg(any(feature = "browser", feature = "browser-native"))]
+        {
+            self.browser_rate_limiter = Some(Arc::clone(&rate_limiter));
+        }
+        self.rate_limiter = Some(rate_limiter);
         self
     }
 
@@ -120,6 +150,28 @@ impl CrawlEngineBuilder {
     #[allow(dead_code)]
     pub fn content_filter(mut self, content_filter: impl ContentFilter + 'static) -> Self {
         self.content_filter = Some(Arc::new(content_filter));
+        self
+    }
+
+    /// Set a byte-aware predicate for document materialization.
+    ///
+    /// The predicate receives the normalized declared MIME type, at most
+    /// `document_max_size` bytes of the already bounded response body, and the decision
+    /// `document_mime_types`/the built-in classification would have reached. Returning that
+    /// third argument reproduces the default; `by_declared_mime || bytes.starts_with(b"%PDF")`
+    /// widens it. It applies to `crawl()`, `scrape()` and the wasm crawl loop alike. With no
+    /// predicate, the existing MIME decision is unchanged.
+    ///
+    /// The predicate runs for **every** fetched response, not only the ones the built-in
+    /// decision would have accepted — an ordinary HTML page included. A predicate that returns
+    /// `true` for HTML therefore materializes every page as a `DownloadedDocument`, duplicating
+    /// its whole body into the result and, on native targets, writing it to
+    /// `document_output_dir`. Keep the predicate as narrow as the documents it is meant to admit.
+    pub fn document_filter(
+        mut self,
+        document_filter: impl Fn(&str, &[u8], bool) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.document_filter = Some(Arc::new(document_filter));
         self
     }
 
@@ -188,14 +240,15 @@ impl CrawlEngineBuilder {
         self
     }
 
-    /// Inject a [`crate::ProxyProvider`] for per-request proxy rotation on the
-    /// reqwest HTTP path. Stored on the resolved [`CrawlConfig`] as
-    /// `proxy_provider`; takes precedence over the static
-    /// `CrawlConfig::proxy` value when both are set.
+    /// Inject a [`crate::ProxyProvider`] for per-request proxy rotation. Stored
+    /// on the resolved [`CrawlConfig`] as `proxy_provider`; takes precedence
+    /// over the static `CrawlConfig::proxy` value when both are set.
     ///
-    /// Browser-backend proxies (`CrawlConfig::browser::proxy`) still read the
-    /// static `ProxyConfig` value — provider rotation only applies to the HTTP
-    /// fetcher.
+    /// A native browser render asks the provider once for the page's host and
+    /// sends the page and all of its requests through that proxy.
+    /// `CrawlConfig::browser::proxy`, when set, wins over the provider for
+    /// renders. The Chrome backend cannot render through a provider, so a
+    /// Chrome render with a provider and no `browser.proxy` fails.
     pub fn with_proxy_provider(mut self, provider: Arc<dyn crate::ProxyProvider>) -> Self {
         self.proxy_provider = Some(provider);
         self
@@ -220,10 +273,31 @@ impl CrawlEngineBuilder {
 
         resolve_ssrf_deny_private(&mut config);
 
-        let rate_limit_ms = config.rate_limit_ms.unwrap_or(DEFAULT_RATE_LIMIT_MS);
-        let rate_limit_jitter_ratio = config.rate_limit_jitter_ratio;
+        // ~keep Always replaced, never kept: a configuration cloned from another engine carries
+        // ~keep that engine's store, and a new engine must start with no cookie.
         #[cfg(not(target_arch = "wasm32"))]
-        let ua_rotation = crate::tower::UaRotationLayer::new(config.user_agents.clone());
+        {
+            config.cookie_store = config.cookies_enabled.then(Default::default);
+        }
+
+        let rate_limiter: Arc<dyn RateLimiter> = self.rate_limiter.unwrap_or_else(|| {
+            Arc::new(default_rate_limiter(
+                config.rate_limit_ms.unwrap_or(DEFAULT_RATE_LIMIT_MS),
+                config.rate_limit_jitter_ratio,
+            ))
+        });
+        // ~keep The only place where the default delay reaches the browser paths. A page of
+        // ~keep Chrome and a native render take a turn of the throttle only when the caller set
+        // ~keep `rate_limit_ms` or installed a limiter: with the default settings, browser mode
+        // ~keep loads the pages of one host with no delay, as before #622 (the owner refused a
+        // ~keep slower default). HTTP mode keeps its default delay.
+        #[cfg(any(feature = "browser", feature = "browser-native"))]
+        let browser_rate_limiter: Arc<dyn RateLimiter> = match self.browser_rate_limiter {
+            Some(shared) => shared,
+            None if config.rate_limit_ms.is_some() => Arc::clone(&rate_limiter),
+            None => Arc::new(defaults::NoopRateLimiter),
+        };
+        let ua_rotation = crate::tower::UaRotation::new(config.user_agents.clone());
 
         #[cfg(all(not(target_arch = "wasm32"), feature = "browser-native"))]
         let native_browser_executor = if let Some(executor) = self.native_executor {
@@ -240,28 +314,34 @@ impl CrawlEngineBuilder {
 
         Ok(CrawlEngine {
             config,
-            frontier: self.frontier.unwrap_or_else(|| default_frontier(crawl_strategy)),
-            rate_limiter: self
-                .rate_limiter
-                .unwrap_or_else(|| Arc::new(default_rate_limiter(rate_limit_ms, rate_limit_jitter_ratio))),
+            frontier: super::frontier_claim::GuardedFrontier::wrap(
+                self.frontier.unwrap_or_else(|| default_frontier(crawl_strategy)),
+            ),
+            rate_limiter,
+            #[cfg(any(feature = "browser", feature = "browser-native"))]
+            browser_rate_limiter,
             store: self.store.unwrap_or_else(|| Arc::new(defaults::NoopStore)),
             event_emitter: self.event_emitter.unwrap_or_else(|| Arc::new(defaults::NoopEmitter)),
             strategy: self.strategy.unwrap_or_else(|| default_strategy(crawl_strategy)),
             content_filter: self
                 .content_filter
                 .unwrap_or_else(|| default_content_filter(bm25_filter)),
+            document_filter: self.document_filter,
             cache: self.cache.unwrap_or_else(|| Arc::new(defaults::NoopCache)),
             #[cfg(not(target_arch = "wasm32"))]
             event_sink,
             page_budget: self
                 .page_budget
                 .unwrap_or_else(|| Arc::new(crate::budget::DefaultPageBudget)),
-            #[cfg(not(target_arch = "wasm32"))]
             ua_rotation,
             #[cfg(not(target_arch = "wasm32"))]
-            robots_cache: Arc::new(super::robots_cache::RobotsCache::default()),
+            robots_cache: self.robots_cache.unwrap_or_default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            crawl_schedule: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "browser-native"))]
             native_browser_executor,
+            #[cfg(feature = "browser")]
+            crawl_cookies: None,
         })
     }
 }
@@ -405,6 +485,77 @@ impl Default for CrawlEngineBuilder {
 }
 
 #[cfg(test)]
+mod cookie_store_tests {
+    use std::sync::Arc;
+
+    use crate::engine::CrawlEngine;
+    use crate::types::CrawlConfig;
+
+    fn engine_with(config: CrawlConfig) -> CrawlEngine {
+        CrawlEngine::builder()
+            .config(config)
+            .build()
+            .expect("the engine builds")
+    }
+
+    // ~keep The API server builds the engine of each request from the configuration of its
+    // ~keep long-lived engine, so a store that the builder kept would be one store for every
+    // ~keep request of every API client.
+    #[test]
+    fn an_engine_built_from_the_configuration_of_another_engine_has_a_store_of_its_own() {
+        let first = engine_with(CrawlConfig {
+            cookies_enabled: true,
+            ..CrawlConfig::default()
+        });
+        let second = engine_with(first.config.clone());
+
+        let first = first
+            .config
+            .cookie_store
+            .expect("an engine with cookies on has a store");
+        let second = second
+            .config
+            .cookie_store
+            .expect("an engine with cookies on has a store");
+        assert!(!Arc::ptr_eq(&first, &second), "each engine must have its own store");
+    }
+
+    #[test]
+    fn an_engine_with_cookies_off_drops_the_store_its_configuration_carries() {
+        let first = engine_with(CrawlConfig {
+            cookies_enabled: true,
+            ..CrawlConfig::default()
+        });
+        let second = engine_with(CrawlConfig {
+            cookies_enabled: false,
+            ..first.config.clone()
+        });
+
+        assert!(second.config.cookie_store.is_none());
+    }
+
+    #[test]
+    fn a_clone_of_an_engine_is_the_same_cookie_session() {
+        let engine = engine_with(CrawlConfig {
+            cookies_enabled: true,
+            ..CrawlConfig::default()
+        });
+        let clone = engine.clone();
+
+        let (first, second) = (engine.config.cookie_store, clone.config.cookie_store);
+        assert!(
+            Arc::ptr_eq(&first.expect("a store"), &second.expect("a store")),
+            "a clone of an engine must share its store"
+        );
+    }
+
+    #[test]
+    fn an_engine_with_default_configuration_has_no_store() {
+        assert!(engine_with(CrawlConfig::default()).config.cookie_store.is_none());
+    }
+}
+
+#[cfg(test)]
 mod env_private_network_precedence_tests {
     use crate::engine::CrawlEngine;
     use crate::net::SsrfPolicy;
@@ -480,44 +631,231 @@ mod env_private_network_precedence_tests {
 
 #[cfg(test)]
 mod rate_limiter_plumbing_tests {
-    use super::default_rate_limiter;
+    use std::time::Duration;
+
+    use super::CrawlEngine;
     use crate::types::CrawlConfig;
 
-    // ~keep These assert the CONFIG-TO-THROTTLE PLUMBING, not the jitter maths (which is unit
-    // tested in defaults::rate_limiter). `rate_limit_jitter_ratio` was added to `CrawlConfig`,
-    // to the builder, to the fixture schema and to `PerDomainThrottle` while nothing joined the
-    // two ends, so it parsed, validated and serialized while a live crawl got no jitter at all.
-    // A timing-based test cannot tell that apart from jitter that happened to be small.
-    #[test]
-    fn configured_jitter_ratio_reaches_the_default_throttle() {
+    // ~keep These assert the CONFIG-TO-THROTTLE PLUMBING actually exercised by `build()`, not
+    // the jitter maths (which is unit tested in defaults::rate_limiter). An earlier version of
+    // this suite called `default_rate_limiter(100, config.rate_limit_jitter_ratio)` directly --
+    // reconstructing the exact expression at builder.rs:246 rather than observing it -- so
+    // cutting that line to a hardcoded ratio left every test here green (`rate_limit_jitter_ratio`
+    // parsed, validated and serialized while a live crawl got no jitter at all). These build a
+    // real `CrawlEngine` through `CrawlEngineBuilder` and observe `engine.rate_limiter.acquire()`
+    // under a paused tokio clock: `tokio::time::sleep` inside `PerDomainThrottle::acquire` still
+    // runs, but the paused clock auto-advances to the sleep's deadline with no wall-clock noise,
+    // so the observed wait is exactly the throttle's computed `sleep_duration` -- deterministic,
+    // not "timing that happened to be small".
+    async fn wait_for_second_acquire(engine: &CrawlEngine, domain: &str) -> Duration {
+        engine.rate_limiter.acquire(domain).await.expect("first acquire");
+        let start = tokio::time::Instant::now();
+        engine.rate_limiter.acquire(domain).await.expect("second acquire");
+        start.elapsed()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_jitter_ratio_reaches_the_default_throttle() {
         let config = CrawlConfig {
-            rate_limit_jitter_ratio: 0.25,
+            rate_limit_ms: Some(100),
+            rate_limit_jitter_ratio: 0.5,
             ..CrawlConfig::default()
         };
-        let throttle = default_rate_limiter(100, config.rate_limit_jitter_ratio);
+        let engine = CrawlEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine must build");
+
+        // ~keep One draw cannot carry this assertion. tokio's paused clock advances to a
+        // sleep's deadline at whole-millisecond granularity, so a 0.5 ratio over 100ms has
+        // exactly 100 reachable outcomes in [51ms, 150ms] and lands on an unperturbed 100ms
+        // in 1 of 100 draws -- measured, not estimated. A single `assert_ne!` against 100ms
+        // was therefore ~1% flaky, under a comment claiming it could only collide at
+        // double-precision float equality; that reasoning was about the f64 factor and
+        // missed the timer's rounding. Several domains fix it: each is an independent draw,
+        // so requiring at least one to differ collides by chance at 0.01^4 = 1e-8, and the
+        // range check still applies to every draw.
+        let domains = ["a.example.com", "b.example.com", "c.example.com", "d.example.com"];
+        let mut waits = Vec::with_capacity(domains.len());
+        for domain in domains {
+            let waited = wait_for_second_acquire(&engine, domain).await;
+            assert!(
+                waited >= Duration::from_millis(50) && waited <= Duration::from_millis(150),
+                "a 0.5 jitter_ratio over a 100ms delay must stay within [50ms, 150ms], \
+                 got {waited:?} for {domain}"
+            );
+            waits.push(waited);
+        }
+
         assert!(
-            (throttle.jitter_ratio() - 0.25).abs() < f64::EPSILON,
-            "rate_limit_jitter_ratio must reach the throttle the engine actually uses, got {}",
-            throttle.jitter_ratio()
+            waits.iter().any(|waited| *waited != Duration::from_millis(100)),
+            "a nonzero jitter_ratio must perturb the delay away from the unjittered 100ms \
+             baseline, but all {} domains waited exactly 100ms: {waits:?}",
+            waits.len()
         );
     }
 
-    #[test]
-    fn default_config_leaves_the_throttle_unjittered() {
-        let config = CrawlConfig::default();
-        let throttle = default_rate_limiter(100, config.rate_limit_jitter_ratio);
-        assert!(
-            (throttle.jitter_ratio() - 0.0).abs() < f64::EPSILON,
+    #[tokio::test(start_paused = true)]
+    async fn default_config_leaves_the_throttle_unjittered() {
+        let config = CrawlConfig {
+            rate_limit_ms: Some(100),
+            ..CrawlConfig::default()
+        };
+        let engine = CrawlEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine must build");
+
+        let waited = wait_for_second_acquire(&engine, "example.com").await;
+
+        assert_eq!(
+            waited,
+            Duration::from_millis(100),
             "an unset ratio must leave the throttle behaving exactly as before jitter existed"
         );
     }
 
-    #[test]
-    fn an_out_of_range_ratio_is_clamped_before_it_reaches_the_throttle() {
-        let throttle = default_rate_limiter(100, 5.0);
+    #[tokio::test(start_paused = true)]
+    async fn an_out_of_range_ratio_is_clamped_before_it_reaches_the_throttle() {
+        let config = CrawlConfig {
+            rate_limit_ms: Some(100),
+            rate_limit_jitter_ratio: 5.0,
+            ..CrawlConfig::default()
+        };
+        let engine = CrawlEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine must build");
+
+        let waited = wait_for_second_acquire(&engine, "example.com").await;
+
         assert!(
-            (throttle.jitter_ratio() - 1.0).abs() < f64::EPSILON,
-            "a ratio above 1.0 must clamp, not scale a delay by 5x"
+            waited <= Duration::from_millis(200),
+            "a ratio above 1.0 must clamp to 1.0 (max 2x the 100ms delay), not scale it by 5x \
+             (up to 600ms), got {waited:?}"
+        );
+    }
+}
+
+/// The delay of the domain in browser mode: the Chrome page and the native render take a turn
+/// of the limiter the builder gives the browser paths. These tests observe that limiter under a
+/// paused tokio clock, as `rate_limiter_plumbing_tests` does: the wait is the computed one.
+#[cfg(all(test, any(feature = "browser", feature = "browser-native")))]
+mod browser_rate_limiter_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::CrawlEngine;
+    use crate::types::CrawlConfig;
+
+    const DOMAIN: &str = "example.com";
+
+    async fn second_turn_of_the_browser_paths(engine: &CrawlEngine) -> Duration {
+        engine.browser_rate_limiter.acquire(DOMAIN).await.expect("first turn");
+        let start = tokio::time::Instant::now();
+        engine.browser_rate_limiter.acquire(DOMAIN).await.expect("second turn");
+        start.elapsed()
+    }
+
+    async fn second_turn_of_http(engine: &CrawlEngine) -> Duration {
+        engine.rate_limiter.acquire(DOMAIN).await.expect("first turn");
+        let start = tokio::time::Instant::now();
+        engine.rate_limiter.acquire(DOMAIN).await.expect("second turn");
+        start.elapsed()
+    }
+
+    fn engine_with(config: CrawlConfig) -> CrawlEngine {
+        CrawlEngine::builder()
+            .config(config)
+            .build()
+            .expect("engine must build")
+    }
+
+    // ~keep The owner refused a slower default: a crawl with the default settings loads the
+    // ~keep pages of one host in browser mode as it did before the delay reached the browser
+    // ~keep paths, with no delay, while HTTP mode keeps its default delay.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_default_settings_the_browser_paths_get_their_turns_at_once() {
+        let engine = engine_with(CrawlConfig::default());
+
+        assert_eq!(
+            second_turn_of_the_browser_paths(&engine).await,
+            Duration::ZERO,
+            "with rate_limit_ms unset, the second page of a host must get its turn at once in browser mode"
+        );
+        assert_eq!(
+            second_turn_of_http(&engine).await,
+            Duration::from_millis(200),
+            "HTTP mode keeps the default delay of 200 ms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_set_rate_limit_ms_spaces_the_turns_of_the_browser_paths() {
+        let engine = engine_with(CrawlConfig {
+            rate_limit_ms: Some(300),
+            ..CrawlConfig::default()
+        });
+
+        assert_eq!(
+            second_turn_of_the_browser_paths(&engine).await,
+            Duration::from_millis(300),
+            "with rate_limit_ms set, the second page of a host gets its turn one delay after the first"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_ms_of_zero_spaces_nothing_in_the_browser_paths() {
+        let engine = engine_with(CrawlConfig {
+            rate_limit_ms: Some(0),
+            ..CrawlConfig::default()
+        });
+
+        assert_eq!(second_turn_of_the_browser_paths(&engine).await, Duration::ZERO);
+    }
+
+    #[test]
+    fn an_installed_rate_limiter_is_the_one_of_the_browser_paths_too() {
+        let engine = CrawlEngine::builder()
+            .config(CrawlConfig::default())
+            .rate_limiter(crate::defaults::PerDomainThrottle::new(Duration::from_millis(50)))
+            .build()
+            .expect("engine must build");
+
+        assert!(
+            Arc::ptr_eq(&engine.rate_limiter, &engine.browser_rate_limiter),
+            "a limiter the caller installed must take the turns of the browser paths"
+        );
+    }
+
+    // ~keep The API server builds the engine of each request from its own politeness, so the
+    // ~keep decision of the server's build must reach the engine of the request unchanged: with
+    // ~keep the default settings, no delay in browser mode there either.
+    #[cfg(feature = "api")]
+    #[tokio::test(start_paused = true)]
+    async fn an_engine_that_shares_the_politeness_of_another_keeps_its_browser_delay() {
+        let server = engine_with(CrawlConfig::default());
+        let request = CrawlEngine::builder()
+            .config(server.config.clone())
+            .politeness(server.politeness())
+            .build()
+            .expect("engine must build");
+
+        assert!(Arc::ptr_eq(&server.rate_limiter, &request.rate_limiter));
+        assert_eq!(second_turn_of_the_browser_paths(&request).await, Duration::ZERO);
+
+        let server = engine_with(CrawlConfig {
+            rate_limit_ms: Some(300),
+            ..CrawlConfig::default()
+        });
+        let request = CrawlEngine::builder()
+            .config(server.config.clone())
+            .politeness(server.politeness())
+            .build()
+            .expect("engine must build");
+        assert_eq!(
+            second_turn_of_the_browser_paths(&request).await,
+            Duration::from_millis(300)
         );
     }
 }

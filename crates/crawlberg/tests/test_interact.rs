@@ -10,8 +10,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use crawlberg::ScrollDirection;
 #[cfg(any(feature = "browser-chromiumoxide", feature = "browser-native"))]
-use crawlberg::{BrowserBackend, BrowserConfig, BrowserMode, CrawlConfig};
-use crawlberg::{CrawlError, PageAction, create_engine, interact, validate_actions};
+use crawlberg::{BrowserBackend, BrowserConfig, BrowserMode};
+use crawlberg::{CrawlConfig, CrawlError, PageAction, SsrfPolicy, create_engine, interact, validate_actions};
 
 #[cfg(any(feature = "browser-chromiumoxide", feature = "browser-native"))]
 use wiremock::matchers::{method, path};
@@ -146,6 +146,482 @@ async fn chromiumoxide_interact_click_wait_screenshot_and_scrape() {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     assert!(scrape_data.contains("clicked"));
+}
+
+/// A server with a start page at `/` and a download at `/dl` that answers 501. Chrome cannot show
+/// that download, so it commits its own error page in place of the start page.
+#[cfg(feature = "browser-chromiumoxide")]
+async fn download_error_site() -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("<html><body><p id=\"start\">start page</p></body></html>", "text/html"),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/dl"))
+        .respond_with(
+            ResponseTemplate::new(501)
+                .set_body_raw("bin", "application/octet-stream")
+                .append_header("content-disposition", "attachment; filename=x.bin"),
+        )
+        .mount(&mock)
+        .await;
+    mock
+}
+
+#[cfg(feature = "browser-chromiumoxide")]
+fn navigate_to_download() -> PageAction {
+    // ~keep Chromiumoxide awaits returned promises. This promise ends only when the navigation
+    // ~keep destroys its execution context, so the next action starts after the error-page commit.
+    PageAction::ExecuteJs {
+        script: "location.assign('/dl'); return new Promise(() => {});".to_string(),
+    }
+}
+
+#[cfg(feature = "browser-chromiumoxide")]
+fn wait_for_start_page() -> PageAction {
+    // ~keep If this starts before history.back commits, context destruction synchronizes with
+    // ~keep the commit. If it starts afterwards, observing the selector resolves the promise.
+    PageAction::ExecuteJs {
+        script: r#"
+            return new Promise(resolve => {
+                const poll = () => document.querySelector('#start') ? resolve() : setTimeout(poll, 10);
+                poll();
+            });
+        "#
+        .to_string(),
+    }
+}
+
+#[cfg(feature = "browser-chromiumoxide")]
+fn assert_download_navigation_synchronized(test_name: &str, result: &crawlberg::InteractionResult) {
+    let navigation = &result.action_results[0];
+    assert_eq!(navigation.action_type, "executeJs", "{test_name}");
+    assert!(
+        !navigation.success && navigation.error.is_some(),
+        "{test_name}: the pending script must end when the download commits: {navigation:?}"
+    );
+}
+
+#[cfg(feature = "browser-chromiumoxide")]
+async fn assert_download_requested(test_name: &str, mock: &MockServer) {
+    let requests = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.iter().any(|request| request.url.path() == "/dl"),
+        "{test_name}: the start page never reached the download, so Chrome never showed its error page"
+    );
+}
+
+#[cfg(feature = "browser-chromiumoxide")]
+fn chromiumoxide_interact_config() -> CrawlConfig {
+    CrawlConfig {
+        browser: BrowserConfig {
+            backend: BrowserBackend::Chromiumoxide,
+            mode: BrowserMode::Always,
+            timeout: Duration::from_secs(15),
+            ..BrowserConfig::default()
+        },
+        ..allow_private_config()
+    }
+}
+
+#[cfg(feature = "browser-chromiumoxide")]
+async fn seed_with_failed_click_navigation() -> (String, String, tokio::sync::oneshot::Receiver<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let address = listener.local_addr().expect("test server should have an address");
+    let seed = format!("http://{address}/");
+    let unreachable = format!("http://{address}/gone");
+    let body = format!(r#"<html><body><a id="go" href="{unreachable}">go</a></body></html>"#);
+    let (gone_tx, gone_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("test server should receive the browser request");
+            let mut request = [0_u8; 4096];
+            let read = socket
+                .read(&mut request)
+                .await
+                .expect("test server should read the request");
+            let request_line = String::from_utf8_lossy(&request[..read])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if request_line == "GET /gone HTTP/1.1" {
+                gone_tx
+                    .send(request_line)
+                    .expect("the test should still be waiting for the failed navigation");
+                // ~keep Dropping the accepted connection without a response deterministically
+                // ~keep gives Chrome a network failure after proving the click reached `/gone`.
+                return;
+            }
+            let (status, response_body) = if request_line == "GET / HTTP/1.1" {
+                ("200 OK", body.as_str())
+            } else {
+                ("404 Not Found", "")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("test server should answer");
+            socket.shutdown().await.expect("test server should close the response");
+        }
+    });
+
+    (seed, unreachable, gone_rx)
+}
+
+/// A click navigation whose server closes without a response fails the session instead of
+/// returning Chrome's own error page as successful HTML (xberg-io/crawlberg#370).
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_fails_when_a_click_navigation_gets_no_response() {
+    let test_name = "chromiumoxide_interact_fails_when_a_click_navigation_gets_no_response";
+    let (seed, unreachable, gone_request) = seed_with_failed_click_navigation().await;
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+
+    let result = interact(
+        &engine,
+        &seed,
+        vec![
+            PageAction::Click {
+                selector: "#go".to_string(),
+            },
+            PageAction::Wait {
+                milliseconds: Some(1500),
+                selector: None,
+            },
+        ],
+    )
+    .await;
+
+    let message = match result {
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+            return;
+        }
+        Err(CrawlError::BrowserError { message, .. }) => message,
+        other => panic!("{test_name}: the failed navigation must fail the session: {other:?}"),
+    };
+    let request_line = tokio::time::timeout(Duration::from_secs(1), gone_request)
+        .await
+        .expect("the failed navigation request should be observed promptly")
+        .expect("the failed navigation server should report its request");
+    assert_eq!(request_line, "GET /gone HTTP/1.1", "{test_name}");
+    assert!(
+        message.contains(&unreachable) && message.contains("error page"),
+        "{test_name}: the error must name the URL Chrome could not show: {message}"
+    );
+}
+
+/// A session that ends on Chrome's error page fails with a browser error that names the URL Chrome
+/// could not show. It never returns Chrome's page as the final HTML.
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_fails_when_the_session_ends_on_chrome_s_error_page() {
+    let test_name = "chromiumoxide_interact_fails_when_the_session_ends_on_chrome_s_error_page";
+    let mock = download_error_site().await;
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+
+    let result = interact(&engine, &mock.uri(), vec![navigate_to_download(), PageAction::Scrape]).await;
+
+    match result {
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+        }
+        Err(CrawlError::BrowserError { message, .. }) => {
+            assert_download_requested(test_name, &mock).await;
+            assert!(
+                message.contains(&format!("{}/dl", mock.uri())) && message.contains("error page"),
+                "{test_name}: the error must name the URL Chrome could not show: {message}"
+            );
+        }
+        other => panic!("{test_name}: Chrome's error page must fail the session: {other:?}"),
+    }
+}
+
+/// A Scrape action run while the page shows Chrome's error page fails, and its data is never that
+/// page. The session then goes back to the start page, so it ends on a real page and succeeds.
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_scrape_fails_on_chrome_s_error_page() {
+    let test_name = "chromiumoxide_interact_scrape_fails_on_chrome_s_error_page";
+    let mock = download_error_site().await;
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+
+    let result = interact(
+        &engine,
+        &mock.uri(),
+        vec![
+            navigate_to_download(),
+            PageAction::Scrape,
+            PageAction::ExecuteJs {
+                script: "history.back()".to_string(),
+            },
+            wait_for_start_page(),
+        ],
+    )
+    .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+            return;
+        }
+        Err(error) => panic!("{test_name}: the session ends on the start page and must succeed: {error:?}"),
+    };
+
+    assert_download_requested(test_name, &mock).await;
+    assert_download_navigation_synchronized(test_name, &result);
+    let scrape = &result.action_results[1];
+    assert_eq!(scrape.action_type, "scrape", "{test_name}");
+    assert!(
+        !scrape.success && scrape.data.is_none(),
+        "{test_name}: the Scrape action must fail with no data on Chrome's error page: {scrape:?}"
+    );
+    let error = scrape.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("/dl") && error.contains("error page"),
+        "{test_name}: the Scrape error must name the URL Chrome could not show: {error}"
+    );
+    assert!(
+        result.final_html.contains("start page"),
+        "{test_name}: the session must end on the start page: {}",
+        result.final_html
+    );
+}
+
+/// An ExecuteJs action run while the page shows Chrome's error page fails, through a check of
+/// the page made just before the script runs (#355). A second ExecuteJs action then goes back to
+/// the start page, so the session ends on a real page and interact() succeeds.
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_execute_js_fails_on_chrome_s_error_page() {
+    let test_name = "chromiumoxide_interact_execute_js_fails_on_chrome_s_error_page";
+    let mock = download_error_site().await;
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+
+    let result = interact(
+        &engine,
+        &mock.uri(),
+        vec![
+            navigate_to_download(),
+            PageAction::ExecuteJs {
+                script: "document.title".to_string(),
+            },
+            PageAction::ExecuteJs {
+                script: "history.back()".to_string(),
+            },
+            wait_for_start_page(),
+        ],
+    )
+    .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+            return;
+        }
+        Err(error) => panic!("{test_name}: the session ends on the start page and must succeed: {error:?}"),
+    };
+
+    assert_download_requested(test_name, &mock).await;
+    assert_download_navigation_synchronized(test_name, &result);
+    let execute_js = &result.action_results[1];
+    assert_eq!(execute_js.action_type, "executeJs", "{test_name}");
+    assert!(
+        !execute_js.success && execute_js.data.is_none(),
+        "{test_name}: the ExecuteJs action must fail with no data on Chrome's error page: {execute_js:?}"
+    );
+    let error = execute_js.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("/dl") && error.contains("error page"),
+        "{test_name}: the ExecuteJs error must name the URL Chrome could not show: {error}"
+    );
+    assert!(
+        result.final_html.contains("start page"),
+        "{test_name}: the session must end on the start page: {}",
+        result.final_html
+    );
+}
+
+/// A Screenshot action run while the page shows Chrome's error page fails, through a check of
+/// the page made just before the capture (#355). The session then goes back to the start page,
+/// so it ends on a real page and succeeds.
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_screenshot_fails_on_chrome_s_error_page() {
+    let test_name = "chromiumoxide_interact_screenshot_fails_on_chrome_s_error_page";
+    let mock = download_error_site().await;
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+
+    let result = interact(
+        &engine,
+        &mock.uri(),
+        vec![
+            navigate_to_download(),
+            PageAction::Screenshot { full_page: Some(false) },
+            PageAction::ExecuteJs {
+                script: "history.back()".to_string(),
+            },
+            wait_for_start_page(),
+        ],
+    )
+    .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+            return;
+        }
+        Err(error) => panic!("{test_name}: the session ends on the start page and must succeed: {error:?}"),
+    };
+
+    assert_download_requested(test_name, &mock).await;
+    assert_download_navigation_synchronized(test_name, &result);
+    let screenshot_action = &result.action_results[1];
+    assert_eq!(screenshot_action.action_type, "screenshot", "{test_name}");
+    assert!(
+        !screenshot_action.success && screenshot_action.data.is_none(),
+        "{test_name}: the Screenshot action must fail with no data on Chrome's error page: {screenshot_action:?}"
+    );
+    let error = screenshot_action.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("/dl") && error.contains("error page"),
+        "{test_name}: the Screenshot error must name the URL Chrome could not show: {error}"
+    );
+    assert!(
+        result.final_html.contains("start page"),
+        "{test_name}: the session must end on the start page: {}",
+        result.final_html
+    );
+}
+
+/// A script run on Chrome's error page that navigates away from it reports the failure, because
+/// the page was checked before the script ran, and the script runs exactly once: the session ends
+/// on the start page, where one `history.back()` leads. Run twice, it would go past the start page
+/// to `about:blank`; not run, the session would end on the error page and fail.
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_script_that_leaves_chrome_s_error_page_runs_once_and_fails() {
+    let test_name = "chromiumoxide_interact_script_that_leaves_chrome_s_error_page_runs_once_and_fails";
+    let mock = download_error_site().await;
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+
+    let result = interact(
+        &engine,
+        &mock.uri(),
+        vec![
+            navigate_to_download(),
+            PageAction::ExecuteJs {
+                script: "history.back()".to_string(),
+            },
+            wait_for_start_page(),
+        ],
+    )
+    .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+            return;
+        }
+        Err(error) => panic!("{test_name}: the script must leave the error page, so the session succeeds: {error:?}"),
+    };
+
+    assert_download_requested(test_name, &mock).await;
+    assert_download_navigation_synchronized(test_name, &result);
+    let execute_js = &result.action_results[1];
+    assert_eq!(execute_js.action_type, "executeJs", "{test_name}");
+    assert!(
+        !execute_js.success && execute_js.data.is_none(),
+        "{test_name}: a script run on Chrome's error page must report failure even when it navigates \
+         away: {execute_js:?}"
+    );
+    let error = execute_js.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("/dl") && error.contains("error page"),
+        "{test_name}: the ExecuteJs error must name the URL Chrome could not show: {error}"
+    );
+    assert!(
+        result.final_html.contains("start page"),
+        "{test_name}: the script must run once, going back to the start page and no further: {}",
+        result.final_html
+    );
+}
+
+/// The final HTML and the final URL of a session on a page that keeps navigating belong to one
+/// document: `/one` and `/two` replace each other every 30 ms. A page that navigates during each
+/// read may fail the session instead, but never pairs one document's HTML with another's URL.
+#[cfg(feature = "browser-chromiumoxide")]
+#[tokio::test]
+async fn chromiumoxide_interact_reports_the_html_and_url_of_one_document() {
+    let test_name = "chromiumoxide_interact_reports_the_html_and_url_of_one_document";
+    let mock = MockServer::start().await;
+    for (route, next) in [("/one", "/two"), ("/two", "/one")] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "<html><body><p>doc{route}</p>\
+                     <script>setTimeout(() => location.replace('{next}'), 30)</script></body></html>"
+                ),
+                "text/html",
+            ))
+            .mount(&mock)
+            .await;
+    }
+    let engine = create_engine(Some(chromiumoxide_interact_config())).unwrap();
+    let mut sessions = 0;
+    for attempt in 0..20 {
+        let wait = PageAction::Wait {
+            milliseconds: Some(100),
+            selector: None,
+        };
+        let result = match interact(&engine, &format!("{}/one", mock.uri()), vec![wait]).await {
+            Ok(result) => result,
+            Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+                announce_chrome_skip(test_name, &message);
+                return;
+            }
+            Err(CrawlError::BrowserError { message, .. }) if message.contains("navigated to a new document") => {
+                continue;
+            }
+            Err(error) => panic!("{test_name}: attempt {attempt}: {error:?}"),
+        };
+        sessions += 1;
+        let route = if result.final_html.contains("doc/one") {
+            "/one"
+        } else {
+            "/two"
+        };
+        assert!(
+            result.final_url.ends_with(route),
+            "{test_name}: attempt {attempt}: the HTML is {route}'s, so the URL must be too: {} {}",
+            result.final_url,
+            result.final_html
+        );
+    }
+    assert!(sessions > 0, "{test_name}: no attempt returned a session");
 }
 
 #[cfg(feature = "browser-native")]
@@ -718,4 +1194,299 @@ async fn no_chromiumoxide_backend_interact_returns_unsupported() {
         matches!(&result, Err(CrawlError::Unsupported { message, .. }) if message.contains("browser-chromiumoxide")),
         "expected Unsupported mentioning browser-chromiumoxide, got {result:?}"
     );
+}
+
+/// The deny-side counterpart to `allow_private_config` above: explicit `SsrfPolicy::default()`
+/// rather than `CrawlConfig::default()`/`CrawlConfig::builder().build()`, both of which read
+/// `SsrfPolicy::from_env()` and so would make this test's denial depend on
+/// `CRAWLBERG_ALLOW_PRIVATE_NETWORK` in the ambient environment. Deny-private is pinned here
+/// regardless of env, for the same reason `allow_private_config` pins allow-private.
+fn deny_private_config() -> CrawlConfig {
+    CrawlConfig {
+        ssrf: SsrfPolicy::default(),
+        ..CrawlConfig::builder().build()
+    }
+}
+
+/// xberg-io/crawlberg#74: `interact()` on the default `BrowserBackend::Chromiumoxide` backend
+/// enforced no SSRF policy at all. This must fail on the pre-flight check in `interact::run`,
+/// before any browser is launched -- a literal IP keeps this hermetic (no DNS) and needs no
+/// Chrome binary, so it runs in CI on every platform regardless of which browser feature is
+/// compiled in.
+#[tokio::test]
+async fn interact_rejects_a_private_target_before_launching_any_browser() {
+    let engine = create_engine(Some(deny_private_config())).unwrap();
+
+    let result = interact(&engine, "http://127.0.0.1:9/", vec![PageAction::Scrape]).await;
+
+    assert!(
+        matches!(&result, Err(CrawlError::SsrfPolicyViolation { .. })),
+        "a loopback target must be rejected by SSRF policy before any browser work, got {result:?}"
+    );
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("ssrf_policy_violation"),
+        "the hand-written e2e suites match on the literal `ssrf_policy_violation` string; got: {message}"
+    );
+}
+
+/// Same as above for a cloud-metadata address, the other address class the interception layer
+/// (`ssrf_intercept.rs`) names explicitly. Also needs no Chrome.
+#[tokio::test]
+async fn interact_rejects_a_cloud_metadata_target_before_launching_any_browser() {
+    let engine = create_engine(Some(deny_private_config())).unwrap();
+
+    let result = interact(
+        &engine,
+        "http://169.254.169.254/latest/meta-data/",
+        vec![PageAction::Scrape],
+    )
+    .await;
+
+    assert!(
+        matches!(&result, Err(CrawlError::SsrfPolicyViolation { .. })),
+        "a cloud metadata target must be rejected by SSRF policy before any browser work, got {result:?}"
+    );
+}
+
+/// A script and a `fetch()` at an address the policy denies keep the native session going, and
+/// the result lists both addresses. The page is served on `localhost`, which the policy
+/// allowlists; the denied address is the literal loopback IP of a second server.
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_lists_the_refused_requests() {
+    let site = MockServer::start().await;
+    let denied = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("// denied"))
+        .mount(&denied)
+        .await;
+    let script = format!("http://127.0.0.1:{}/denied.js", denied.address().port());
+    let fetched = format!("http://127.0.0.1:{}/secret", denied.address().port());
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                "<html><head><script src={script:?}></script></head><body><p>start</p>\
+                 <script>fetch({fetched:?}).catch(() => {{}});</script></body></html>"
+            ),
+            "text/html",
+        ))
+        .mount(&site)
+        .await;
+    let config = CrawlConfig {
+        browser: BrowserConfig {
+            backend: BrowserBackend::Native,
+            mode: BrowserMode::Always,
+            timeout: Duration::from_secs(15),
+            ..BrowserConfig::default()
+        },
+        respect_robots_txt: false,
+        ..CrawlConfig::builder()
+            .ssrf_allowlist_host(crawlberg::HostMatcher::exact("localhost"))
+            .build()
+    };
+    let engine = create_engine(Some(config)).expect("engine must build");
+    let seed = format!("http://localhost:{}/", site.address().port());
+    let result = interact(&engine, &seed, vec![PageAction::Scrape])
+        .await
+        .expect("the session must keep the page");
+    assert!(
+        result.final_html.contains("start"),
+        "the page must be kept: {}",
+        result.final_html
+    );
+    let mut listed = result.ssrf_refused_urls.clone();
+    listed.sort();
+    let mut expected = vec![script, fetched];
+    expected.sort();
+    assert_eq!(listed, expected, "the result must list every refused address");
+    let received = denied.received_requests().await.expect("request recording is on");
+    assert!(
+        received.is_empty(),
+        "the denied address must receive nothing: {received:?}"
+    );
+}
+
+/// A native interact config at `max_redirects`.
+#[cfg(feature = "browser-native")]
+fn native_interact_config(max_redirects: usize) -> CrawlConfig {
+    CrawlConfig {
+        browser: BrowserConfig {
+            backend: BrowserBackend::Native,
+            mode: BrowserMode::Always,
+            timeout: Duration::from_secs(15),
+            ..BrowserConfig::default()
+        },
+        max_redirects,
+        ..allow_private_config()
+    }
+}
+
+/// Native `interact` follows at most `max_redirects` redirects to reach its page (#115).
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_stops_a_chain_longer_than_max_redirects() {
+    let mock = MockServer::start().await;
+    for hop in 0..5 {
+        let from = if hop == 0 { "/".to_owned() } else { format!("/r{hop}") };
+        Mock::given(method("GET"))
+            .and(path(from))
+            .respond_with(ResponseTemplate::new(301).append_header("location", format!("/r{}", hop + 1)))
+            .mount(&mock)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/r5"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html><body>landed</body></html>", "text/html"))
+        .mount(&mock)
+        .await;
+
+    let engine = create_engine(Some(native_interact_config(2))).unwrap();
+    let error = interact(&engine, &format!("{}/", mock.uri()), vec![PageAction::Scrape])
+        .await
+        .expect_err("an unfinished redirect chain is not an interaction page");
+    assert!(
+        matches!(error, CrawlError::SsrfPolicyViolation { ref url, ref reason, ref source }
+        if reason == "redirect limit exceeded" && url == &format!("{}/r3", mock.uri()) && source.is_some()),
+        "{error:?}"
+    );
+    let requested: Vec<String> = mock
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .iter()
+        .map(|request| request.url.path().to_owned())
+        .collect();
+    assert!(
+        !requested.iter().any(|p| p == "/r3"),
+        "native interact must not request past the limit, requested: {requested:?}"
+    );
+}
+
+/// The limit bounds the navigation to the seed only: a click that navigates afterwards is the
+/// caller's own and is followed even at `max_redirects = 0`.
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_follows_a_click_navigation_at_max_redirects_zero() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"<html><body><a id="next" href="/next">Next</a></body></html>"#,
+            "text/html",
+        ))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/next"))
+        .respond_with(ResponseTemplate::new(302).append_header("location", "/landed"))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/landed"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"<html><body><h1 id="arrived">Arrived</h1></body></html>"#,
+            "text/html",
+        ))
+        .mount(&mock)
+        .await;
+
+    let engine = create_engine(Some(native_interact_config(0))).unwrap();
+    let result = interact(
+        &engine,
+        &mock.uri(),
+        vec![
+            PageAction::Click {
+                selector: "#next".to_string(),
+            },
+            PageAction::Scrape,
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert!(result.action_results.iter().all(|action| action.success));
+    assert!(result.final_url.ends_with("/landed"), "{}", result.final_url);
+    assert!(result.final_html.contains("id=\"arrived\""));
+}
+
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_reports_a_redirect_loop_as_scrape_does() {
+    let mock = MockServer::start().await;
+    for (from, to) in [("/", "/b"), ("/b", "/")] {
+        Mock::given(method("GET"))
+            .and(path(from))
+            .respond_with(ResponseTemplate::new(301).append_header("location", to))
+            .mount(&mock)
+            .await;
+    }
+    let engine = create_engine(Some(native_interact_config(2))).unwrap();
+    let url = format!("{}/", mock.uri());
+    let interact_error = interact(&engine, &url, vec![PageAction::Scrape])
+        .await
+        .expect_err("a redirect loop is not an interaction page");
+    let scrape_error = crawlberg::scrape(&engine, &url)
+        .await
+        .expect_err("scrape rejects the loop");
+    for error in [interact_error, scrape_error] {
+        assert!(
+            matches!(error, CrawlError::SsrfPolicyViolation { ref url, ref reason, ref source }
+            if reason == "redirect loop" && url == &format!("{}/b", mock.uri()) && source.is_some()),
+            "{error:?}"
+        );
+    }
+}
+
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_keeps_pages_at_the_exact_redirect_budget_and_without_location() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(301).append_header("location", "/landed"))
+        .mount(&mock)
+        .await;
+    for (route, status) in [("/landed", 200), ("/no-location", 302)] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(status).set_body_raw("<p>kept page</p>", "text/html"))
+            .mount(&mock)
+            .await;
+    }
+    let engine = create_engine(Some(native_interact_config(1))).unwrap();
+    for route in ["/", "/no-location"] {
+        let result = interact(&engine, &format!("{}{route}", mock.uri()), vec![PageAction::Scrape])
+            .await
+            .expect("a real page within the budget remains usable");
+        assert!(result.final_html.contains("kept page"), "{result:?}");
+        assert_eq!(result.action_results.len(), 1);
+        assert!(result.action_results[0].success);
+    }
+}
+
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_redacts_credentials_when_reporting_a_redirect_loop() {
+    let mock = MockServer::start().await;
+    let host = mock.uri().trim_start_matches("http://").to_owned();
+    for (from, to) in [("/", "/b"), ("/b", "/")] {
+        Mock::given(method("GET"))
+            .and(path(from))
+            .respond_with(ResponseTemplate::new(301).append_header("location", format!("http://user:pass@{host}{to}")))
+            .mount(&mock)
+            .await;
+    }
+    let engine = create_engine(Some(native_interact_config(2))).unwrap();
+    let url = format!("{}/", mock.uri());
+    let error = interact(&engine, &url, vec![PageAction::Scrape])
+        .await
+        .expect_err("redirect loop");
+    assert!(
+        matches!(error, CrawlError::SsrfPolicyViolation { ref url, ref reason, ref source }
+        if reason == "redirect loop" && url == &format!("{}/b", mock.uri()) && source.is_some()),
+        "{error:?}"
+    );
+    assert!(!error.to_string().contains("user:pass"));
 }

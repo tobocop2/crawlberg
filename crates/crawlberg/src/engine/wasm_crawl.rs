@@ -7,6 +7,7 @@
 
 #![cfg(any(target_arch = "wasm32", test))]
 
+use super::chain_claim::ChainClaim;
 use super::link_scope::{LinkScopePolicy, link_in_scope};
 use super::{CrawlEngine, DEFAULT_MAX_LINKS_PER_PAGE, take_selected};
 use crate::error::CrawlError;
@@ -21,7 +22,13 @@ use crate::types::*;
 /// strategy logic sequentially using `.await` only — no concurrency primitives.
 impl CrawlEngine {
     /// Convert a `ScrapeResult` into a `CrawlPageResult` at the given depth.
-    fn scrape_to_crawl_page(scrape: ScrapeResult, url: &str, depth: usize, base_host: &str) -> CrawlPageResult {
+    fn scrape_to_crawl_page(
+        scrape: ScrapeResult,
+        url: &str,
+        original_url: &str,
+        depth: usize,
+        base_host: &str,
+    ) -> CrawlPageResult {
         let domain = url::Url::parse(url)
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_owned()))
@@ -29,6 +36,7 @@ impl CrawlEngine {
         let stayed_on_domain = domain == base_host;
         CrawlPageResult {
             url: url.to_owned(),
+            original_url: original_url.to_owned(),
             normalized_url: crate::normalize::normalize_url(url),
             status_code: scrape.status_code,
             content_type: scrape.content_type,
@@ -51,9 +59,19 @@ impl CrawlEngine {
             browser_used: scrape.browser_used,
             // ~keep The browser's own `fetch` already followed redirects (see `scrape`'s
             // ~keep wasm32 path), so `scrape.final_url` is this page's post-redirect URL and
-            // ~keep there is no separate per-hop count to report here.
+            // ~keep there is no per-hop count to report AT THE PAGE LEVEL. Two limits this
+            // ~keep does not excuse: `note_page_outcome` increments the crawl-wide
+            // ~keep `redirect_count` only for the depth-0 seed, from `final_url != entry.url`,
+            // ~keep so it is a did-the-seed-redirect flag rather than a hop count; and
+            // ~keep `wasm_fetch_for_scrape` -- the fetch this reasoning is about -- is
+            // ~keep `#[cfg(target_arch = "wasm32")]`, so this file's tests under plain
+            // ~keep `cargo test` drive the loop against the NATIVE fetch path. Real wasm
+            // ~keep redirect behaviour has no executing test.
             final_url: scrape.final_url,
             redirect_count: 0,
+            noindex_detected: scrape.noindex_detected,
+            nofollow_detected: scrape.nofollow_detected,
+            ssrf_refused_urls: scrape.ssrf_refused_urls,
         }
     }
 
@@ -64,47 +82,60 @@ impl CrawlEngine {
     /// `allow_subdomains`, `include_paths`, `exclude_paths`, and the configured
     /// `CrawlStrategy`. No concurrency primitives are used — each page is awaited
     /// sequentially, which is correct for the wasm single-threaded executor.
-    pub(super) async fn crawl_sequential(&self, url: &str) -> Result<CrawlResult, CrawlError> {
+    pub(super) async fn crawl_sequential(&self, seed: &super::SeedUrl) -> Result<CrawlResult, CrawlError> {
         // ~keep Stripped once, here, before the seed is planned, robots-checked, or
         // ~keep dedup-keyed, mirroring the native crawl loop -- every later use of the seed
         // ~keep (fetch, `final_url`, `normalized_url`) derives from this string, so one strip
         // ~keep keeps them all consistent.
-        let stripped_seed = crate::helpers::strip_seed_tracking_params(&self.config, url);
+        let stripped_seed = crate::helpers::strip_seed_tracking_params(&self.config, seed.as_str());
         let url = stripped_seed.as_str();
-        let redacted_url = crate::net::redact_url_credentials(url);
-        tracing::Span::current().record(URL_FULL, tracing::field::display(&redacted_url));
+        tracing::Span::current().record(URL_FULL, tracing::field::display(url));
         self.config.validate()?;
 
         let plan = SequentialPlan::new(url, &self.config)?;
-        let robots = self.load_sequential_robots(url).await?;
-        if let Some(reason) = robots.disallow_all_reason() {
-            return Ok(self.robots_blocked_result(url, reason).await);
-        }
-
-        self.seed_sequential_frontier(url).await?;
+        self.seed_sequential_frontier(url, seed.as_str()).await?;
 
         let mut state = SequentialState::new(url);
-        self.drive_sequential_loop(&plan, &robots, &mut state).await?;
+        if let Some(blocked) = self.drive_sequential_loop(&plan, &mut state).await? {
+            return Ok(blocked);
+        }
         self.finish_sequential_crawl(state, plan.max_pages).await
     }
 
-    /// Read the seed's robots.txt.
+    /// Resolve the robots.txt outcome `agent` sees at `url`'s origin, reusing `cache` so a
+    /// repeated agent (the rotation list is usually short) does not refetch it.
     ///
-    /// ~keep robots.txt is read before the seed is pushed, so nothing is fetched before the
-    /// site's policy is known. This loop previously never read `respect_robots_txt` at all:
-    /// on wasm the setting was silently ignored and every URL was fetched.
-    async fn load_sequential_robots(&self, url: &str) -> Result<crate::helpers::RobotsOutcome, CrawlError> {
+    /// ~keep robots.txt is judged for the SAME agent the page fetch itself sends, picked once
+    /// per page by the caller -- mirroring native's `redirect.rs::admits`, which reads
+    /// `choose_request_user_agent` for exactly this reason (crawlberg#483). `respect_robots_txt
+    /// = false` never fetches at all, matching the loop's previous behaviour.
+    async fn wasm_robots_outcome_for(
+        &self,
+        url: &str,
+        agent: &str,
+        cache: &mut std::collections::HashMap<String, std::sync::Arc<crate::helpers::RobotsOutcome>>,
+    ) -> Result<std::sync::Arc<crate::helpers::RobotsOutcome>, CrawlError> {
         if !self.config.respect_robots_txt {
-            return Ok(crate::helpers::RobotsOutcome::AllowAll);
+            return Ok(std::sync::Arc::new(crate::helpers::RobotsOutcome::AllowAll));
+        }
+        let Ok(parsed) = url::Url::parse(url) else {
+            return Ok(std::sync::Arc::new(crate::helpers::RobotsOutcome::AllowAll));
+        };
+        let key = format!(
+            "{}://{}:{}|{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or_default(),
+            parsed.port_or_known_default().unwrap_or(0),
+            agent
+        );
+        if let Some(outcome) = cache.get(&key) {
+            return Ok(outcome.clone());
         }
         let client = crate::http::build_client(&self.config)?;
-        Ok(crate::helpers::fetch_robots_outcome(
-            url,
-            &self.config,
-            &client,
-            crate::helpers::default_robots_user_agent(&self.config),
-        )
-        .await)
+        let outcome =
+            std::sync::Arc::new(crate::helpers::fetch_robots_outcome(url, &self.config, &client, agent).await);
+        cache.insert(key, outcome.clone());
+        Ok(outcome)
     }
 
     /// The result for a site whose robots.txt forbids the crawl outright.
@@ -143,12 +174,13 @@ impl CrawlEngine {
     }
 
     /// Put the seed on the frontier as the depth-0 entry, marking it seen first.
-    async fn seed_sequential_frontier(&self, url: &str) -> Result<(), CrawlError> {
+    async fn seed_sequential_frontier(&self, url: &str, original_url: &str) -> Result<(), CrawlError> {
         let seed_dedup = crate::normalize::normalize_url_for_dedup(url, self.config.dedup_include_query);
         self.frontier.mark_seen(&seed_dedup).await?;
         self.frontier
             .push(FrontierEntry {
                 url: url.to_owned(),
+                original_url: Some(original_url.to_owned()),
                 depth: 0,
                 doc_depth: 0,
                 priority: 1.0,
@@ -157,12 +189,17 @@ impl CrawlEngine {
     }
 
     /// Fetch one page at a time until a limit, the strategy, or an empty frontier stops it.
+    ///
+    /// Returns `Ok(Some(result))` when the seed's own robots.txt is unreachable -- the crawl
+    /// never really starts, and the caller reports that result directly instead of running
+    /// `finish_sequential_crawl` -- and `Ok(None)` once the loop ends normally.
     async fn drive_sequential_loop(
         &self,
         plan: &SequentialPlan,
-        robots: &crate::helpers::RobotsOutcome,
         state: &mut SequentialState,
-    ) -> Result<(), CrawlError> {
+    ) -> Result<Option<CrawlResult>, CrawlError> {
+        let mut robots_cache: std::collections::HashMap<String, std::sync::Arc<crate::helpers::RobotsOutcome>> =
+            std::collections::HashMap::new();
         loop {
             if state.window.is_empty() {
                 state.window = self.frontier.pop_batch(1).await?;
@@ -182,7 +219,30 @@ impl CrawlEngine {
                 break;
             };
 
-            if !passes_url_filters(&entry, plan, robots, state) {
+            if !passes_path_filters(&entry, plan, state) {
+                continue;
+            }
+
+            // ~keep Picked once per page, here, before robots.txt is even read: the same call
+            // ~keep that advances the UA rotation counter is the one whose result both judges
+            // ~keep this page's robots decision and is sent on the wire below (crawlberg#483),
+            // ~keep mirroring native's `redirect.rs::admits`.
+            let agent = self.choose_request_user_agent();
+            let robots = self
+                .wasm_robots_outcome_for(&entry.url, &agent, &mut robots_cache)
+                .await?;
+
+            // ~keep Only the seed (depth 0) gets the whole-crawl bail-out: a later page whose
+            // ~keep origin's robots.txt is unreachable is just refused below, like any other
+            // ~keep robots-disallowed page, matching native's `crawl_loop.rs::finish_without_crawling`,
+            // ~keep which is reached only for a pre-loop refusal too.
+            if entry.depth == 0
+                && let Some(reason) = robots.disallow_all_reason()
+            {
+                return Ok(Some(self.robots_blocked_result(&entry.url, reason).await));
+            }
+
+            if !passes_robots(&entry, &robots, state) {
                 continue;
             }
 
@@ -190,18 +250,28 @@ impl CrawlEngine {
                 break;
             }
 
-            let Some(scrape) = self.scrape_for_sequential_crawl(&entry, state).await else {
+            let Some(scrape) = self.scrape_for_sequential_crawl(&entry, state, &agent).await else {
                 continue;
             };
 
             state.note_page_outcome(&entry, &scrape);
+
+            if !self.claims_landed_page(&entry, &scrape).await? {
+                continue;
+            }
 
             if self.should_discover_sequentially(&entry, &scrape, plan) {
                 self.discover_sequential_links(&scrape, &entry, plan, state).await?;
             }
 
             let page_url = scrape.final_url.clone();
-            let page = Self::scrape_to_crawl_page(scrape, &page_url, entry.depth, &plan.base_host);
+            let page = Self::scrape_to_crawl_page(
+                scrape,
+                &page_url,
+                entry.original_url.as_deref().unwrap_or(&entry.url),
+                entry.depth,
+                &plan.base_host,
+            );
 
             let Some(page) = self.content_filter.filter(page).await? else {
                 state.urls_filtered += 1;
@@ -221,7 +291,7 @@ impl CrawlEngine {
             state.pages.push(page);
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Whether the page budget admits another fetch.
@@ -246,8 +316,11 @@ impl CrawlEngine {
         &self,
         entry: &FrontierEntry,
         state: &mut SequentialState,
+        agent: &str,
     ) -> Option<ScrapeResult> {
-        match self.scrape(&entry.url).await {
+        // ~keep `agent` is the pick `drive_sequential_loop` already judged this page's robots.txt
+        // ~keep for; pinning it here makes the fetch send that same agent (crawlberg#483).
+        match self.scrape_in_scope(&entry.url, Some(agent)).await {
             Ok(scrape) => Some(scrape),
             Err(e) => {
                 state.pages_failed += 1;
@@ -267,7 +340,24 @@ impl CrawlEngine {
         }
     }
 
-    /// Whether this page's links are followed at all.
+    /// Whether the page `entry` landed on is this entry's page to report.
+    ///
+    /// ~keep The fetch follows a redirect by itself, so the loop learns where it landed only
+    /// ~keep afterwards. The landed address then makes the claim a redirect hop makes in the
+    /// ~keep native loop, with the same [`ChainClaim`]: a page that another entry holds is
+    /// ~keep dropped here, and a page nobody holds is marked, so a later link to it is not
+    /// ~keep fetched again. Without it a folder linked as `/docs` and as `/docs/`, where the
+    /// ~keep first redirects to the second, is reported twice.
+    async fn claims_landed_page(&self, entry: &FrontierEntry, scrape: &ScrapeResult) -> Result<bool, CrawlError> {
+        let mut chain = ChainClaim::default();
+        let frontier = self.frontier.as_ref();
+        let include_query = self.config.dedup_include_query;
+        chain.admits(frontier, include_query, &entry.url, false).await?;
+        chain.admits(frontier, include_query, &scrape.final_url, true).await
+    }
+
+    /// Whether this page's links are followed at all. A `nofollow` page's links are not,
+    /// when the crawl respects robots.
     fn should_discover_sequentially(
         &self,
         entry: &FrontierEntry,
@@ -276,7 +366,10 @@ impl CrawlEngine {
     ) -> bool {
         let in_doc_context = entry.doc_depth > 0;
         let page_is_skipped = scrape.was_skipped || scrape.is_pdf;
-        entry.depth < plan.max_depth && !page_is_skipped && (!in_doc_context || self.config.follow_document_urls)
+        entry.depth < plan.max_depth
+            && !page_is_skipped
+            && (!in_doc_context || self.config.follow_document_urls)
+            && !(self.config.respect_robots_txt && scrape.nofollow_detected)
     }
 
     /// Enqueue the eligible links of one page, up to the per-page cap.
@@ -327,6 +420,7 @@ impl CrawlEngine {
                 follow_document_urls: self.config.follow_document_urls,
                 document_url_depth: self.config.document_url_depth,
                 allow_subdomains: self.config.allow_subdomains,
+                stay_on_domain: self.config.stay_on_domain,
                 base_host: &plan.base_host,
                 base_host_suffix: &plan.base_host_suffix,
             };
@@ -336,7 +430,7 @@ impl CrawlEngine {
 
             let is_doc_link = link.link_type == LinkType::Document;
             if self
-                .enqueue_discovered_link(&link_url, is_doc_link, entry, state)
+                .enqueue_discovered_link(&link_url, &link.original_url, is_doc_link, entry, state)
                 .await?
             {
                 enqueued_from_page += 1;
@@ -350,6 +444,7 @@ impl CrawlEngine {
     async fn enqueue_discovered_link(
         &self,
         link_url: &str,
+        original_url: &str,
         is_doc_link: bool,
         entry: &FrontierEntry,
         state: &mut SequentialState,
@@ -358,17 +453,16 @@ impl CrawlEngine {
         // owns the queue, so a persistent implementation that survives a restart
         // would otherwise re-enqueue every URL it had already crawled.
         let dedup_key = crate::normalize::normalize_url_for_dedup(link_url, self.config.dedup_include_query);
-        if self.frontier.is_seen(&dedup_key).await? {
+        if !self.frontier.claim(&dedup_key).await? {
             return Ok(false);
         }
-
-        self.frontier.mark_seen(&dedup_key).await?;
         let child_depth = entry.depth + 1;
         let child_doc_depth: u32 = if is_doc_link { entry.doc_depth + 1 } else { 0 };
         let priority = self.strategy.score_url(link_url, child_depth);
         self.frontier
             .push(FrontierEntry {
                 url: link_url.to_owned(),
+                original_url: Some(original_url.to_owned()),
                 depth: child_depth,
                 doc_depth: child_doc_depth,
                 priority,
@@ -420,29 +514,43 @@ impl CrawlEngine {
     /// Crawl a website starting from `url`.
     ///
     /// See [`CrawlEngine::crawl_sequential`] for the loop this delegates to.
-    #[tracing::instrument(name = "crawl.engine.crawl", skip(self), fields(url.full = tracing::field::Empty))]
     pub async fn crawl(&self, url: &str) -> Result<CrawlResult, CrawlError> {
-        self.crawl_sequential(url).await
+        let (engine, seed) = self.admit(url)?;
+        engine.crawl_seed(&seed).await
+    }
+
+    /// Crawl an admitted seed URL. See [`CrawlEngine::crawl`].
+    #[tracing::instrument(name = "crawl.engine.crawl", skip_all, fields(url.full = tracing::field::Empty))]
+    async fn crawl_seed(&self, seed: &super::SeedUrl) -> Result<CrawlResult, CrawlError> {
+        self.crawl_sequential(seed).await
     }
 
     /// Scrape multiple URLs sequentially (no concurrency on wasm).
+    ///
+    /// Each result is paired with its admitted URL.
     #[tracing::instrument(name = "crawl.engine.batch_scrape", skip(self, urls), fields(url_count = urls.len()))]
     pub async fn batch_scrape(&self, urls: &[&str]) -> Vec<(String, Result<ScrapeResult, CrawlError>)> {
         let mut results = Vec::with_capacity(urls.len());
         for url in urls {
-            let result = self.scrape(url).await;
-            results.push((url.to_string(), result));
+            results.push(match self.admit(url) {
+                Ok((engine, seed)) => (seed.as_str().to_owned(), engine.scrape_seed(&seed).await),
+                Err(e) => (super::admission::admission_key(url, None), Err(e)),
+            });
         }
         results
     }
 
     /// Crawl multiple seed URLs sequentially (no concurrency on wasm).
+    ///
+    /// Each result is paired with its admitted URL.
     #[tracing::instrument(name = "crawl.engine.batch", skip(self, urls), fields(crawl.seed_count = urls.len()))]
     pub async fn batch_crawl(&self, urls: &[&str]) -> Vec<(String, Result<CrawlResult, CrawlError>)> {
         let mut results = Vec::with_capacity(urls.len());
         for url in urls {
-            let result = self.crawl(url).await;
-            results.push((url.to_string(), result));
+            results.push(match self.admit(url) {
+                Ok((engine, seed)) => (seed.as_str().to_owned(), engine.crawl_seed(&seed).await),
+                Err(e) => (super::admission::admission_key(url, None), Err(e)),
+            });
         }
         results
     }
@@ -454,9 +562,9 @@ struct SequentialPlan {
     base_host_suffix: String,
     max_depth: usize,
     max_pages: usize,
-    exclude_regexes: Vec<regex::Regex>,
-    include_regexes: Vec<regex::Regex>,
-    match_query: bool,
+    exclude_regexes: Vec<crate::helpers::PathPattern>,
+    include_regexes: Vec<crate::helpers::PathPattern>,
+    target: crate::helpers::PathPatternTarget,
 }
 
 impl SequentialPlan {
@@ -470,7 +578,7 @@ impl SequentialPlan {
             max_pages: config.max_pages.unwrap_or(usize::MAX),
             exclude_regexes: crate::helpers::compile_regexes(&config.exclude_paths)?,
             include_regexes: crate::helpers::compile_regexes(&config.include_paths)?,
-            match_query: config.path_patterns_match_query,
+            target: crate::helpers::PathPatternTarget::from_config(config),
         })
     }
 }
@@ -531,40 +639,49 @@ impl SequentialState {
     }
 }
 
-/// Whether `entry` survives the path filters and robots.txt, counting it if it does not.
+/// Whether `entry` survives `exclude_paths`/`include_paths`, counting it if it does not.
 ///
 /// ~keep An entry whose URL does not parse is admitted: the original loop applied these
 /// ~keep rules only inside `if let Ok(parsed)`, letting the fetch report the failure.
-fn passes_url_filters(
-    entry: &FrontierEntry,
-    plan: &SequentialPlan,
-    robots: &crate::helpers::RobotsOutcome,
-    state: &mut SequentialState,
-) -> bool {
+///
+/// ~keep Checked before robots.txt is even fetched, and before this page's agent is picked:
+/// ~keep an excluded URL should not cost its origin a robots.txt request, or a rotation tick,
+/// ~keep either -- the same ordering native's `redirect.rs::admits` uses, for the same reason
+/// ~keep (see its `filtered_by_path_patterns` comment).
+fn passes_path_filters(entry: &FrontierEntry, plan: &SequentialPlan, state: &mut SequentialState) -> bool {
     let Ok(parsed) = url::Url::parse(&entry.url) else {
         return true;
     };
 
     // ~keep `include_paths` is exempt at depth 0 (the seed), mirroring the native loop's
     // `should_fetch_url`: the seed was not discovered through any filter.
-    if !crate::helpers::passes_path_patterns(
+    crate::helpers::passes_path_patterns(
         &parsed,
         &plan.exclude_regexes,
         &plan.include_regexes,
         entry.depth > 0,
-        plan.match_query,
+        plan.target,
         &mut state.urls_filtered,
-    ) {
-        return false;
-    }
+    )
+}
+
+/// Whether `robots` -- already judged for the agent this page's fetch will send -- admits
+/// `entry.url`'s path.
+fn passes_robots(entry: &FrontierEntry, robots: &crate::helpers::RobotsOutcome, state: &mut SequentialState) -> bool {
+    let Ok(parsed) = url::Url::parse(&entry.url) else {
+        return true;
+    };
     if !robots.allows(parsed.path()) {
         state.urls_filtered += 1;
         return false;
     }
-
     true
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "wasm_crawl_tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "original_url_tests.rs"]
+mod original_url_tests;

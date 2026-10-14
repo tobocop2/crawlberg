@@ -4,6 +4,7 @@
 // ignore_for_file: invalid_use_of_internal_member, unused_import, unnecessary_import
 
 import 'frb_generated.dart';
+
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'lib.freezed.dart';
@@ -67,20 +68,20 @@ Future<BatchCrawlResults> batchCrawl({
   required List<String> urls,
 }) => RustLib.instance.api.crateBatchCrawl(engine: engine, urls: urls);
 
-Future<CrawlConfig> createCrawlConfigFromJson({required String json}) =>
-    RustLib.instance.api.crateCreateCrawlConfigFromJson(json: json);
+Future<ProxyConfig> createProxyConfigFromJson({required String json}) =>
+    RustLib.instance.api.crateCreateProxyConfigFromJson(json: json);
 
 Future<ExtractionMeta> createExtractionMetaFromJson({required String json}) =>
     RustLib.instance.api.crateCreateExtractionMetaFromJson(json: json);
-
-Future<ProxyConfig> createProxyConfigFromJson({required String json}) =>
-    RustLib.instance.api.crateCreateProxyConfigFromJson(json: json);
 
 Future<ContentConfig> createContentConfigFromJson({required String json}) =>
     RustLib.instance.api.crateCreateContentConfigFromJson(json: json);
 
 Future<BrowserConfig> createBrowserConfigFromJson({required String json}) =>
     RustLib.instance.api.crateCreateBrowserConfigFromJson(json: json);
+
+Future<CrawlConfig> createCrawlConfigFromJson({required String json}) =>
+    RustLib.instance.api.crateCreateCrawlConfigFromJson(json: json);
 
 Future<BrowserExtras> createBrowserExtrasFromJson({required String json}) =>
     RustLib.instance.api.crateCreateBrowserExtrasFromJson(json: json);
@@ -185,6 +186,9 @@ Future<BatchCrawlResults> createBatchCrawlResultsFromJson({
 Future<SsrfPolicy> createSsrfPolicyFromJson({required String json}) =>
     RustLib.instance.api.crateCreateSsrfPolicyFromJson(json: json);
 
+Future<AuthConfig> createAuthConfigFromJson({required String json}) =>
+    RustLib.instance.api.crateCreateAuthConfigFromJson(json: json);
+
 Future<BrowserMode> createBrowserModeFromJson({required String json}) =>
     RustLib.instance.api.crateCreateBrowserModeFromJson(json: json);
 
@@ -206,9 +210,6 @@ Future<CrawlStrategyKind> createCrawlStrategyKindFromJson({
 Future<ContentFilterKind> createContentFilterKindFromJson({
   required String json,
 }) => RustLib.instance.api.crateCreateContentFilterKindFromJson(json: json);
-
-Future<AuthConfig> createAuthConfigFromJson({required String json}) =>
-    RustLib.instance.api.crateCreateAuthConfigFromJson(json: json);
 
 Future<LinkType> createLinkTypeFromJson({required String json}) =>
     RustLib.instance.api.crateCreateLinkTypeFromJson(json: json);
@@ -570,6 +571,7 @@ class BrowserConfig {
   final BrowserBackend backend;
 
   /// CDP WebSocket endpoint for connecting to an external browser instance.
+  /// Crawlberg disconnects during teardown but never closes the external browser process. <!-- -->
   final String? endpoint;
 
   /// Timeout for browser page load and rendering (in milliseconds when serialized).
@@ -577,9 +579,13 @@ class BrowserConfig {
 
   /// Overall deadline for a single browser fetch, covering browser launch (or
   /// page acquisition from a shared pool), page setup, navigation, rendering,
-  /// and screenshot capture. Must exceed `timeout` to leave room for launch
-  /// and setup overhead; a fetch that has not returned within this deadline
-  /// fails with a timeout error (in milliseconds when serialized).
+  /// screenshot capture, and every retry of the fetch. Must exceed `timeout`
+  /// to leave room for launch and setup overhead; a fetch that has not
+  /// returned within this deadline fails with a timeout error (in
+  /// milliseconds when serialized). The wait for the delay of the domain
+  /// (`rate_limit_ms`) is not counted, so a delay longer than this deadline
+  /// does not fail the page. A scrape with the native backend is not bounded
+  /// by this deadline.
   ///
   /// Shutdown/teardown is governed separately by `shutdown_timeout` and is
   /// not counted against this deadline: an already-computed result is
@@ -607,7 +613,7 @@ class BrowserConfig {
 
   /// URL patterns to block before the network request fires. Supports `*`
   /// wildcards. Useful for skipping ads/analytics/large images. Honored by
-  /// `BrowserBackend::Native`; chromiumoxide ignores this field today.
+  /// both browser backends.
   final List<String> blockUrlPatterns;
 
   /// JavaScript snippet evaluated after navigation completes.
@@ -627,8 +633,29 @@ class BrowserConfig {
 
   /// Enable session affinity: reuse chromiumoxide Pages for same-domain
   /// requests so cookies + fingerprint + solved challenges persist.
-  /// Default: true. When false, each request gets a fresh Page.
+  /// Default: true. Session reuse requires `CrawlConfig.browser_session_pool` alongside a browser pool.
+  /// Without a session pool, or when false, each request gets a fresh Page.
   final bool sessionAffinity;
+
+  /// Chrome or Chromium executable to launch. When set, crawlberg launches only this
+  /// binary, and a path that is missing or not executable is an error that names the
+  /// path; crawlberg never falls back to a different Chrome. When unset, crawlberg uses
+  /// the `CHROME` environment variable, then searches the machine for an installed Chrome,
+  /// Chromium or Edge. Chromiumoxide backend only: ignored, with a warning, when `endpoint`
+  /// is set, with the native backend, and by scrapes and crawls that use a shared browser pool.
+  final String? chromePath;
+
+  /// Extra Chrome command-line flags, each written as `--flag` or `--flag=value`, for example
+  /// `--user-agent=...`. A flag here replaces a crawlberg default flag of the same name
+  /// (`--lang=fr` replaces crawlberg's `--lang=en_US`). Rejected: an entry that does not
+  /// start with `--`, a flag name with an uppercase letter (Chrome flag names are lowercase),
+  /// a flag named twice, and `--headless`, `--remote-debugging-port` and `--user-data-dir`,
+  /// which crawlberg sets itself to run Chrome. Set this only from trusted configuration,
+  /// like `proxy`: flags such as `--proxy-server` and `--host-resolver-rules` send Chrome's
+  /// traffic around the `ssrf` policy. Chromiumoxide backend only: ignored, with a warning,
+  /// when `endpoint` is set, with the native backend, and by scrapes and crawls that use a
+  /// shared browser pool.
+  final List<String> chromeArgs;
 
   const BrowserConfig({
     required this.mode,
@@ -646,6 +673,8 @@ class BrowserConfig {
     this.robotsUserAgent,
     required this.captureNetworkEvents,
     required this.sessionAffinity,
+    this.chromePath,
+    required this.chromeArgs,
   });
 
   @override
@@ -664,7 +693,9 @@ class BrowserConfig {
       evalScript.hashCode ^
       robotsUserAgent.hashCode ^
       captureNetworkEvents.hashCode ^
-      sessionAffinity.hashCode;
+      sessionAffinity.hashCode ^
+      chromePath.hashCode ^
+      chromeArgs.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -685,7 +716,9 @@ class BrowserConfig {
           evalScript == other.evalScript &&
           robotsUserAgent == other.robotsUserAgent &&
           captureNetworkEvents == other.captureNetworkEvents &&
-          sessionAffinity == other.sessionAffinity;
+          sessionAffinity == other.sessionAffinity &&
+          chromePath == other.chromePath &&
+          chromeArgs == other.chromeArgs;
 }
 
 /// Browser-specific extras populated when the native browser backend was used.
@@ -883,6 +916,24 @@ class ContentConfig {
   /// parsed DOM, so turning this off does not lose any metadata field.
   final bool extractMetadata;
 
+  /// Replace paragraph source line breaks with spaces. Default: `false`.
+  final bool stripNewlines;
+
+  /// Markdown unordered-list markers, cycled by nesting level. Default: `"-*+"`.
+  final String bullets;
+
+  /// Spaces per nested list level. Default: `2`.
+  final PlatformInt64 listIndentWidth;
+
+  /// Markdown emphasis marker: `"*"` (default) or `"_"`.
+  final String strongEmSymbol;
+
+  /// Render tables without column-width padding. Default: `false`.
+  final bool compactTables;
+
+  /// HTML elements whose inline images stay images instead of alt text. Default: `[]`.
+  final List<String> keepInlineImagesIn;
+
   const ContentConfig({
     required this.outputFormat,
     required this.preprocessingPreset,
@@ -897,6 +948,12 @@ class ContentConfig {
     required this.wrapWidth,
     required this.includeDocumentStructure,
     required this.extractMetadata,
+    this.stripNewlines = false,
+    this.bullets = "-*+",
+    this.listIndentWidth = 2,
+    this.strongEmSymbol = "*",
+    this.compactTables = false,
+    this.keepInlineImagesIn = const [],
   });
 
   @override
@@ -913,7 +970,13 @@ class ContentConfig {
       wrap.hashCode ^
       wrapWidth.hashCode ^
       includeDocumentStructure.hashCode ^
-      extractMetadata.hashCode;
+      extractMetadata.hashCode ^
+      stripNewlines.hashCode ^
+      bullets.hashCode ^
+      listIndentWidth.hashCode ^
+      strongEmSymbol.hashCode ^
+      compactTables.hashCode ^
+      keepInlineImagesIn.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -932,7 +995,13 @@ class ContentConfig {
           wrap == other.wrap &&
           wrapWidth == other.wrapWidth &&
           includeDocumentStructure == other.includeDocumentStructure &&
-          extractMetadata == other.extractMetadata;
+          extractMetadata == other.extractMetadata &&
+          stripNewlines == other.stripNewlines &&
+          bullets == other.bullets &&
+          listIndentWidth == other.listIndentWidth &&
+          strongEmSymbol == other.strongEmSymbol &&
+          compactTables == other.compactTables &&
+          keepInlineImagesIn == other.keepInlineImagesIn;
 }
 
 /// Content filter applied to each crawled page before it reaches the result.
@@ -1011,12 +1080,19 @@ class CrawlConfig {
   /// Minimum BM25 score a page must reach to be kept. Defaults to `0.0`.
   final double? bm25Threshold;
 
-  /// Whether to respect robots.txt directives.
+  /// Whether to respect robots.txt directives. A crawl that respects them also honours
+  /// the page's own robots instructions: it does not follow the links of a page marked
+  /// `nofollow` by its robots meta tag or an `X-Robots-Tag` header. A link marked
+  /// `rel="nofollow"` is a hint, not a robots directive, and is still followed. A `noindex`
+  /// page is still crawled and its links followed; the page result marks it with
+  /// `noindex_detected`.
   final bool respectRobotsTxt;
 
   /// When true, HTTP-level error responses (404 NotFound, 403 Forbidden, WAF blocks)
   /// are surfaced as `ScrapeResult` records with the matching `status_code` rather
-  /// than raised as `CrawlError`. Default `false` preserves the historical
+  /// than raised as `CrawlError`. A WAF block reports the status of the refused
+  /// response when it is a 4xx or 5xx, and 403 when the block page came with a
+  /// 2xx status. Default `false` preserves the historical
   /// throw-on-error contract for direct fetches. Independently of this flag,
   /// 404s reached at the end of a redirect chain are *always* surfaced softly —
   /// the user opted into redirect-following, so receiving a 404 there is part of
@@ -1026,10 +1102,19 @@ class CrawlConfig {
   /// Custom user-agent string.
   final String? userAgent;
 
-  /// Whether to restrict crawling to the same domain.
+  /// Whether to confine *document* links (`.pdf`, `.docx`, `.zip`, ...) to the seed domain.
+  ///
+  /// Page links are always confined to the seed host, widened to its subdomains by
+  /// [`Self::allow_subdomains`]; this flag does not loosen that. It applies only to document
+  /// links, which are classified by file extension before their host is considered and so
+  /// are followed cross-host by default -- the usual case being documents served from a CDN
+  /// or object store. Set this to `true` to require documents to live on the seed domain too.
   final bool stayOnDomain;
 
-  /// Whether to allow subdomains when `stay_on_domain` is true.
+  /// Whether subdomains of the seed host are in scope.
+  ///
+  /// Applies to page links unconditionally, and to document links when
+  /// [`Self::stay_on_domain`] is set.
   final bool allowSubdomains;
 
   /// Regex patterns for paths to include during crawling.
@@ -1041,13 +1126,22 @@ class CrawlConfig {
   /// Whether `include_paths`/`exclude_paths` match against `path?query` instead of just
   /// `path`. Defaults to `false`, matching path only: a pattern anchored with `$` (e.g.
   /// `/feed/?$`) changes meaning once the query joins the matched text, so this must stay
-  /// opt-in rather than silently changing what an existing config matches.
+  /// opt-in rather than silently changing what an existing config matches. Has no effect
+  /// when [`Self::path_patterns_match_url`] is `true`.
   final bool pathPatternsMatchQuery;
 
-  /// Whether the crawl-dedup key includes the (sorted) query string. Defaults to `false`,
-  /// matching historical behavior: `/item?id=1` and `/item?id=2` are treated as one page and
-  /// only the first is fetched. `true` keeps the query, sorted, in the key, so each distinct
-  /// query is fetched once.
+  /// Whether `include_paths`/`exclude_paths` match against the full URL,
+  /// `scheme://host[:port]/path?query`, so a pattern can scope by host. Defaults to `false`.
+  /// When `true` it takes precedence over [`Self::path_patterns_match_query`]: the query is
+  /// part of the full URL whatever that flag says. The matched text never contains a
+  /// `user:password@`, a fragment or a default port, and the host is in punycode
+  /// (`bücher.de` is matched as `xn--bcher-kva.de`).
+  final bool pathPatternsMatchUrl;
+
+  /// Whether the crawl-dedup key includes the query string, sorted by parameter name.
+  /// Defaults to `true`: `/item?id=1` and `/item?id=2` are distinct pages, each fetched once.
+  /// Set to `false` to merge query variants and fetch only the first. Session parameters
+  /// produce a page for each distinct value unless removed with `strip_tracking_params`.
   final bool dedupIncludeQuery;
 
   /// Whether to strip `tracking_params` from a discovered URL before it is deduplicated,
@@ -1062,14 +1156,16 @@ class CrawlConfig {
   /// enabled.
   final List<String> trackingParams;
 
-  /// Custom HTTP headers to send with each request.
+  /// Custom HTTP headers to send with each request to the seed URL's host. A request to another host
+  /// does not carry them.
   final Map<String, String> customHeaders;
 
   /// Timeout for individual HTTP requests (in milliseconds when serialized).
   final PlatformInt64 requestTimeout;
 
   /// Per-domain rate limit in milliseconds. When set, enforces a minimum delay
-  /// between requests to the same domain. Defaults to 200ms when `None`.
+  /// between requests to the same domain, in HTTP mode and before each page load in
+  /// browser mode. When `None`, HTTP mode uses 200ms and browser mode applies no delay.
   final PlatformInt64? rateLimitMs;
 
   /// Maximum number of redirects to follow.
@@ -1078,7 +1174,9 @@ class CrawlConfig {
   /// Number of retry attempts for failed requests. Bounded by [`MAX_RETRY_COUNT`].
   final PlatformInt64 retryCount;
 
-  /// HTTP status codes that should trigger a retry.
+  /// HTTP status codes that should trigger a retry. When empty, every rate limit, server
+  /// error, bad gateway and timeout is retried. When set, only a failure whose status is
+  /// listed is retried, so a timeout without a response is not.
   final Int64List retryCodes;
 
   /// Initial delay, in milliseconds, before the first retry. Doubled on each
@@ -1248,6 +1346,7 @@ class CrawlConfig {
     required this.includePaths,
     required this.excludePaths,
     required this.pathPatternsMatchQuery,
+    required this.pathPatternsMatchUrl,
     required this.dedupIncludeQuery,
     required this.stripTrackingParams,
     required this.trackingParams,
@@ -1306,6 +1405,7 @@ class CrawlConfig {
       includePaths.hashCode ^
       excludePaths.hashCode ^
       pathPatternsMatchQuery.hashCode ^
+      pathPatternsMatchUrl.hashCode ^
       dedupIncludeQuery.hashCode ^
       stripTrackingParams.hashCode ^
       trackingParams.hashCode ^
@@ -1366,6 +1466,7 @@ class CrawlConfig {
           includePaths == other.includePaths &&
           excludePaths == other.excludePaths &&
           pathPatternsMatchQuery == other.pathPatternsMatchQuery &&
+          pathPatternsMatchUrl == other.pathPatternsMatchUrl &&
           dedupIncludeQuery == other.dedupIncludeQuery &&
           stripTrackingParams == other.stripTrackingParams &&
           trackingParams == other.trackingParams &&
@@ -1468,6 +1569,13 @@ sealed class CrawlError with _$CrawlError {
   /// Data was lost or truncated during transfer.
   const factory CrawlError.dataLoss({required String message}) =
       CrawlError_DataLoss;
+
+  /// The page was fetched but could not be converted to Markdown.
+  ///
+  /// A crawl event and a batch item carry an error as text only. There, the text starts with
+  /// `conversion_failed:`, and that tag is stable.
+  const factory CrawlError.conversionFailed({required String message}) =
+      CrawlError_ConversionFailed;
 
   /// The browser failed to launch, connect, or navigate.
   const factory CrawlError.browserError({required String message}) =
@@ -1594,6 +1702,22 @@ class CrawlPageResult {
   /// Redirect hops taken to reach `final_url` from `url`.
   final PlatformInt64 redirectCount;
 
+  /// Whether the page asked not to be indexed, by its robots meta tag or `X-Robots-Tag`
+  /// header. The page is still crawled and its links still followed.
+  final bool noindexDetected;
+
+  /// Whether the page asked that its links not be followed, by its robots meta tag or
+  /// `X-Robots-Tag` header. When the crawl respects robots, its links are not followed.
+  final bool nofollowDetected;
+
+  /// URLs of the requests the page sent in browser mode that the SSRF policy refused, without
+  /// their credentials, each listed once. The page is kept; only the refused requests failed.
+  final List<String> ssrfRefusedUrls;
+
+  /// Seed address as supplied, or the discovered link address resolved against its base.
+  /// Preserves source spelling through redirects; URL credentials are removed. <!-- -->
+  final String originalUrl;
+
   const CrawlPageResult({
     required this.url,
     required this.normalizedUrl,
@@ -1618,6 +1742,10 @@ class CrawlPageResult {
     required this.browserUsed,
     required this.finalUrl,
     required this.redirectCount,
+    required this.noindexDetected,
+    required this.nofollowDetected,
+    required this.ssrfRefusedUrls,
+    this.originalUrl = "",
   });
 
   @override
@@ -1644,7 +1772,11 @@ class CrawlPageResult {
       downloadedDocument.hashCode ^
       browserUsed.hashCode ^
       finalUrl.hashCode ^
-      redirectCount.hashCode;
+      redirectCount.hashCode ^
+      noindexDetected.hashCode ^
+      nofollowDetected.hashCode ^
+      ssrfRefusedUrls.hashCode ^
+      originalUrl.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -1673,7 +1805,11 @@ class CrawlPageResult {
           downloadedDocument == other.downloadedDocument &&
           browserUsed == other.browserUsed &&
           finalUrl == other.finalUrl &&
-          redirectCount == other.redirectCount;
+          redirectCount == other.redirectCount &&
+          noindexDetected == other.noindexDetected &&
+          nofollowDetected == other.nofollowDetected &&
+          ssrfRefusedUrls == other.ssrfRefusedUrls &&
+          originalUrl == other.originalUrl;
 }
 
 /// The result of a multi-page crawl operation.
@@ -2182,11 +2318,16 @@ class InteractionResult {
   /// callers that never request a screenshot do not pay the encoding cost.
   final String? screenshotBase64;
 
+  /// URLs of the requests the page sent during the session that the SSRF policy refused,
+  /// including during the extra wait, without their credentials, each listed once.
+  final List<String> ssrfRefusedUrls;
+
   const InteractionResult({
     required this.actionResults,
     required this.finalHtml,
     required this.finalUrl,
     this.screenshotBase64,
+    required this.ssrfRefusedUrls,
   });
 
   @override
@@ -2194,7 +2335,8 @@ class InteractionResult {
       actionResults.hashCode ^
       finalHtml.hashCode ^
       finalUrl.hashCode ^
-      screenshotBase64.hashCode;
+      screenshotBase64.hashCode ^
+      ssrfRefusedUrls.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -2204,7 +2346,8 @@ class InteractionResult {
           actionResults == other.actionResults &&
           finalHtml == other.finalHtml &&
           finalUrl == other.finalUrl &&
-          screenshotBase64 == other.screenshotBase64;
+          screenshotBase64 == other.screenshotBase64 &&
+          ssrfRefusedUrls == other.ssrfRefusedUrls;
 }
 
 /// A JSON-LD structured data entry found on a page.
@@ -2250,12 +2393,18 @@ class LinkInfo {
   /// Whether the link has `rel="nofollow"`.
   final bool nofollow;
 
+  /// Link address resolved against the page's base without changing path spelling.
+  /// Percent escapes, Unicode, spaces, backslashes and dot segments are preserved.
+  /// URL credentials are removed. <!-- -->
+  final String originalUrl;
+
   const LinkInfo({
     required this.url,
     required this.text,
     required this.linkType,
     this.rel,
     required this.nofollow,
+    this.originalUrl = "",
   });
 
   @override
@@ -2264,7 +2413,8 @@ class LinkInfo {
       text.hashCode ^
       linkType.hashCode ^
       rel.hashCode ^
-      nofollow.hashCode;
+      nofollow.hashCode ^
+      originalUrl.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -2275,7 +2425,8 @@ class LinkInfo {
           text == other.text &&
           linkType == other.linkType &&
           rel == other.rel &&
-          nofollow == other.nofollow;
+          nofollow == other.nofollow &&
+          originalUrl == other.originalUrl;
 }
 
 /// The classification of a link.
@@ -2286,7 +2437,7 @@ enum LinkType {
   /// A link to a different domain.
   external_,
 
-  /// A fragment-only link (e.g., `#section`).
+  /// A link into the page it is on: its address without the fragment is the page address (e.g., `#section`).
   anchor,
 
   /// A link to a downloadable document (PDF, DOC, etc.).
@@ -2713,7 +2864,7 @@ class PageMetadata {
 
 /// Proxy configuration for HTTP requests.
 class ProxyConfig {
-  /// Proxy URL (e.g. "http://proxy:8080", "socks5://proxy:1080").
+  /// Proxy URL (e.g. "http://proxy:8080"). <!-- -->
   final String url;
 
   /// Optional username for proxy authentication.
@@ -2838,7 +2989,7 @@ class ScrapeResult {
   /// Whether a nofollow directive was detected.
   final bool nofollowDetected;
 
-  /// The X-Robots-Tag header value, if present.
+  /// The X-Robots-Tag header values, joined with `, ` when the response sent more than one.
   final String? xRobotsTag;
 
   /// Whether the content is a PDF.
@@ -2888,6 +3039,10 @@ class ScrapeResult {
   /// populated when `BrowserBackend::Native` was used for this request.
   final BrowserExtras? browser;
 
+  /// URLs of the requests the page sent in browser mode that the SSRF policy refused, without
+  /// their credentials, each listed once. The page is kept; only the refused requests failed.
+  final List<String> ssrfRefusedUrls;
+
   const ScrapeResult({
     required this.statusCode,
     required this.finalUrl,
@@ -2918,6 +3073,7 @@ class ScrapeResult {
     this.screenshotBase64,
     this.downloadedDocument,
     this.browser,
+    required this.ssrfRefusedUrls,
   });
 
   @override
@@ -2950,7 +3106,8 @@ class ScrapeResult {
       extractionMeta.hashCode ^
       screenshotBase64.hashCode ^
       downloadedDocument.hashCode ^
-      browser.hashCode;
+      browser.hashCode ^
+      ssrfRefusedUrls.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -2985,7 +3142,8 @@ class ScrapeResult {
           extractionMeta == other.extractionMeta &&
           screenshotBase64 == other.screenshotBase64 &&
           downloadedDocument == other.downloadedDocument &&
-          browser == other.browser;
+          browser == other.browser &&
+          ssrfRefusedUrls == other.ssrfRefusedUrls;
 }
 
 /// Direction for a scroll action.
@@ -3044,7 +3202,7 @@ sealed class SsrfError with _$SsrfError {
   /// Host not on allowlist when an allowlist is configured.
   const factory SsrfError.notOnAllowlist() = SsrfError_NotOnAllowlist;
 
-  /// Allowlist entry is not a parseable CIDR block.
+  /// SSRF policy entry is not a parseable CIDR block.
   const factory SsrfError.invalidCidr({required String field0}) =
       SsrfError_InvalidCidr;
 
@@ -3069,22 +3227,33 @@ class SsrfPolicy {
   /// If true, reject URLs that resolve to private/metadata IP ranges.
   final bool denyPrivate;
 
-  /// Hostnames and IP ranges permitted regardless of `deny_private`.
+  /// Hostnames and IP ranges permitted regardless of `deny_private`, unless a matching
+  /// address is in `denylist`.
   ///
   /// The allowlist is an *override* of `deny_private`, not an intersection with it.
   /// Precedence, in order:
   ///
-  /// 1. `deny_private == false` permits everything; the allowlist is not consulted.
-  /// 2. A hostname matching an `Exact` or `Suffix` entry is permitted immediately,
-  ///    *before* DNS resolution — so the deny-list is never applied to it. This trusts
-  ///    the host string: a name that resolves into private space is still permitted.
-  /// 3. A literal or resolved IP inside a `Cidr` entry is permitted even though it is
+  /// 1. A configured `denylist` CIDR always refuses a matching address.
+  /// 2. `deny_private == false` permits addresses outside `denylist`; the allowlist is not consulted.
+  /// 3. A hostname matching an `Exact` or `Suffix` entry is permitted before applying
+  ///    the built-in deny-list. When `denylist` is non-empty, it is still resolved so
+  ///    custom network denials can be enforced.
+  /// 4. A literal or resolved IP inside a `Cidr` entry is permitted even though it is
   ///    in the default deny-list.
-  /// 4. Otherwise the default deny-list decides.
+  /// 5. Otherwise the default deny-list decides.
   ///
   /// An empty allowlist therefore denies nothing by itself — it simply leaves
   /// `deny_private` and the deny-list in sole control.
   final List<HostMatcher> allowlist;
+
+  /// IP ranges refused regardless of `deny_private` and `allowlist`.
+  ///
+  /// Only [`HostMatcher::Cidr`] entries are valid. Configured denials are checked
+  /// before permissive settings, including against IPv4 addresses embedded in IPv6 and,
+  /// on native targets, every address returned by DNS. They extend the built-in deny-list
+  /// and cannot weaken it. A hostname is refused when an upstream proxy or remote browser
+  /// performs the connection lookup, because that lookup cannot be bound to these checks.
+  final List<HostMatcher> denylist;
 
   /// Maximum number of HTTP redirects to follow during validation.
   final PlatformInt64 maxRedirects;
@@ -3097,6 +3266,7 @@ class SsrfPolicy {
   const SsrfPolicy({
     required this.denyPrivate,
     required this.allowlist,
+    required this.denylist,
     required this.maxRedirects,
     required this.schemeAllowlist,
   });
@@ -3105,6 +3275,7 @@ class SsrfPolicy {
   int get hashCode =>
       denyPrivate.hashCode ^
       allowlist.hashCode ^
+      denylist.hashCode ^
       maxRedirects.hashCode ^
       schemeAllowlist.hashCode;
 
@@ -3115,6 +3286,7 @@ class SsrfPolicy {
           runtimeType == other.runtimeType &&
           denyPrivate == other.denyPrivate &&
           allowlist == other.allowlist &&
+          denylist == other.denylist &&
           maxRedirects == other.maxRedirects &&
           schemeAllowlist == other.schemeAllowlist;
 }

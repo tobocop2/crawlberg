@@ -9,6 +9,11 @@ use super::dispatch::{content_density, escalation_reason_label};
 use crate::error::CrawlError;
 use crate::types::*;
 
+#[cfg(feature = "browser-native")]
+pub(super) type NativeRenderState = crawlberg_browser::adapter::NativeRenderState;
+#[cfg(not(feature = "browser-native"))]
+pub(super) type NativeRenderState = ();
+
 /// What the dispatch loop should do once a step has had its say.
 enum LoopStep {
     /// Carry on with the current attempt.
@@ -45,11 +50,69 @@ struct AttemptState {
     attempt: u32,
     /// ~keep The global attempt cap guards against RetryPolicy implementations that never return Stop.
     total_attempts: u32,
-    last_ok: Option<(crate::tower::CrawlResponse, bool)>,
+    last_ok: Option<Fallback>,
     last_err: Option<CrawlError>,
     tiers_attempted: Vec<&'static str>,
     last_escalation_reason: Option<&'static str>,
     last_content_density: f32,
+}
+
+/// A successful response kept to hand back if the attempt cap is reached.
+struct Fallback {
+    response: crate::tower::CrawlResponse,
+    browser_used: bool,
+    /// The WAF block the engine refused `response` as, if it did.
+    refusal: PendingWafBlock,
+}
+
+/// A WAF refusal that `crawl_waf_blocks_total` counts when it is dropped, unless it is cancelled.
+///
+/// ~keep A refused response kept as the [`Fallback`] stays refused unless the attempt cap hands
+/// it back as content. Dropping it, when a later attempt replaces it or the fetch ends any other
+/// way, makes the refusal final. So no exit from the loop can skip the count, and no response
+/// the caller gets is counted.
+struct PendingWafBlock(Option<String>);
+
+impl PendingWafBlock {
+    /// The count owed for a response refused for `reason`, if `reason` refuses it as a WAF block.
+    fn for_reason(reason: &EscalationReason) -> Self {
+        Self(CrawlEngine::waf_refusal_vendor(reason).map(str::to_owned))
+    }
+
+    /// Drop the count: the response is returned as content after all.
+    fn cancel(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PendingWafBlock {
+    fn drop(&mut self) {
+        if let Some(vendor) = self.0.take() {
+            crate::http::record_waf_block(&vendor);
+        }
+    }
+}
+
+/// Whether `status` is one a `soft_http_errors` page can report: a 4xx or a 5xx.
+fn is_soft_error_status(status: u16) -> bool {
+    (400..600).contains(&status)
+}
+
+/// The status a `soft_http_errors` page reports for `err`, or `None` when `err` is not reported softly.
+///
+/// ~keep A WAF or soft block reports the status of the response it refused, which the fetch path
+/// keeps as the error's source. A block page served with a 2xx reports 403: a 2xx soft error reads
+/// as success. A plain 403 carries 403, and a forbidden error with no response status reports 403.
+fn soft_error_status(err: &CrawlError) -> Option<u16> {
+    match err {
+        CrawlError::NotFound { .. } => Some(404),
+        CrawlError::Forbidden { .. } | CrawlError::WafBlocked { .. } => Some(
+            crate::http::error_status(err)
+                .filter(|status| is_soft_error_status(*status))
+                .unwrap_or(403),
+        ),
+        _ => None,
+    }
 }
 
 impl DispatchPlan {
@@ -120,7 +183,7 @@ impl DispatchPlan {
         });
 
         let waf_signal = match (self.waf_classifier.as_ref(), response.as_ref()) {
-            (Some(c), Some(h)) => match c.classify(h) {
+            (Some(c), Some(h)) => match crate::http::engine_waf_signal(c.as_ref(), h) {
                 Ok(sig) => sig,
                 Err(e) => {
                     tracing::warn!(
@@ -187,7 +250,14 @@ impl AttemptState {
             "max_total_attempts exceeded, force-returning current result"
         );
         match self.last_ok {
-            Some((resp, browser_used)) => Ok((resp, browser_used)),
+            Some(Fallback {
+                response,
+                browser_used,
+                refusal,
+            }) => {
+                refusal.cancel();
+                Ok((response, browser_used))
+            }
             None => Err(self
                 .last_err
                 .unwrap_or_else(|| CrawlError::other("max_total_attempts exceeded with no result"))),
@@ -202,32 +272,37 @@ impl CrawlEngine {
     ///
     /// This is intentionally `#[cfg(not(target_arch = "wasm32"))]`-only: wasm
     /// has its own simpler inline path inside `scrape`.
-    ///
-    /// `origin_host` is the host that started the redirect chain `url` belongs to, or
-    /// `None` when `url` is itself the origin. It scopes configured credentials to that
-    /// host — see [`crate::tower::CrawlRequest::is_on_origin_host`].
+    /// `forced_user_agent` is the agent `RedirectPolicy::admits` chose for `url` before
+    /// admitting it, when a policy runs -- `None` for `scrape()`, which passes no policy. It is
+    /// pinned onto every attempt the Http tier makes for this call, so a retry or an escalation
+    /// resends the same request rather than letting the UA rotation layer pick a new one
+    /// (crawlberg#423). The browser and bypass tiers do not read it: neither reaches the
+    /// rotation layer today.
     pub(super) async fn fetch_response(
         &self,
         url: &str,
-        origin_host: Option<&str>,
+        forced_user_agent: Option<&str>,
+        native_state: Option<&mut NativeRenderState>,
+        browser_cookies: Option<&[BrowserCookie]>,
     ) -> Result<(crate::tower::CrawlResponse, bool), CrawlError> {
-        #[cfg(feature = "browser")]
-        if matches!(self.config.browser.mode, BrowserMode::Always | BrowserMode::Stealth) {
-            let pool = self.config.browser_pool.as_deref();
+        #[cfg(any(feature = "browser", feature = "browser-native"))]
+        if self.request_will_use_browser() {
             #[cfg(feature = "browser-native")]
-            let http_resp = crate::browser::browser_fetch(
-                url,
-                &self.config,
-                None,
-                pool,
-                false,
-                self.native_browser_executor.as_deref(),
-            )
-            .await?;
-            #[cfg(not(feature = "browser-native"))]
-            let http_resp = crate::browser::browser_fetch(url, &self.config, None, pool, false).await?;
-            let (crawl_resp, _extras) = Self::browser_http_to_crawl(http_resp);
-            return Ok((crawl_resp, true));
+            if self.config.browser.backend == BrowserBackend::Native
+                && let Some(state) = native_state
+            {
+                return self.native_render(url, state).await;
+            }
+            #[cfg(feature = "browser")]
+            {
+                let page = self.browser_fetch(url, browser_cookies, false).await?;
+                let (crawl_resp, _extras) = Self::browser_http_to_crawl(page);
+                return Ok((crawl_resp, true));
+            }
+            #[cfg(not(feature = "browser"))]
+            return Err(CrawlError::browser_error(
+                "native browser render state is not available",
+            ));
         }
 
         let plan = DispatchPlan::from_config(&self.config);
@@ -235,28 +310,21 @@ impl CrawlEngine {
         if matches!(plan.effective_strategy, EscalationStrategy::BypassFirst)
             && let Some(provider) = self.config.dispatch.as_ref().and_then(|d| d.bypass.as_ref())
         {
-            let bypass_resp = provider.fetch(url).await?;
-            return Ok((
-                crate::tower::CrawlResponse {
-                    status: bypass_resp.status,
-                    content_type: bypass_resp.content_type,
-                    body: bypass_resp.body,
-                    body_bytes: bypass_resp.body_bytes,
-                    headers: bypass_resp.headers,
-                },
-                false,
-            ));
+            return Ok((provider.fetch(url).await?.into_crawl_response(), false));
         }
 
-        self.run_dispatch_loop(url, origin_host, &plan).await
+        self.run_dispatch_loop(url, &plan, forced_user_agent, native_state, browser_cookies)
+            .await
     }
 
     /// Attempt the fetch, retrying and escalating tiers until the policy says stop.
     async fn run_dispatch_loop(
         &self,
         url: &str,
-        origin_host: Option<&str>,
         plan: &DispatchPlan,
+        forced_user_agent: Option<&str>,
+        mut native_state: Option<&mut NativeRenderState>,
+        browser_cookies: Option<&[BrowserCookie]>,
     ) -> Result<(crate::tower::CrawlResponse, bool), CrawlError> {
         let mut state = AttemptState::new();
 
@@ -274,7 +342,16 @@ impl CrawlEngine {
                 LoopStep::Done(result) => return result,
             }
 
-            let step = match self.run_tier(state.current_tier, url, origin_host).await {
+            let step = match self
+                .run_tier(
+                    state.current_tier,
+                    url,
+                    forced_user_agent,
+                    native_state.as_deref_mut(),
+                    browser_cookies,
+                )
+                .await
+            {
                 Ok(fetched) => self.handle_tier_success(url, fetched, plan, &mut state).await,
                 Err(err) => self.handle_tier_error(url, err, plan, &mut state).await,
             };
@@ -372,18 +449,27 @@ impl CrawlEngine {
                 // ~keep Moves (not clones) `resp` into `last_ok`: it is only read on the rare
                 // total_attempts > max_total bail-out, and this loop iteration has no other
                 // use for `resp` after this point.
-                state.last_ok = Some((resp, browser_used));
+                state.last_ok = Some(Fallback {
+                    response: resp,
+                    browser_used,
+                    refusal: PendingWafBlock(None),
+                });
                 LoopStep::Restart
             }
             RetryDirective::Escalate { reason } => {
                 if let Some(next) = state.affordable_next_tier(plan).await {
                     Self::record_escalation(state.current_tier, next, &reason);
                     state.escalate_to(next, &reason);
-                    state.last_ok = Some((resp, browser_used));
+                    state.last_ok = Some(Fallback {
+                        response: resp,
+                        browser_used,
+                        refusal: PendingWafBlock::for_reason(&reason),
+                    });
                     return LoopStep::Restart;
                 }
+                Self::record_waf_refusal(&reason);
                 state.report_dispatch(url, plan);
-                LoopStep::Done(Err(Self::escalation_reason_to_error(&reason, url)))
+                self.refuse(Self::escalation_reason_to_error(&reason, url, resp.status))
             }
         }
     }
@@ -421,13 +507,14 @@ impl CrawlEngine {
             }
             Decision::EscalateBrowser => {
                 let reason = EscalationReason::AntibotEscalate;
+                Self::record_waf_refusal(&reason);
                 if let Some(next) = state.affordable_next_tier(plan).await {
                     Self::record_escalation(state.current_tier, next, &reason);
                     state.escalate_to(next, &reason);
                     return Some(LoopStep::Restart);
                 }
                 state.report_dispatch(url, plan);
-                Some(LoopStep::Done(Err(Self::escalation_reason_to_error(&reason, url))))
+                Some(self.refuse(Self::escalation_reason_to_error(&reason, url, response.status)))
             }
         }
     }
@@ -440,15 +527,6 @@ impl CrawlEngine {
         plan: &DispatchPlan,
         state: &mut AttemptState,
     ) -> LoopStep {
-        if self.config.soft_http_errors {
-            if matches!(err, CrawlError::NotFound { .. }) {
-                return LoopStep::Done(Ok((Self::synthesise_status(404), false)));
-            }
-            if matches!(err, CrawlError::Forbidden { .. } | CrawlError::WafBlocked { .. }) {
-                return LoopStep::Done(Ok((Self::synthesise_status(403), false)));
-            }
-        }
-
         state.last_err = Some(err.clone());
 
         // ~keep Error-arm WAF classification has vendor attribution but no classifier fingerprint.
@@ -465,7 +543,7 @@ impl CrawlEngine {
         let outcome = AttemptOutcome {
             attempt: state.attempt,
             url: std::sync::Arc::from(url),
-            status: None,
+            status: crate::http::error_status(&err),
             error: Some(err.clone()),
             waf_signal,
             body_size: 0,
@@ -476,7 +554,7 @@ impl CrawlEngine {
         match plan.retry_policy.decide(&outcome).await {
             RetryDirective::Stop => {
                 state.report_dispatch(url, plan);
-                LoopStep::Done(Err(err))
+                self.refuse(err)
             }
             RetryDirective::Retry { backoff_ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -490,9 +568,20 @@ impl CrawlEngine {
                     return LoopStep::Restart;
                 }
                 state.report_dispatch(url, plan);
-                LoopStep::Done(Err(err))
+                self.refuse(err)
             }
         }
+    }
+
+    /// The soft error page `soft_http_errors` ends the fetch with in place of `err`, if any.
+    fn soft_page(&self, err: &CrawlError) -> Option<LoopStep> {
+        let status = soft_error_status(err).filter(|_| self.config.soft_http_errors)?;
+        Some(LoopStep::Done(Ok((Self::synthesise_status(status), false))))
+    }
+
+    /// End the fetch refusing a response with `err`, or with its soft error page.
+    fn refuse(&self, err: CrawlError) -> LoopStep {
+        self.soft_page(&err).unwrap_or(LoopStep::Done(Err(err)))
     }
 
     /// Count one tier transition on `backend_escalations_total`.
@@ -505,5 +594,53 @@ impl CrawlEngine {
                 KeyValue::new("reason", escalation_reason_label(reason)),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_error_status_reports_403_for_a_waf_block_without_a_response_status() {
+        let blocked = CrawlError::waf_blocked("cloudflare", "cloudflare detected");
+        assert_eq!(soft_error_status(&blocked), Some(403));
+    }
+
+    #[test]
+    fn soft_error_status_reports_not_found_and_forbidden_and_no_other_error() {
+        assert_eq!(
+            soft_error_status(&CrawlError::not_found("https://example.com/x")),
+            Some(404)
+        );
+        assert_eq!(soft_error_status(&CrawlError::forbidden("forbidden")), Some(403));
+        assert_eq!(soft_error_status(&CrawlError::rate_limited("rate_limited")), None);
+        assert_eq!(soft_error_status(&CrawlError::other("boom")), None);
+    }
+
+    #[test]
+    fn a_refusal_reports_the_status_of_the_response_it_refused() {
+        let url = "https://example.com/x";
+        let blocked = EscalationReason::WafBlocked { vendor: "acme".into() };
+        for (status, soft) in [
+            (200_u16, Some(403_u16)),
+            (418, Some(418)),
+            (429, Some(429)),
+            (503, Some(503)),
+        ] {
+            for reason in [
+                &blocked,
+                &EscalationReason::SoftBlock,
+                &EscalationReason::AntibotEscalate,
+            ] {
+                let refusal = CrawlEngine::escalation_reason_to_error(reason, url, status);
+                assert_eq!(crate::http::error_status(&refusal), Some(status), "{refusal:?}");
+                assert_eq!(soft_error_status(&refusal), soft, "{refusal:?}");
+            }
+        }
+        for reason in [EscalationReason::RenderNeeded, EscalationReason::OriginUnreliable] {
+            let refusal = CrawlEngine::escalation_reason_to_error(&reason, url, 200);
+            assert_eq!(soft_error_status(&refusal), None, "{refusal:?}");
+        }
     }
 }

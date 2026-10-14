@@ -53,7 +53,7 @@ const AUTH_EXEMPT_PATH: &str = "/health";
 ///
 /// # Arguments
 ///
-/// * `engine` - A shared [`CrawlEngine`] that powers scrape, crawl, and map operations.
+/// * `engine` - The [`CrawlEngine`] whose configuration each request builds its own engine from.
 pub(crate) fn create_router_with_security(engine: Arc<CrawlEngine>, security: ApiSecurityConfig) -> Router {
     // ~keep Capture config before moving the engine so MCP sessions use the same crawl settings.
     #[cfg(feature = "mcp")]
@@ -192,6 +192,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::types::CrawlConfig;
 
     use super::*;
 
@@ -202,6 +206,63 @@ mod tests {
                 .build()
                 .expect("default engine"),
         )
+    }
+
+    fn test_engine_with_config(config: CrawlConfig) -> Arc<CrawlEngine> {
+        Arc::new(
+            CrawlEngine::builder()
+                .config(config)
+                .rate_limiter(crate::defaults::NoopRateLimiter)
+                .build()
+                .expect("engine with test config"),
+        )
+    }
+
+    /// A `CrawlConfig` that allows fetching a local wiremock server without tripping SSRF
+    /// private-network protections, and skips robots.txt (the mock mounts no `/robots.txt`).
+    fn local_test_config() -> CrawlConfig {
+        CrawlConfig {
+            respect_robots_txt: false,
+            ..CrawlConfig::builder().allow_private_networks(true).build()
+        }
+    }
+
+    fn urlset(locs: &[&str]) -> String {
+        let mut body =
+            String::from(r#"<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#);
+        for loc in locs {
+            body.push_str(&format!("<url><loc>{loc}</loc></url>"));
+        }
+        body.push_str("</urlset>");
+        body
+    }
+
+    async fn mount_sitemap(mock: &MockServer, locs: &[&str]) {
+        let response = ResponseTemplate::new(200)
+            .set_body_string(urlset(locs))
+            .append_header("content-type", "application/xml");
+        Mock::given(method("GET"))
+            .and(path("/sitemap.xml"))
+            .respond_with(response)
+            .mount(mock)
+            .await;
+    }
+
+    /// POST `/v1/map` and return the discovered URLs in response order.
+    async fn map_urls(router: Router, url: &str, search: &str) -> Vec<String> {
+        let response = call(
+            router,
+            json_post("/v1/map", serde_json::json!({ "url": url, "search": search })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "map request must succeed");
+        let body = body_json(response).await;
+        body["data"]["urls"]
+            .as_array()
+            .expect("urls array")
+            .iter()
+            .map(|u| u["url"].as_str().expect("url string").to_owned())
+            .collect()
     }
 
     #[tokio::test]
@@ -228,6 +289,14 @@ mod tests {
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
             .expect("valid request")
+    }
+
+    fn crawl_router_and_state() -> (Router, Arc<ApiState>) {
+        let state = Arc::new(ApiState::with_security(test_engine(), ApiSecurityConfig::default()));
+        let router = Router::new()
+            .route("/v1/crawl", post(handlers::crawl_handler))
+            .with_state(state.clone());
+        (router, state)
     }
 
     async fn body_json(response: Response) -> serde_json::Value {
@@ -406,6 +475,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crawl_with_a_look_around_path_pattern_is_rejected() {
+        let secret_pattern = "^/private/REST-PATH-284/(?!token=REST-QUERY-284)";
+        for field in ["includePaths", "excludePaths"] {
+            let router = create_router_with_security(test_engine(), ApiSecurityConfig::default());
+            let response = call(
+                router,
+                json_post(
+                    "/v1/crawl",
+                    serde_json::json!({ "url": "http://127.0.0.1:9/", field: ["^/docs", secret_pattern] }),
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "a look-around pattern in {field} must be refused from a REST caller"
+            );
+            let body = body_json(response).await;
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message,
+                format!("{field}[1] uses look-around or a backreference, which the REST API does not accept"),
+                "the error must identify the indexed field and reason"
+            );
+            assert!(!message.contains("REST-PATH-284"), "path secret leaked: {body}");
+            assert!(!message.contains("REST-QUERY-284"), "query secret leaked: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn crawl_with_a_malformed_path_pattern_returns_400_without_creating_a_job() {
+        for field in ["includePaths", "excludePaths"] {
+            let (router, state) = crawl_router_and_state();
+            let response = call(
+                router,
+                json_post(
+                    "/v1/crawl",
+                    serde_json::json!({ "url": "http://127.0.0.1:9/", field: ["a{2,1}"] }),
+                ),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(response).await;
+            assert_eq!(body["success"], false, "body: {body}");
+            assert_eq!(body["error"]["code"], "BAD_REQUEST", "body: {body}");
+            let message = body["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message,
+                format!("{field}[0] does not compile"),
+                "the error must identify the indexed field"
+            );
+            assert!(state.jobs.is_empty(), "an invalid request must not create a job");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_path_pattern_error_does_not_reflect_path_or_query_secrets() {
+        let (router, state) = crawl_router_and_state();
+        let response = call(
+            router,
+            json_post(
+                "/v1/crawl",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "includePaths": ["^https://example.com/private/REST-PATH-284?token=REST-QUERY-284/["]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "BAD_REQUEST", "body: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, "includePaths[0] does not compile",
+            "the error must identify the indexed field without reflecting caller text"
+        );
+        assert!(!message.contains("REST-PATH-284"), "path secret leaked: {body}");
+        assert!(!message.contains("REST-QUERY-284"), "query secret leaked: {body}");
+        assert!(state.jobs.is_empty(), "an invalid request must not create a job");
+    }
+
+    #[tokio::test]
+    async fn crawl_with_plain_path_patterns_is_accepted() {
+        let router = create_router_with_security(test_engine(), ApiSecurityConfig::default());
+        let response = call(
+            router,
+            json_post(
+                "/v1/crawl",
+                serde_json::json!({
+                    "url": "http://127.0.0.1:9/",
+                    "includePaths": ["^/docs", r"(?-u)\w"],
+                    "excludePaths": [r"\?p=\d+"],
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "a pattern the regex crate accepts must still be accepted from a REST caller"
+        );
+    }
+
+    #[tokio::test]
     async fn crawl_is_rejected_at_the_concurrent_job_ceiling() {
         let security = ApiSecurityConfig {
             max_concurrent_jobs: 0,
@@ -501,5 +679,377 @@ mod tests {
         assert!(constant_time_eq(b"token", b"token"));
         assert!(!constant_time_eq(b"token", b"tokeN"));
         assert!(!constant_time_eq(b"short", b"longer-value"));
+    }
+
+    #[tokio::test]
+    async fn map_endpoint_search_matches_a_non_ascii_term_against_a_percent_encoded_path() {
+        let mock = MockServer::start().await;
+        let base = mock.uri();
+        mount_sitemap(&mock, &["https://example.com/café", "https://example.com/other"]).await;
+
+        let router = create_router_with_security(
+            test_engine_with_config(local_test_config()),
+            ApiSecurityConfig::default(),
+        );
+
+        let urls = map_urls(router, &base, "café").await;
+
+        assert_eq!(
+            urls,
+            vec!["https://example.com/caf%C3%A9".to_owned()],
+            "search=\"café\" must match the address map() stores percent-encoded, got {urls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_endpoint_search_matches_a_non_ascii_term_against_a_punycode_host() {
+        let mock = MockServer::start().await;
+        let base = mock.uri();
+        mount_sitemap(&mock, &["https://bücher.example/x", "https://example.com/other"]).await;
+
+        let router = create_router_with_security(
+            test_engine_with_config(local_test_config()),
+            ApiSecurityConfig::default(),
+        );
+
+        let urls = map_urls(router, &base, "bücher").await;
+
+        assert_eq!(
+            urls,
+            vec!["https://xn--bcher-kva.example/x".to_owned()],
+            "search=\"bücher\" must match the address map() stores as punycode, got {urls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_endpoint_search_matches_an_ascii_term() {
+        let mock = MockServer::start().await;
+        let base = mock.uri();
+        mount_sitemap(&mock, &["https://example.com/keep-1", "https://example.com/drop-1"]).await;
+
+        let router = create_router_with_security(
+            test_engine_with_config(local_test_config()),
+            ApiSecurityConfig::default(),
+        );
+
+        let urls = map_urls(router, &base, "KEEP").await;
+
+        assert_eq!(
+            urls,
+            vec!["https://example.com/keep-1".to_owned()],
+            "an ASCII search term must still match case-insensitively, got {urls:?}"
+        );
+    }
+
+    /// A site whose `/set` sets the cookie `user=alice` and whose other pages set none.
+    async fn cookie_site() -> MockServer {
+        let site = MockServer::start().await;
+        let html = |body: &str| {
+            ResponseTemplate::new(200).set_body_raw(format!("<html><body>{body}</body></html>"), "text/html")
+        };
+        Mock::given(method("GET"))
+            .and(path("/set"))
+            .respond_with(html("set").append_header("set-cookie", "user=alice; Path=/"))
+            .mount(&site)
+            .await;
+        Mock::given(method("GET")).respond_with(html("page")).mount(&site).await;
+        site
+    }
+
+    /// The `(path, Cookie header)` of each request the site received after `mark` that has a
+    /// `Cookie` header.
+    async fn cookies_sent_since(site: &MockServer, mark: usize) -> Vec<(String, String)> {
+        let requests = site.received_requests().await.expect("request recording is on");
+        requests[mark..]
+            .iter()
+            .filter_map(|seen| {
+                let cookie = seen.headers.get("cookie")?.to_str().expect("an ASCII cookie");
+                Some((seen.url.path().to_owned(), cookie.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Wait until the job that `response` created is complete.
+    async fn wait_for_job(router: &Router, status_route: &str, response: Response) {
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "the job must be created");
+        let id = body_json(response).await["id"].as_str().expect("a job id").to_owned();
+        for _ in 0..200 {
+            let status = call(
+                router.clone(),
+                json_request("GET", &format!("{status_route}/{id}"), None),
+            )
+            .await;
+            if body_json(status).await["status"] == "completed" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the job {id} of {status_route} did not complete");
+    }
+
+    // ~keep One router serves both requests, as one server serves two API clients. The first
+    // ~keep request receives a cookie; the second request must not send it (crawlberg#652).
+    #[tokio::test]
+    async fn no_route_sends_the_cookie_that_an_earlier_request_received() {
+        let site = cookie_site().await;
+        let config = CrawlConfig {
+            cookies_enabled: true,
+            browser: crate::types::BrowserConfig {
+                mode: crate::types::BrowserMode::Never,
+                ..Default::default()
+            },
+            ..local_test_config()
+        };
+        let url = |at: &str| format!("{}{at}", site.uri());
+        // ~keep The request body of a form for a URL.
+        type Body = fn(String) -> serde_json::Value;
+        let forms: [(&str, Body, Option<&str>); 7] = [
+            ("/v1/scrape", |url| serde_json::json!({ "url": url }), None),
+            ("/v1/download", |url| serde_json::json!({ "url": url }), None),
+            (
+                "/v1/download",
+                |url| serde_json::json!({ "url": url, "maxSize": 1_000_000 }),
+                None,
+            ),
+            ("/v1/map", |url| serde_json::json!({ "url": url }), None),
+            (
+                "/v1/map",
+                |url| serde_json::json!({ "url": url, "search": "page" }),
+                None,
+            ),
+            (
+                "/v1/crawl",
+                |url| serde_json::json!({ "url": url, "maxDepth": 0 }),
+                Some("/v1/crawl"),
+            ),
+            (
+                "/v1/batch/scrape",
+                |url| serde_json::json!({ "urls": [url] }),
+                Some("/v1/batch/scrape"),
+            ),
+        ];
+
+        let mut leaks = Vec::new();
+        for (route, body, status_route) in forms {
+            let engine = test_engine_with_config(config.clone());
+            let router = create_router_with_security(engine, ApiSecurityConfig::default());
+            for at in ["/set", "/after"] {
+                let mark = site.received_requests().await.expect("request recording is on").len();
+                let response = call(router.clone(), json_post(route, body(url(at)))).await;
+                match status_route {
+                    Some(status_route) => wait_for_job(&router, status_route, response).await,
+                    None => assert_eq!(response.status(), StatusCode::OK, "{route} {at} must succeed"),
+                }
+                let requests = site.received_requests().await.expect("request recording is on");
+                assert!(
+                    requests[mark..].iter().any(|seen| seen.url.path() == at),
+                    "{route} must fetch {at}"
+                );
+                // ~keep The request for `/set` can send its own cookie on a later fetch of its own.
+                let sent = cookies_sent_since(&site, mark).await;
+                if at == "/after" && !sent.is_empty() {
+                    leaks.push(format!("{route} {} sent {sent:?}", body(at.to_owned())));
+                }
+            }
+        }
+
+        assert_eq!(
+            leaks,
+            Vec::<String>::new(),
+            "a request sent a cookie of an earlier request"
+        );
+    }
+
+    /// A rate limiter that counts the requests it admits.
+    struct CountingLimiter(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::traits::RateLimiter for CountingLimiter {
+        async fn acquire(&self, _domain: &str) -> Result<(), crate::error::CrawlError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn record_response(&self, _domain: &str, _status: u16) -> Result<(), crate::error::CrawlError> {
+            Ok(())
+        }
+
+        async fn set_crawl_delay(&self, _domain: &str, _delay: Duration) -> Result<(), crate::error::CrawlError> {
+            Ok(())
+        }
+    }
+
+    // ~keep The default throttle spaces the requests of one host. Each request has its own
+    // ~keep engine, so the throttle must be the one of the server.
+    #[tokio::test]
+    async fn sequential_download_requests_to_one_host_are_spaced_by_the_configured_delay() {
+        let site = cookie_site().await;
+        let config = CrawlConfig {
+            rate_limit_ms: Some(150),
+            ..local_test_config()
+        };
+        let engine = Arc::new(CrawlEngine::builder().config(config).build().expect("engine"));
+        let router = create_router_with_security(engine, ApiSecurityConfig::default());
+
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            let response = call(
+                router.clone(),
+                json_post(
+                    "/v1/download",
+                    serde_json::json!({ "url": format!("{}/page", site.uri()) }),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(4 * 150),
+            "5 requests to one host took {:?}, less than 4 delays of 150 ms",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_download_requests_to_one_host_are_spaced_by_the_configured_delay() {
+        let site = cookie_site().await;
+        let config = CrawlConfig {
+            rate_limit_ms: Some(150),
+            ..local_test_config()
+        };
+        let engine = Arc::new(CrawlEngine::builder().config(config).build().expect("engine"));
+        let router = create_router_with_security(engine, ApiSecurityConfig::default());
+        let download = || {
+            call(
+                router.clone(),
+                json_post(
+                    "/v1/download",
+                    serde_json::json!({ "url": format!("{}/page", site.uri()) }),
+                ),
+            )
+        };
+
+        let started = std::time::Instant::now();
+        let responses = tokio::join!(download(), download(), download(), download(), download());
+        let elapsed = started.elapsed();
+
+        for response in [responses.0, responses.1, responses.2, responses.3, responses.4] {
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert!(
+            elapsed >= Duration::from_millis(4 * 150),
+            "5 concurrent requests to one host took {elapsed:?}, less than 4 delays of 150 ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_routes_that_fetch_a_page_use_the_rate_limiter_of_the_server() {
+        let site = cookie_site().await;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Arc::new(
+            CrawlEngine::builder()
+                .config(local_test_config())
+                .rate_limiter(CountingLimiter(count.clone()))
+                .build()
+                .expect("engine"),
+        );
+        let router = create_router_with_security(engine, ApiSecurityConfig::default());
+        let calls = || count.load(std::sync::atomic::Ordering::SeqCst);
+
+        let mut silent = Vec::new();
+        for route in ["/v1/scrape", "/v1/download"] {
+            let before = calls();
+            let response = call(
+                router.clone(),
+                json_post(route, serde_json::json!({ "url": format!("{}/page", site.uri()) })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{route} must succeed");
+            if calls() == before {
+                silent.push(route);
+            }
+        }
+
+        assert_eq!(silent, Vec::<&str>::new(), "routes that did not call the rate limiter");
+    }
+
+    // ~keep Each map request reads robots.txt once for its sitemap hints, with no cache. The
+    // ~keep judgment of the seed URL uses the cache of the server, so it fetches once for all
+    // ~keep requests: 5 hint fetches and 1 judgment fetch, as before each request had an engine.
+    #[tokio::test]
+    async fn sequential_map_requests_judge_a_site_with_one_shared_robots_txt_fetch() {
+        let site = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("User-agent: *\nAllow: /\n", "text/plain"))
+            .mount(&site)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<html><body>page</body></html>", "text/html"))
+            .mount(&site)
+            .await;
+        let config = CrawlConfig {
+            respect_robots_txt: true,
+            rate_limit_ms: Some(0),
+            ..local_test_config()
+        };
+        let router = create_router_with_security(test_engine_with_config(config), ApiSecurityConfig::default());
+
+        for _ in 0..5 {
+            let response = call(
+                router.clone(),
+                json_post("/v1/map", serde_json::json!({ "url": format!("{}/page", site.uri()) })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let requests = site.received_requests().await.expect("request recording is on");
+        let robots = requests.iter().filter(|seen| seen.url.path() == "/robots.txt").count();
+        assert_eq!(
+            robots, 6,
+            "want 5 hint fetches and 1 shared judgment fetch, got {robots}"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_endpoint_answers_a_seed_robots_txt_disallows_as_forbidden() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/robots.txt"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("User-agent: *\nDisallow: /private\n")
+                    .append_header("content-type", "text/plain"),
+            )
+            .mount(&mock)
+            .await;
+        let config = CrawlConfig {
+            respect_robots_txt: true,
+            ..local_test_config()
+        };
+        let router = create_router_with_security(test_engine_with_config(config), ApiSecurityConfig::default());
+
+        let response = call(
+            router,
+            json_post(
+                "/v1/map",
+                serde_json::json!({ "url": format!("{}/private", mock.uri()) }),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a refusal is not a server fault"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "FORBIDDEN", "{body}");
+        assert_eq!(
+            body["error"]["message"], "forbidden: robots.txt disallows /private",
+            "{body}"
+        );
     }
 }

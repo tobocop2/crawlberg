@@ -9,10 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tower::{Layer, Service};
 
-use super::types::{CrawlRequest, CrawlResponse};
+use super::types::{CrawlRequest, CrawlResponse, ResponseBody};
 use crate::error::CrawlError;
 use crate::traits::CrawlCache;
-use crate::types::CachedPage;
+use crate::types::{CachedPage, CrawlConfig};
 
 /// The subset of `Cache-Control` response directives this cache acts on.
 ///
@@ -100,7 +100,13 @@ fn now_secs() -> u64 {
 const STATUS_NOT_MODIFIED: u16 = 304;
 
 /// Build a [`CrawlResponse`] that replays `cached`.
-fn response_from_cache(cached: CachedPage) -> CrawlResponse {
+///
+/// `sent_user_agent` is the agent the request pinned before this layer answered from cache
+/// (a caller earlier in the chain -- `RedirectPolicy::admits` -- may have chosen one for
+/// robots.txt group selection and forced it onto the request); a cache hit never reaches the
+/// UA rotation layer, but the caller's robots decision was still made for that agent, so the
+/// replayed response must report the same one rather than none.
+fn response_from_cache(cached: CachedPage, sent_user_agent: Option<String>) -> CrawlResponse {
     let mut headers = HashMap::new();
     if let Some(ref etag) = cached.etag {
         headers.insert("etag".to_owned(), vec![etag.clone()]);
@@ -108,14 +114,13 @@ fn response_from_cache(cached: CachedPage) -> CrawlResponse {
     if let Some(ref last_modified) = cached.last_modified {
         headers.insert("last-modified".to_owned(), vec![last_modified.clone()]);
     }
-    let body_bytes = cached.body.as_bytes().to_vec();
-    CrawlResponse {
-        status: cached.status_code,
-        content_type: cached.content_type,
-        body: cached.body,
-        body_bytes,
-        headers,
-    }
+    // ~keep The entry holds the text of the page. Its `Content-Type` and its `<meta>` tag still
+    // ~keep name the character set of the bytes it came from, so it must not be decoded again.
+    let body = ResponseBody::Text {
+        text: cached.body,
+        charset: cached.charset,
+    };
+    CrawlResponse::new(cached.status_code, cached.content_type, headers, body).with_sent_user_agent(sent_user_agent)
 }
 
 /// Attach the conditional-request headers that let the origin answer 304.
@@ -139,11 +144,22 @@ fn apply_validators(req: &mut CrawlRequest, cached: &CachedPage) -> bool {
 /// Tower layer that caches HTTP responses using a [`CrawlCache`].
 pub struct CrawlCacheLayer {
     cache: Arc<dyn CrawlCache>,
+    config: Option<Arc<CrawlConfig>>,
 }
 
 impl CrawlCacheLayer {
     pub fn new(cache: Arc<dyn CrawlCache>) -> Self {
-        Self { cache }
+        Self { cache, config: None }
+    }
+
+    /// Pass requests that carry `config`'s credentials straight through, uncached.
+    ///
+    /// ~keep A shared cache must not reuse a response to an authorized request (RFC 9111
+    /// ~keep section 3.5), and the cache key is the URL alone, so one caller's
+    /// ~keep authenticated page would be served to the next caller of the same URL.
+    pub fn bypassing_credentials(mut self, config: Arc<CrawlConfig>) -> Self {
+        self.config = Some(config);
+        self
     }
 }
 
@@ -154,6 +170,7 @@ impl<S: Clone> Layer<S> for CrawlCacheLayer {
         CrawlCacheService {
             inner,
             cache: self.cache.clone(),
+            config: self.config.clone(),
         }
     }
 }
@@ -163,6 +180,7 @@ impl<S: Clone> Layer<S> for CrawlCacheLayer {
 pub struct CrawlCacheService<S> {
     inner: S,
     cache: Arc<dyn CrawlCache>,
+    config: Option<Arc<CrawlConfig>>,
 }
 
 impl<S> Service<CrawlRequest> for CrawlCacheService<S>
@@ -183,18 +201,31 @@ where
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
         let url = req.url.clone();
+        let credentialed = self.config.as_deref().is_some_and(|config| {
+            url::Url::parse(&url).is_ok_and(|parsed| crate::net::credentials::is_credentialed(config, &parsed))
+        });
 
         Box::pin(async move {
+            if credentialed {
+                return inner.call(req).await;
+            }
             let mut req = req;
+            let sent_user_agent = req.headers.get("user-agent").cloned();
 
             // ~keep A fresh entry short-circuits; a stored-but-unusable one (expired, or
             // `no-cache`) is still worth a conditional request, so it is carried forward
             // to be validated rather than discarded.
             let revalidating = match cache.get(&url).await {
-                Ok(Some(cached)) if is_fresh(&cached, now_secs()) => return Ok(response_from_cache(cached)),
+                Ok(Some(cached)) if cached.decoded && is_fresh(&cached, now_secs()) => {
+                    return Ok(response_from_cache(cached, sent_user_agent));
+                }
                 Ok(Some(stale)) => Some(stale),
                 _ => cache.get_stale(&url).await.ok().flatten(),
             };
+            // ~keep An entry that an earlier release stored holds a lossy UTF-8 read of the page, so a page
+            // ~keep in another character set has lost its letters. It is not served and not
+            // ~keep revalidated (a 304 would keep its body): the page is fetched and stored again.
+            let revalidating = revalidating.filter(|cached| cached.decoded);
 
             let revalidating = revalidating.filter(|cached| apply_validators(&mut req, cached));
 
@@ -209,7 +240,7 @@ where
                     ..cached
                 };
                 let _ = cache.set(&url, &refreshed).await;
-                return Ok(response_from_cache(refreshed));
+                return Ok(response_from_cache(refreshed, resp.sent_user_agent.clone()));
             }
 
             if resp.status >= 200 && resp.status < 300 {
@@ -222,6 +253,12 @@ where
                 );
 
                 if directives.may_store() {
+                    // ~keep The cache holds text, not bytes, so the entry gets the text of the page:
+                    // ~keep the bytes decoded with the character set decided for them. A hit replays
+                    // ~keep that text, where a lossy UTF-8 read of the bytes lost every letter of a
+                    // ~keep page in another character set.
+                    let (text, charset) =
+                        crate::html::decode_page(resp.body_text(), &resp.content_type, &url, &resp.body_bytes);
                     let _ = cache
                         .set(
                             &url,
@@ -229,12 +266,14 @@ where
                                 url: url.clone(),
                                 status_code: resp.status,
                                 content_type: resp.content_type.clone(),
-                                body: resp.body.clone(),
+                                body: text.unwrap_or_else(|| resp.body.clone()),
                                 etag: resp.headers.get("etag").and_then(|v| v.first().cloned()),
                                 last_modified: resp.headers.get("last-modified").and_then(|v| v.first().cloned()),
                                 cached_at: now_secs(),
                                 max_age_secs: directives.max_age_secs,
                                 must_revalidate: directives.no_cache,
+                                charset,
+                                decoded: true,
                             },
                         )
                         .await;
@@ -255,9 +294,125 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::BodyText;
     use super::*;
     use crate::defaults::NoopCache;
     use tower::Service;
+
+    /// The JSON of an entry as 1.10.3 stored it: no `charset` and no `decoded`. Its body is the
+    /// lossy UTF-8 read of a Latin-1 page.
+    const ENTRY_FROM_1_10_3: &str = r#"{"url":"http://example.com/","status_code":200,
+        "content_type":"text/html; charset=iso-8859-1",
+        "body":"<p>caf\ufffd</p>",
+        "etag":"\"v1\"","last_modified":null,"cached_at":CACHED_AT}"#;
+
+    /// A service that answers every request with one Latin-1 page and keeps the requests it got.
+    #[derive(Clone, Default)]
+    struct LatinOrigin(std::sync::Arc<std::sync::Mutex<Vec<CrawlRequest>>>);
+    impl Service<CrawlRequest> for LatinOrigin {
+        type Response = CrawlResponse;
+        type Error = CrawlError;
+        type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<CrawlResponse, CrawlError>> + Send>>;
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: CrawlRequest) -> Self::Future {
+            self.0.lock().expect("lock").push(req);
+            Box::pin(async {
+                Ok(CrawlResponse::new(
+                    200,
+                    "text/html; charset=iso-8859-1".into(),
+                    HashMap::from([("cache-control".to_owned(), vec!["max-age=600".to_owned()])]),
+                    ResponseBody::Bytes(b"<p>caf\xe9</p>".to_vec()),
+                ))
+            })
+        }
+    }
+
+    /// An entry that 1.10.3 stored loads, and is not served: its body lost the letters of the
+    /// page. The page is fetched again, with no validator of the old entry, and stored as text.
+    #[tokio::test]
+    async fn an_entry_stored_before_the_upgrade_is_fetched_again_and_replaced() {
+        let stored = ENTRY_FROM_1_10_3.replace("CACHED_AT", &now_secs().to_string());
+        let entry: CachedPage = serde_json::from_str(&stored).expect("an entry of 1.10.3 must load");
+        assert!(!entry.decoded, "an entry without `decoded` must read as not decoded");
+        assert!(
+            is_fresh(&entry, now_secs()),
+            "the entry must be one the cache would serve by its age"
+        );
+
+        let cache = RecordingCache::default();
+        cache
+            .entries
+            .lock()
+            .expect("lock")
+            .insert("http://example.com/".to_owned(), entry);
+        let origin = LatinOrigin::default();
+        let mut service = CrawlCacheLayer::new(std::sync::Arc::new(cache.clone())).layer(origin.clone());
+        let response = service
+            .call(CrawlRequest::new("http://example.com/"))
+            .await
+            .expect("the fetch must succeed");
+
+        let requests = origin.0.lock().expect("lock");
+        assert_eq!(requests.len(), 1, "the old entry must not be served");
+        assert!(
+            !requests[0].headers.contains_key("if-none-match"),
+            "the old entry must not be revalidated: a 304 would keep its body"
+        );
+        assert_eq!(
+            response.body_bytes, b"<p>caf\xe9</p>",
+            "the response must be the origin's"
+        );
+        let replaced = cache.entries.lock().expect("lock")["http://example.com/"].clone();
+        assert_eq!(
+            replaced.body, "<p>caf\u{e9}</p>",
+            "the new entry must hold the text of the page"
+        );
+        assert!(replaced.decoded);
+        assert_eq!(replaced.charset.as_deref(), Some("iso-8859-1"));
+    }
+
+    /// The entry a hit replays is text: the header and the `<meta>` tag it still carries do not
+    /// decode it again.
+    #[test]
+    fn a_hit_is_text_that_is_not_decoded_again() {
+        let entry = CachedPage {
+            content_type: "text/html; charset=iso-8859-1".to_owned(),
+            body: "<meta charset=\"iso-8859-1\"><p>caf\u{e9}</p>".to_owned(),
+            decoded: true,
+            ..CachedPage::default()
+        };
+        let response = response_from_cache(entry, None);
+        assert_eq!(*response.body_text(), BodyText::Decoded { charset: None });
+        assert_eq!(
+            crate::html::decode_page(
+                response.body_text(),
+                &response.content_type,
+                "http://example.com/",
+                &response.body_bytes
+            ),
+            (None, None),
+            "the text of the entry must stay as it is"
+        );
+    }
+
+    #[test]
+    fn a_hit_reports_the_character_set_of_its_entry() {
+        let entry = CachedPage {
+            body: "<p>café</p>".to_owned(),
+            charset: Some("shift_jis".to_owned()),
+            ..CachedPage::default()
+        };
+        let stored = serde_json::to_string(&entry).expect("an entry must serialize");
+        let loaded: CachedPage = serde_json::from_str(&stored).expect("an entry must load");
+        assert_eq!(
+            *response_from_cache(loaded, None).body_text(),
+            BodyText::Decoded {
+                charset: Some("shift_jis".to_owned()),
+            }
+        );
+    }
 
     #[derive(Clone)]
     struct CountingService(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -271,13 +426,12 @@ mod tests {
         fn call(&mut self, _req: CrawlRequest) -> Self::Future {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Box::pin(async {
-                Ok(CrawlResponse {
-                    status: 200,
-                    content_type: "text/html".into(),
-                    body: "ok".into(),
-                    body_bytes: vec![],
-                    headers: HashMap::new(),
-                })
+                Ok(CrawlResponse::new(
+                    200,
+                    "text/html".into(),
+                    HashMap::new(),
+                    ResponseBody::Bytes(String::from("ok").into_bytes()),
+                ))
             })
         }
     }
@@ -320,6 +474,8 @@ mod tests {
         status: u16,
         headers: HashMap<String, Vec<String>>,
         seen_request_headers: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
+        /// The agent the origin reports back as actually sent, as a real fetch would.
+        sent_user_agent: Option<String>,
     }
 
     impl ScriptedService {
@@ -332,7 +488,14 @@ mod tests {
                 status,
                 headers,
                 seen_request_headers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sent_user_agent: None,
             }
+        }
+
+        /// Report `agent` back on the response, as the agent this hop's request pinned.
+        fn with_sent_user_agent(mut self, agent: &str) -> Self {
+            self.sent_user_agent = Some(agent.to_owned());
+            self
         }
     }
 
@@ -347,14 +510,15 @@ mod tests {
             *self.seen_request_headers.lock().expect("headers mutex") = req.headers.clone();
             let status = self.status;
             let headers = self.headers.clone();
+            let sent_user_agent = self.sent_user_agent.clone();
             Box::pin(async move {
-                Ok(CrawlResponse {
+                Ok(CrawlResponse::new(
                     status,
-                    content_type: "text/html".into(),
-                    body: "fresh from origin".into(),
-                    body_bytes: b"fresh from origin".to_vec(),
+                    "text/html".into(),
                     headers,
-                })
+                    ResponseBody::Bytes(b"fresh from origin".to_vec()),
+                )
+                .with_sent_user_agent(sent_user_agent))
             })
         }
     }
@@ -438,6 +602,77 @@ mod tests {
         );
     }
 
+    /// crawlberg#423: a cache hit never reaches the UA rotation layer, but a caller earlier
+    /// in the chain (`RedirectPolicy::admits`) may have pinned an agent onto the request for
+    /// its robots.txt decision. The replayed response must report that same agent back, not
+    /// none, or a downstream directive check would fall back to the configured default.
+    #[tokio::test]
+    async fn a_fresh_cache_hit_reports_the_agent_the_request_pinned() {
+        let cache = RecordingCache::default();
+        cache.entries.lock().expect("cache mutex").insert(
+            "http://a.com".to_owned(),
+            CachedPage {
+                url: "http://a.com".to_owned(),
+                status_code: 200,
+                content_type: "text/html".to_owned(),
+                body: "cached body".to_owned(),
+                etag: None,
+                last_modified: None,
+                cached_at: now_secs(),
+                max_age_secs: Some(600),
+                must_revalidate: false,
+                charset: None,
+                decoded: true,
+            },
+        );
+        let layer = CrawlCacheLayer::new(std::sync::Arc::new(cache));
+        let mut svc = layer.layer(ScriptedService::new(200, &[]));
+
+        let mut req = CrawlRequest::new("http://a.com");
+        req.headers.insert("user-agent".to_owned(), "AgentB".to_owned());
+        let resp = svc.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.sent_user_agent.as_deref(),
+            Some("AgentB"),
+            "a fresh cache hit must report the agent pinned on the request that looked it up"
+        );
+    }
+
+    /// crawlberg#423: the revalidated-hit call site must report the *origin's* answer to the
+    /// conditional request, not the request's own pin, since a 304 still comes from a live
+    /// fetch through the UA rotation layer.
+    #[tokio::test]
+    async fn a_revalidated_cache_hit_reports_the_agent_the_304_request_sent() {
+        let cache = RecordingCache::default();
+        cache.entries.lock().expect("cache mutex").insert(
+            "http://a.com".to_owned(),
+            CachedPage {
+                url: "http://a.com".to_owned(),
+                status_code: 200,
+                content_type: "text/html".to_owned(),
+                body: "stored body".to_owned(),
+                etag: Some("\"v1\"".to_owned()),
+                last_modified: None,
+                cached_at: now_secs(),
+                max_age_secs: None,
+                must_revalidate: true,
+                charset: None,
+                decoded: true,
+            },
+        );
+        let layer = CrawlCacheLayer::new(std::sync::Arc::new(cache));
+        let mut svc = layer.layer(ScriptedService::new(STATUS_NOT_MODIFIED, &[]).with_sent_user_agent("AgentB"));
+
+        let resp = svc.call(CrawlRequest::new("http://a.com")).await.unwrap();
+
+        assert_eq!(
+            resp.sent_user_agent.as_deref(),
+            Some("AgentB"),
+            "a revalidated cache hit must report the agent the 304 request actually sent"
+        );
+    }
+
     #[tokio::test]
     async fn a_cacheable_response_records_its_freshness_lifetime() {
         let cache = RecordingCache::default();
@@ -467,6 +702,8 @@ mod tests {
                 cached_at: now_secs(),
                 max_age_secs: None,
                 must_revalidate: true,
+                charset: None,
+                decoded: true,
             },
         );
         let layer = CrawlCacheLayer::new(std::sync::Arc::new(cache.clone()));
@@ -503,6 +740,8 @@ mod tests {
             cached_at: 1,
             max_age_secs: None,
             must_revalidate: false,
+            charset: None,
+            decoded: true,
         };
         cache
             .stale
@@ -556,6 +795,8 @@ mod tests {
                 cached_at: now_secs().saturating_sub(100),
                 max_age_secs: Some(10),
                 must_revalidate: false,
+                charset: None,
+                decoded: true,
             },
         );
         let layer = CrawlCacheLayer::new(std::sync::Arc::new(cache.clone()));
@@ -584,6 +825,8 @@ mod tests {
                 cached_at: now_secs(),
                 max_age_secs: Some(600),
                 must_revalidate: false,
+                charset: None,
+                decoded: true,
             },
         );
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

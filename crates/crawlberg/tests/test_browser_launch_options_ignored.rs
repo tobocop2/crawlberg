@@ -1,0 +1,397 @@
+//! `BrowserConfig.chrome_path` and `chrome_args` are ignored, with a warning, when no Chrome
+//! is launched from them: an external `browser.endpoint`, the native backend, and a scrape
+//! through a shared browser pool. Each test captures the warning the fetch logs. None of them
+//! needs Chrome.
+//!
+//! The `interact_on_*` tests below cover the same two warnings on the `interact()` entry
+//! point (`interact/chromiumoxide.rs` and `interact/native.rs`), which is a separate call
+//! site from `scrape()`'s and had no coverage of its own.
+
+#![cfg(any(feature = "browser", feature = "browser-native"))]
+
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crawlberg::{BrowserBackend, BrowserConfig, BrowserMode, CrawlConfig, PageAction, create_engine, interact, scrape};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tracing::instrument::WithSubscriber;
+
+const IGNORED_WARNING: &str = "browser.chrome_path and browser.chrome_args are ignored when";
+#[cfg(feature = "browser")]
+const IGNORED_PIPE_WARNING: &str = "browser.private_pipe is ignored when";
+const IGNORED_PROFILE_WARNING: &str = "browser_profile is ignored by interact";
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
+    }
+}
+
+fn capture_warnings() -> (CapturedLogs, tracing::Dispatch) {
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (logs, tracing::Dispatch::new(subscriber))
+}
+
+/// Launch options that would refuse the config if they were checked: the path does not exist.
+fn ignored_launch_options(browser: BrowserConfig) -> BrowserConfig {
+    BrowserConfig {
+        mode: BrowserMode::Always,
+        timeout: Duration::from_secs(5),
+        overall_timeout: Duration::from_secs(10),
+        chrome_path: Some("/nonexistent/crawlberg-ignored-chrome".into()),
+        chrome_args: vec!["--user-agent=crawlberg-ignored".to_owned()],
+        ..browser
+    }
+}
+
+async fn start_page_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("test server should bind");
+    let addr = listener.local_addr().expect("test server should have local addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let body = "<html><body><p>ignored-launch-options-page</p></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[cfg(feature = "browser")]
+async fn start_rejected_cdp_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("CDP endpoint should bind");
+    let addr = listener.local_addr().expect("CDP endpoint should have local addr");
+    let handshake = tokio::spawn(async move {
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("interact should connect to the test CDP endpoint")
+            .expect("the test CDP endpoint should accept the connection");
+        let mut prefix = [0_u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut prefix))
+            .await
+            .expect("interact should send the CDP websocket handshake")
+            .expect("the CDP websocket handshake should be readable");
+        assert_eq!(
+            prefix, *b"GET ",
+            "the CDP connection should begin with a websocket handshake"
+        );
+        stream.shutdown().await.expect("the test CDP endpoint should close");
+    });
+    (format!("ws://{addr}/devtools/browser/crawlberg-test"), handshake)
+}
+
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn an_external_endpoint_ignores_the_launch_options_with_a_warning() {
+    // ~keep Nothing listens on port 1, so the connect fails after the warning is logged.
+    let config = CrawlConfig {
+        browser: ignored_launch_options(BrowserConfig {
+            backend: BrowserBackend::Chromiumoxide,
+            endpoint: Some("ws://127.0.0.1:1/devtools/browser/crawlberg-test".to_owned()),
+            ..BrowserConfig::default()
+        }),
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("an endpoint config must not be refused for ignored options");
+        let url = start_page_server().await;
+        let _ = scrape(&engine, &url).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_WARNING) && logs.contains("browser.endpoint"),
+        "the endpoint path must warn that the launch options are ignored; logs: {logs}"
+    );
+}
+
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn the_native_backend_ignores_the_launch_options_with_a_warning() {
+    let config = CrawlConfig {
+        browser: ignored_launch_options(BrowserConfig {
+            backend: BrowserBackend::Native,
+            ..BrowserConfig::default()
+        }),
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("a native config must not be refused for ignored options");
+        let url = start_page_server().await;
+        let _ = scrape(&engine, &url).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_WARNING) && logs.contains("native browser backend"),
+        "the native path must warn that the launch options are ignored; logs: {logs}"
+    );
+}
+
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn a_shared_browser_pool_ignores_the_launch_options_with_a_warning() {
+    // ~keep The pool's own chrome_path does not exist, so page acquisition fails without
+    // ~keep Chrome, after the per-fetch warning is logged.
+    let pool = crawlberg::BrowserPool::new(crawlberg::BrowserPoolConfig {
+        chrome_path: Some("/nonexistent/crawlberg-pool-chrome".into()),
+        ..crawlberg::BrowserPoolConfig::default()
+    });
+    // ~keep The config's own chrome_path stays unset: `interact()` ignores the pool and
+    // ~keep launches from these fields, so validation still checks them with a pool.
+    let config = CrawlConfig {
+        browser: BrowserConfig {
+            chrome_path: None,
+            ..ignored_launch_options(BrowserConfig {
+                backend: BrowserBackend::Chromiumoxide,
+                session_affinity: false,
+                ..BrowserConfig::default()
+            })
+        },
+        browser_pool: Some(pool),
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("a pooled config with valid launch options must build");
+        let url = start_page_server().await;
+        let _ = scrape(&engine, &url).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_WARNING) && logs.contains("browser_pool"),
+        "the pool path must warn that the launch options are ignored; logs: {logs}"
+    );
+}
+
+/// A scrape on a shared pool uses the pool's `private_pipe`. The key of the fetch is ignored with
+/// a warning when it is on and the pool's is off; a fetch that sets nothing gets no warning.
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn a_shared_browser_pool_ignores_the_private_pipe_key_with_a_warning() {
+    for (private_pipe, warns) in [(true, true), (false, false)] {
+        // ~keep The pool's own chrome_path does not exist, so page acquisition fails without Chrome.
+        let pool = crawlberg::BrowserPool::new(crawlberg::BrowserPoolConfig {
+            chrome_path: Some("/nonexistent/crawlberg-pool-chrome".into()),
+            ..crawlberg::BrowserPoolConfig::default()
+        });
+        let config = CrawlConfig {
+            browser: BrowserConfig {
+                mode: BrowserMode::Always,
+                timeout: Duration::from_secs(5),
+                overall_timeout: Duration::from_secs(10),
+                backend: BrowserBackend::Chromiumoxide,
+                session_affinity: false,
+                private_pipe,
+                ..BrowserConfig::default()
+            },
+            browser_pool: Some(pool),
+            ..CrawlConfig::builder().allow_private_networks(true).build()
+        };
+        let (logs, subscriber) = capture_warnings();
+        async {
+            let engine = create_engine(Some(config)).expect("a pooled config must build");
+            let url = start_page_server().await;
+            let _ = scrape(&engine, &url).await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = logs.text();
+        assert_eq!(
+            logs.contains(IGNORED_PIPE_WARNING) && logs.contains("browser_pool"),
+            warns,
+            "private_pipe {private_pipe}: the pool path must warn only for a key that is on; logs: {logs}"
+        );
+    }
+}
+
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn interact_on_an_external_endpoint_ignores_the_launch_options_with_a_warning() {
+    // ~keep Nothing listens on port 1, so the connect fails after the warning is logged.
+    let config = CrawlConfig {
+        browser: ignored_launch_options(BrowserConfig {
+            backend: BrowserBackend::Chromiumoxide,
+            endpoint: Some("ws://127.0.0.1:1/devtools/browser/crawlberg-test".to_owned()),
+            ..BrowserConfig::default()
+        }),
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("an endpoint config must not be refused for ignored options");
+        let url = start_page_server().await;
+        let _ = interact(&engine, &url, vec![PageAction::Scrape]).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_WARNING) && logs.contains("browser.endpoint"),
+        "interact() on the endpoint path must warn that the launch options are ignored; logs: {logs}"
+    );
+}
+
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn chromiumoxide_interact_ignores_a_browser_profile_with_a_warning() {
+    let (endpoint, handshake) = start_rejected_cdp_endpoint().await;
+    let config = CrawlConfig {
+        browser: BrowserConfig {
+            backend: BrowserBackend::Chromiumoxide,
+            endpoint: Some(endpoint),
+            mode: BrowserMode::Always,
+            timeout: Duration::from_secs(5),
+            overall_timeout: Duration::from_secs(10),
+            ..BrowserConfig::default()
+        },
+        browser_profile: Some("ignored-interact-profile".to_owned()),
+        save_browser_profile: true,
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("an interact profile config must build");
+        let url = start_page_server().await;
+        let _ = interact(&engine, &url, vec![PageAction::Scrape]).await;
+        handshake.await.expect("the test CDP endpoint task should finish");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_PROFILE_WARNING) && logs.contains("ignored-interact-profile"),
+        "interact() must warn that the named profile is ignored; logs: {logs}"
+    );
+}
+
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn native_interact_ignores_a_browser_profile_with_a_warning() {
+    let config = CrawlConfig {
+        browser: BrowserConfig {
+            backend: BrowserBackend::Native,
+            mode: BrowserMode::Always,
+            timeout: Duration::from_secs(5),
+            overall_timeout: Duration::from_secs(10),
+            ..BrowserConfig::default()
+        },
+        browser_profile: Some("ignored-native-interact-profile".to_owned()),
+        save_browser_profile: true,
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("a native interact profile config must build");
+        let url = start_page_server().await;
+        let _ = interact(&engine, &url, vec![PageAction::Scrape]).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_PROFILE_WARNING) && logs.contains("ignored-native-interact-profile"),
+        "native interact() must warn that the named profile is ignored; logs: {logs}"
+    );
+}
+
+#[cfg(feature = "browser-native")]
+#[tokio::test]
+async fn interact_on_the_native_backend_ignores_the_launch_options_with_a_warning() {
+    let config = CrawlConfig {
+        browser: ignored_launch_options(BrowserConfig {
+            backend: BrowserBackend::Native,
+            ..BrowserConfig::default()
+        }),
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("a native config must not be refused for ignored options");
+        let url = start_page_server().await;
+        let _ = interact(&engine, &url, vec![PageAction::Scrape]).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_WARNING) && logs.contains("native browser backend"),
+        "interact() on the native path must warn that the launch options are ignored; logs: {logs}"
+    );
+}
+
+#[cfg(feature = "browser")]
+#[tokio::test]
+async fn the_ignored_launch_options_warning_gives_only_the_number_of_flags() {
+    const SECRET: &str = "sk-live-9f8e7d6c5b4a";
+    // ~keep Nothing listens on port 1, so the connect fails after the warning is logged.
+    let config = CrawlConfig {
+        browser: BrowserConfig {
+            chrome_args: vec![format!("--proxy-server=http://user:{SECRET}@proxy.internal:8080")],
+            ..ignored_launch_options(BrowserConfig {
+                backend: BrowserBackend::Chromiumoxide,
+                endpoint: Some("ws://127.0.0.1:1/devtools/browser/crawlberg-test".to_owned()),
+                ..BrowserConfig::default()
+            })
+        },
+        ..CrawlConfig::builder().allow_private_networks(true).build()
+    };
+    let (logs, subscriber) = capture_warnings();
+    async {
+        let engine = create_engine(Some(config)).expect("an endpoint config must not be refused for ignored options");
+        let url = start_page_server().await;
+        let _ = scrape(&engine, &url).await;
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let logs = logs.text();
+    assert!(
+        logs.contains(IGNORED_WARNING) && logs.contains("chrome_args=1 flags"),
+        "the warning must give the number of flags; logs: {logs}"
+    );
+    assert!(
+        !logs.contains(SECRET) && !logs.contains("--proxy-server"),
+        "the warning printed a flag value; logs: {logs}"
+    );
+}

@@ -59,7 +59,7 @@ fn validate_url(url: &str) -> Result<(), ApiError> {
     if url.is_empty() {
         return Err(ApiError::bad_request("url is required"));
     }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    if !crate::net::has_http_scheme(url) {
         return Err(ApiError::bad_request("url must start with http:// or https://"));
     }
     if url.len() > 8192 {
@@ -165,9 +165,7 @@ pub async fn scrape_handler(
         validate_formats(formats)?;
     }
 
-    let mut config = state.engine.config.clone();
-    apply_scrape_overrides(&mut config, &req)?;
-    let engine = rebuild_engine_with_config(&state.engine, config)?;
+    let engine = state.request_engine(|config| apply_scrape_overrides(config, &req))?;
 
     let result = engine.scrape(&req.url).await?;
     let mut value =
@@ -196,11 +194,9 @@ pub async fn crawl_handler(
     if let Some(pages) = req.max_pages {
         validate_max_pages(pages, state.security.max_pages_ceiling)?;
     }
-    ensure_job_capacity(&state)?;
 
-    let mut config = state.engine.config.clone();
-    apply_crawl_overrides(&mut config, &req);
-    let crawl_engine = rebuild_engine_with_config(&state.engine, config)?;
+    let crawl_engine = state.request_engine(|config| apply_crawl_overrides(config, &req))?;
+    ensure_job_capacity(&state)?;
 
     let job_id = state.jobs.create_job();
     spawn_crawl_job(job_id, state.jobs.clone(), crawl_engine, req.url.clone());
@@ -214,9 +210,28 @@ pub async fn crawl_handler(
     ))
 }
 
+/// Validate caller-supplied `include_paths`/`exclude_paths` before creating a crawl job.
+///
+/// ~keep Such a pattern runs on a backtracking engine, and its cost grows faster than linearly
+/// with the URL. A REST caller is not trusted to choose one. Patterns in the server's own config
+/// are not checked here: they come from the operator.
+fn validate_caller_path_patterns(field: &str, patterns: &[String]) -> Result<(), ApiError> {
+    for (index, pattern) in patterns.iter().enumerate() {
+        let compiled = crate::helpers::PathPattern::new(pattern)
+            .map_err(|_| ApiError::bad_request(format!("{field}[{index}] does not compile")))?;
+        if compiled.needs_backtracking() {
+            return Err(ApiError::bad_request(format!(
+                "{field}[{index}] uses look-around or a backreference, \
+                 which the REST API does not accept"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Apply `CrawlRequest` overrides to a crawl config. Mirrors the fields
 /// `scrape`/`map` honor so REST exposes the same crawl-shaping knobs consistently.
-fn apply_crawl_overrides(config: &mut CrawlConfig, req: &CrawlRequest) {
+fn apply_crawl_overrides(config: &mut CrawlConfig, req: &CrawlRequest) -> Result<(), ApiError> {
     if let Some(depth) = req.max_depth {
         config.max_depth = Some(depth);
     }
@@ -227,14 +242,26 @@ fn apply_crawl_overrides(config: &mut CrawlConfig, req: &CrawlRequest) {
         config.content.preprocessing_preset = "aggressive".to_owned();
     }
     if let Some(ref includes) = req.include_paths {
+        validate_caller_path_patterns("includePaths", includes)?;
         config.include_paths = includes.clone();
     }
     if let Some(ref excludes) = req.exclude_paths {
+        validate_caller_path_patterns("excludePaths", excludes)?;
         config.exclude_paths = excludes.clone();
+    }
+    if let Some(match_query) = req.path_patterns_match_query {
+        config.path_patterns_match_query = match_query;
+    }
+    if let Some(match_url) = req.path_patterns_match_url {
+        config.path_patterns_match_url = match_url;
     }
     if let Some(stay) = req.stay_on_domain {
         config.stay_on_domain = stay;
     }
+    if let Some(respect_robots_txt) = req.respect_robots_txt {
+        config.respect_robots_txt = respect_robots_txt;
+    }
+    Ok(())
 }
 
 /// Spawn the background task that runs a crawl job to completion and records
@@ -347,19 +374,18 @@ pub async fn map_handler(
 ) -> Result<impl IntoResponse, ApiError> {
     validate_url(&req.url)?;
 
-    let mut result = if let Some(respect_robots_txt) = req.respect_robots_txt {
-        let mut config = state.engine.config.clone();
-        config.respect_robots_txt = respect_robots_txt;
-        let engine = rebuild_engine_with_config(&state.engine, config)?;
-        engine.map(&req.url).await?
-    } else {
-        state.engine.map(&req.url).await?
-    };
-
-    if let Some(ref search) = req.search {
-        let term = search.to_lowercase();
-        result.urls.retain(|u| u.url.to_lowercase().contains(&term));
-    }
+    // ~keep `search` becomes `map_search`, so this endpoint matches a term the same way as the
+    // ~keep CLI and the MCP `map` tool.
+    let engine = state.request_engine(|config| {
+        if let Some(respect_robots_txt) = req.respect_robots_txt {
+            config.respect_robots_txt = respect_robots_txt;
+        }
+        if let Some(search) = &req.search {
+            config.map_search = Some(search.clone());
+        }
+        Ok(())
+    })?;
+    let mut result = engine.map(&req.url).await?;
 
     if let Some(limit) = req.limit {
         result.urls.truncate(limit);
@@ -400,14 +426,15 @@ pub async fn batch_scrape_handler(
     }
     ensure_job_capacity(&state)?;
 
-    let mut config = state.engine.config.clone();
-    if let Some(true) = req.only_main_content {
-        config.content.preprocessing_preset = "aggressive".to_owned();
-    }
-    if let Some(concurrency) = req.concurrency {
-        config.max_concurrent = Some(concurrency);
-    }
-    let engine = rebuild_engine_with_config(&state.engine, config)?;
+    let engine = state.request_engine(|config| {
+        if let Some(true) = req.only_main_content {
+            config.content.preprocessing_preset = "aggressive".to_owned();
+        }
+        if let Some(concurrency) = req.concurrency {
+            config.max_concurrent = Some(concurrency);
+        }
+        Ok(())
+    })?;
 
     let job_id = state.jobs.create_job();
     spawn_batch_scrape_job(job_id, state.jobs.clone(), engine, req.urls.clone());
@@ -503,15 +530,14 @@ pub async fn download_handler(
 ) -> Result<impl IntoResponse, ApiError> {
     validate_url(&req.url)?;
 
-    let result = if let Some(max_size) = req.max_size {
-        let mut config = state.engine.config.clone();
-        config.download_documents = true;
-        config.document_max_size = Some(max_size);
-        let engine = rebuild_engine_with_config(&state.engine, config)?;
-        engine.scrape(&req.url).await?
-    } else {
-        state.engine.scrape(&req.url).await?
-    };
+    let engine = state.request_engine(|config| {
+        if let Some(max_size) = req.max_size {
+            config.download_documents = true;
+            config.document_max_size = Some(max_size);
+        }
+        Ok(())
+    })?;
+    let result = engine.scrape(&req.url).await?;
 
     let value = serde_json::to_value(&result).map_err(|e| ApiError::internal(format!("serialization error: {e}")))?;
 
@@ -587,17 +613,63 @@ fn job_state_to_response(state: &JobState) -> JobStatusResponse {
     }
 }
 
-/// Build a new [`CrawlEngine`] with an overridden [`CrawlConfig`], keeping all
-/// trait implementations from the original engine.
-///
-/// This is used to apply per-request config overrides (max_depth, max_pages, etc.)
-/// without mutating the shared engine.
-fn rebuild_engine_with_config(
-    _engine: &crate::engine::CrawlEngine,
-    config: CrawlConfig,
-) -> Result<crate::engine::CrawlEngine, ApiError> {
-    crate::engine::CrawlEngine::builder()
-        .config(config)
-        .build()
-        .map_err(|e| ApiError::bad_request(format!("invalid config override: {e}")))
+#[cfg(test)]
+mod tests {
+    use super::{apply_crawl_overrides, validate_url};
+    use crate::api::types::CrawlRequest;
+    use crate::types::CrawlConfig;
+
+    #[test]
+    fn accepts_an_upper_case_scheme() {
+        assert!(validate_url("HTTP://example.com/").is_ok());
+        assert!(validate_url("Https://example.com/").is_ok());
+    }
+
+    #[test]
+    fn rejects_an_empty_url() {
+        assert!(validate_url("").is_err());
+    }
+
+    #[test]
+    fn rejects_a_non_http_scheme() {
+        assert!(validate_url("ftp://example.com/").is_err());
+    }
+
+    #[test]
+    fn crawl_overrides_preserve_server_defaults_when_fields_are_omitted() {
+        let request: CrawlRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com"
+        }))
+        .expect("minimal crawl request");
+        let mut config = CrawlConfig {
+            respect_robots_txt: true,
+            path_patterns_match_query: true,
+            path_patterns_match_url: true,
+            ..CrawlConfig::default()
+        };
+
+        apply_crawl_overrides(&mut config, &request).expect("omitted fields preserve defaults");
+
+        assert!(config.respect_robots_txt);
+        assert!(config.path_patterns_match_query);
+        assert!(config.path_patterns_match_url);
+    }
+
+    #[test]
+    fn crawl_overrides_apply_robots_and_path_pattern_target_fields() {
+        let request: CrawlRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com",
+            "respectRobotsTxt": true,
+            "pathPatternsMatchQuery": true,
+            "pathPatternsMatchUrl": true
+        }))
+        .expect("crawl request with policy overrides");
+        let mut config = CrawlConfig::default();
+
+        apply_crawl_overrides(&mut config, &request).expect("policy overrides are valid");
+
+        assert!(config.respect_robots_txt);
+        assert!(config.path_patterns_match_query);
+        assert!(config.path_patterns_match_url);
+    }
 }

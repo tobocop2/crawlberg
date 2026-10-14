@@ -22,21 +22,33 @@ const NETWORK_IDLE_POLL_WITHOUT_JS: std::time::Duration = std::time::Duration::f
 const NETWORK_IDLE0_THRESHOLD: u32 = 0;
 const NETWORK_IDLE2_THRESHOLD: u32 = 2;
 impl Page {
+    /// Load one document, following at most `max_redirects` HTTP redirects to it (the client's
+    /// cap when `None`), and return how many it followed.
     pub(super) async fn navigate_single(
         &mut self,
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
-    ) -> Result<(), PageError> {
+        max_redirects: Option<usize>,
+    ) -> Result<usize, PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        let initiator = self.url.clone();
+        // ~keep Refused before robots.txt or the document is fetched, and before the URL is
+        // ~keep recorded as the page's own, so nothing downstream sees the userinfo.
+        crate::net::credential::refuse_userinfo(&url).map_err(|e| PageError::NetworkError(e.to_string()))?;
 
         self.lifecycle = LifecycleState::Loading;
         self.url = Some(url.clone());
+        self.document_base_url = None;
         self.network_events.clear();
 
-        self.enforce_robots(&url).await?;
-        let response = self.fetch_document(&url, method, body).await?;
+        self.enforce_robots(&url, initiator.as_ref()).await?;
+        let response = self
+            .fetch_document(&url, method, body, max_redirects, initiator.as_ref())
+            .await?;
+        let redirects = response.redirected_from.len();
+        self.unfollowed_redirect = unfollowed_redirect(&response);
 
         self.record_network_event(
             url.as_str(),
@@ -51,8 +63,17 @@ impl Page {
             self.url = Some(response.url.clone());
         }
 
-        let body_text = String::from_utf8_lossy(&response.body).to_string();
+        let (body_text, charset) = match self.document_decoder {
+            Some(decode) => decode(
+                response.content_type().unwrap_or_default(),
+                response.url.as_str(),
+                &response.body,
+            ),
+            None => (String::from_utf8_lossy(&response.body).into_owned(), None),
+        };
+        self.document_charset = charset;
         let dom = parse_html(&body_text);
+        self.document_base_url = self.base_url_from_dom(&dom);
         self.title = dom
             .query_selector("title")
             .ok()
@@ -67,7 +88,7 @@ impl Page {
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             self.init_js();
-            return Ok(());
+            return Ok(redirects);
         }
 
         self.init_js();
@@ -86,13 +107,30 @@ impl Page {
         self.lifecycle = LifecycleState::Loaded;
         self.wait_for_network_idle(wait_until).await;
 
-        Ok(())
+        Ok(redirects)
+    }
+
+    fn base_url_from_dom(&self, dom: &DomTree) -> Option<Url> {
+        let page_url = self.url.as_ref()?;
+        let href = dom
+            .query_selector_all("base")
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|node_id| dom.get_node(node_id)?.get_attribute("href").map(str::to_owned));
+        let Some(href) = href else {
+            return Some(page_url.clone());
+        };
+        Url::options()
+            .base_url(Some(page_url))
+            .parse(&href)
+            .ok()
+            .or_else(|| Some(page_url.clone()))
     }
 
     /// Apply the context's `robots.txt` policy, fetching and caching the file on first use.
     ///
     /// Does nothing when `obey_robots` is off or the URL has no host.
-    async fn enforce_robots(&mut self, url: &Url) -> Result<(), PageError> {
+    async fn enforce_robots(&mut self, url: &Url, initiator: Option<&Url>) -> Result<(), PageError> {
         if !self.context.obey_robots || url.host_str().is_none() {
             return Ok(());
         }
@@ -104,7 +142,7 @@ impl Page {
         if self.context.robots_cache.is_allowed(&origin, "/robots.txt") {
             let robots_url = format!("{origin}/robots.txt");
             if let Ok(robots_url) = Url::parse(&robots_url)
-                && let Ok(resp) = self.http_client.fetch(&robots_url).await
+                && let Ok(resp) = self.http_client.fetch_subresource(&robots_url, initiator).await
                 && resp.status == ROBOTS_OK_STATUS
             {
                 let body = String::from_utf8_lossy(&resp.body);
@@ -121,15 +159,30 @@ impl Page {
         Ok(())
     }
 
-    async fn fetch_document(&mut self, url: &Url, method: &str, body: &str) -> Result<Response, PageError> {
+    async fn fetch_document(
+        &mut self,
+        url: &Url,
+        method: &str,
+        body: &str,
+        max_redirects: Option<usize>,
+        initiator: Option<&Url>,
+    ) -> Result<Response, PageError> {
         let result = if method == "POST" {
-            self.http_client.post_form(url, body).await
+            self.http_client
+                .fetch_following_from(
+                    reqwest::Method::POST,
+                    url,
+                    Some(body.as_bytes().to_vec()),
+                    max_redirects,
+                    initiator,
+                )
+                .await
         } else {
-            self.do_fetch(url).await
+            self.do_fetch_from(url, max_redirects, initiator).await
         };
         result.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
-            PageError::NetworkError(e.to_string())
+            PageError::from(e)
         })
     }
 
@@ -151,7 +204,14 @@ impl Page {
 
         let mut allowed = Vec::new();
         for href in &hrefs {
-            let full_url = self.resolve_subresource_url(href);
+            let Some(full_url) = self.resolve_subresource_url(href) else {
+                tracing::debug!(
+                    "skipping unparseable <link rel=stylesheet href>: page={} href_len={}",
+                    self.url_string(),
+                    href.len(),
+                );
+                continue;
+            };
             if !subresource_allowed(self.url.as_ref(), &full_url) {
                 tracing::warn!(
                     "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
@@ -171,15 +231,15 @@ impl Page {
 
     /// Fetch every permitted stylesheet concurrently and record a network event for each.
     async fn load_stylesheets(&mut self, dom: &DomTree) -> Vec<String> {
-        let client = self.http_client.clone();
+        let page = &*self;
         let css_futures: Vec<_> = self
             .allowed_stylesheet_urls(dom)
             .into_iter()
-            .map(|url_str| {
-                let client = client.clone();
+            .map(move |url_str| {
+                let page = page;
                 async move {
                     let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                    match client.fetch(&parsed).await {
+                    match page.do_fetch_subresource(&parsed).await {
                         Ok(resp) => Some((url_str, resp)),
                         Err(e) => {
                             tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
@@ -266,5 +326,112 @@ impl Page {
         }
 
         self.lifecycle = LifecycleState::NetworkIdle;
+    }
+}
+
+fn unfollowed_redirect(response: &Response) -> Option<PageError> {
+    const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
+    if !REDIRECT_STATUSES.contains(&response.status) {
+        return None;
+    }
+    let target = response.url.join(response.headers.get("location")?).ok()?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return None;
+    }
+    let target = crate::net::credential::without_userinfo(&target);
+    let visited = crate::net::credential::without_userinfo(&response.url) == target
+        || response
+            .redirected_from
+            .iter()
+            .any(|url| crate::net::credential::without_userinfo(url) == target);
+    Some(PageError::UnfollowedRedirect { target, visited })
+}
+
+#[cfg(test)]
+mod redirect_error_tests {
+    use super::*;
+
+    #[test]
+    fn should_return_no_unfollowed_redirect_for_success_with_location() {
+        let response = Response {
+            url: Url::parse("http://example.test/a").expect("response URL"),
+            status: 200,
+            headers: std::collections::HashMap::from([("location".to_owned(), "/b".to_owned())]),
+            body: Vec::new(),
+            redirected_from: Vec::new(),
+        };
+        assert_eq!(unfollowed_redirect(&response).map(|error| error.to_string()), None);
+    }
+
+    #[test]
+    fn should_return_no_unfollowed_redirect_for_non_http_location() {
+        for location in [
+            "mailto:help@example.test",
+            "javascript:alert(1)",
+            "data:text/plain,redirect",
+        ] {
+            let response = Response {
+                url: Url::parse("http://example.test/a").expect("response URL"),
+                status: 301,
+                headers: std::collections::HashMap::from([("location".to_owned(), location.to_owned())]),
+                body: Vec::new(),
+                redirected_from: Vec::new(),
+            };
+            assert_eq!(
+                unfollowed_redirect(&response).map(|error| error.to_string()),
+                None,
+                "location: {location}",
+            );
+        }
+    }
+
+    #[test]
+    fn should_return_no_unfollowed_redirect_without_location() {
+        let response = Response {
+            url: Url::parse("http://example.test/a").expect("response URL"),
+            status: 301,
+            headers: std::collections::HashMap::new(),
+            body: Vec::new(),
+            redirected_from: Vec::new(),
+        };
+        assert_eq!(unfollowed_redirect(&response).map(|error| error.to_string()), None);
+    }
+
+    #[test]
+    fn should_compare_credential_free_canonical_redirect_keys() {
+        for (earlier, location, visited) in [
+            (
+                "http://old:secret@EXAMPLE.test/b#part",
+                "http://user:pass@example.test/b#part",
+                true,
+            ),
+            (
+                "http://example.test/b#part",
+                "http://user:pass@example.test/b#other",
+                false,
+            ),
+            ("http://EXAMPLE.test", "http://user:pass@example.test/", true),
+        ] {
+            let response = Response {
+                url: Url::parse("http://example.test/a").expect("response URL"),
+                status: 301,
+                headers: std::collections::HashMap::from([("location".to_owned(), location.to_owned())]),
+                body: Vec::new(),
+                redirected_from: vec![Url::parse(earlier).expect("earlier URL")],
+            };
+            let expected = crate::net::credential::without_userinfo(&Url::parse(location).expect("target"));
+            match unfollowed_redirect(&response).expect("a pending redirect") {
+                PageError::UnfollowedRedirect {
+                    target,
+                    visited: actual,
+                } => {
+                    assert_eq!(target, expected);
+                    assert_eq!(actual, visited, "earlier: {earlier}, location: {location}");
+                    assert_eq!(target.username(), "");
+                    assert_eq!(target.password(), None);
+                }
+                error => panic!("unexpected redirect error: {error:?}"),
+            }
+        }
     }
 }

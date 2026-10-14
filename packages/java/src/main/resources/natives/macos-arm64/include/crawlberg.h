@@ -296,6 +296,7 @@ enum CBERGAlefFfiErrorCode
   CbergAlefUnknown = 2,
   CbergAlefPanic = 3,
   CbergAlefInvalidHandle = 4,
+  CbergAlefCancelled = 5,
 };
 #if __STDC_VERSION__ >= 202311L
 typedef enum CBERGAlefFfiErrorCode CBERGAlefFfiErrorCode;
@@ -330,6 +331,15 @@ int32_t cberg_last_error_code(void);
 const char *cberg_last_error_context(void);
 
 /**
+ * Return the variant name of the last typed error, such as `RateLimited`.
+ * The pointer is NULL when the last error did not come from a typed error
+ * value, and is borrowed and valid until the next FFI call on this thread. #
+ * Safety Caller must ensure all pointer arguments are valid or null. The
+ * returned pointer is borrowed from thread-local storage and must NOT be freed.
+ */
+const char *cberg_last_error_variant(void);
+
+/**
  * Free a string previously returned by this library.
  * # Safety
  * Pointer must have been returned by this library, or be null.
@@ -359,6 +369,25 @@ const char *cberg_version(void);
 CBERGAlefHandle
 cberg_crawl_engine_handle_crawl_stream_start(CBERGAlefHandle client,
                                              CBERGAlefHandle req);
+
+/**
+ * Start a streaming chat completion that a cancel token can abort, and return
+ * an opaque iterator handle.
+ *
+ * Behaves exactly like `cberg_crawl_engine_handle_crawl_stream_start`, and
+ * additionally tripping `alef_cancel_token` (created by
+ * `cberg_cancel_token_new`, `0` for none) aborts both the stream-open request
+ * and any later blocking `cberg_crawl_engine_handle_crawl_stream_next` call on
+ * the returned handle: each returns null with last-error code `Cancelled`. The
+ * handle keeps its own reference to the token, so the token may be freed before
+ * the handle is.
+ *
+ * # Safety
+ * Same contract as `cberg_crawl_engine_handle_crawl_stream_start`.
+ */
+CBERGAlefHandle cberg_crawl_engine_handle_crawl_stream_start_cancellable(
+    CBERGAlefHandle client, CBERGAlefHandle req,
+    CBERGAlefHandle alef_cancel_token);
 
 /**
  * Advance the stream and return a heap-allocated chunk, or null.
@@ -411,6 +440,25 @@ void cberg_crawl_engine_handle_crawl_stream_free(CBERGAlefHandle handle);
 CBERGAlefHandle
 cberg_crawl_engine_handle_batch_crawl_stream_start(CBERGAlefHandle client,
                                                    CBERGAlefHandle req);
+
+/**
+ * Start a streaming chat completion that a cancel token can abort, and return
+ * an opaque iterator handle.
+ *
+ * Behaves exactly like `cberg_crawl_engine_handle_batch_crawl_stream_start`,
+ * and additionally tripping `alef_cancel_token` (created by
+ * `cberg_cancel_token_new`, `0` for none) aborts both the stream-open request
+ * and any later blocking `cberg_crawl_engine_handle_batch_crawl_stream_next`
+ * call on the returned handle: each returns null with last-error code
+ * `Cancelled`. The handle keeps its own reference to the token, so the token
+ * may be freed before the handle is.
+ *
+ * # Safety
+ * Same contract as `cberg_crawl_engine_handle_batch_crawl_stream_start`.
+ */
+CBERGAlefHandle cberg_crawl_engine_handle_batch_crawl_stream_start_cancellable(
+    CBERGAlefHandle client, CBERGAlefHandle req,
+    CBERGAlefHandle alef_cancel_token);
 
 /**
  * Advance the stream and return a heap-allocated chunk, or null.
@@ -974,6 +1022,24 @@ int32_t cberg_browser_config_capture_network_events(CBERGAlefHandle handle);
 int32_t cberg_browser_config_session_affinity(CBERGAlefHandle handle);
 
 /**
+ * Get the `chrome_path` field from a `BrowserConfig`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_browser_config_chrome_path(CBERGAlefHandle handle);
+
+/**
+ * Get the `chrome_args` field from a `BrowserConfig`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_browser_config_chrome_args(CBERGAlefHandle handle);
+
+/**
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */
@@ -1240,6 +1306,54 @@ int32_t cberg_content_config_wrap(CBERGAlefHandle handle);
  * Pointer must be a valid handle returned by this library.
  */
 uintptr_t cberg_content_config_wrap_width(CBERGAlefHandle handle);
+
+/**
+ * Get the `strip_newlines` field from a `ContentConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t cberg_content_config_strip_newlines(CBERGAlefHandle handle);
+
+/**
+ * Get the `bullets` field from a `ContentConfig`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_content_config_bullets(CBERGAlefHandle handle);
+
+/**
+ * Get the `list_indent_width` field from a `ContentConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+uintptr_t cberg_content_config_list_indent_width(CBERGAlefHandle handle);
+
+/**
+ * Get the `strong_em_symbol` field from a `ContentConfig`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_content_config_strong_em_symbol(CBERGAlefHandle handle);
+
+/**
+ * Get the `compact_tables` field from a `ContentConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t cberg_content_config_compact_tables(CBERGAlefHandle handle);
+
+/**
+ * Get the `keep_inline_images_in` field from a `ContentConfig`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_content_config_keep_inline_images_in(CBERGAlefHandle handle);
 
 /**
  * Get the `include_document_structure` field from a `ContentConfig`.
@@ -1531,6 +1645,13 @@ char *cberg_crawl_config_exclude_paths(CBERGAlefHandle handle);
  * Pointer must be a valid handle returned by this library.
  */
 int32_t cberg_crawl_config_path_patterns_match_query(CBERGAlefHandle handle);
+
+/**
+ * Get the `path_patterns_match_url` field from a `CrawlConfig`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t cberg_crawl_config_path_patterns_match_url(CBERGAlefHandle handle);
 
 /**
  * Get the `dedup_include_query` field from a `CrawlConfig`.
@@ -2016,6 +2137,15 @@ void cberg_crawl_page_result_free(CBERGAlefHandle handle);
 char *cberg_crawl_page_result_url(CBERGAlefHandle handle);
 
 /**
+ * Get the `original_url` field from a `CrawlPageResult`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_crawl_page_result_original_url(CBERGAlefHandle handle);
+
+/**
  * Get the `normalized_url` field from a `CrawlPageResult`.
  * A non-null returned pointer is owned by the caller.
  * It must be freed with `cberg_free_string`.
@@ -2197,6 +2327,29 @@ char *cberg_crawl_page_result_final_url(CBERGAlefHandle handle);
  * Pointer must be a valid handle returned by this library.
  */
 uintptr_t cberg_crawl_page_result_redirect_count(CBERGAlefHandle handle);
+
+/**
+ * Get the `noindex_detected` field from a `CrawlPageResult`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t cberg_crawl_page_result_noindex_detected(CBERGAlefHandle handle);
+
+/**
+ * Get the `nofollow_detected` field from a `CrawlPageResult`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+int32_t cberg_crawl_page_result_nofollow_detected(CBERGAlefHandle handle);
+
+/**
+ * Get the `ssrf_refused_urls` field from a `CrawlPageResult`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_crawl_page_result_ssrf_refused_urls(CBERGAlefHandle handle);
 
 /**
  * Create a `CrawlResult` from a JSON string. Returns null on failure.
@@ -2944,6 +3097,15 @@ char *cberg_interaction_result_final_url(CBERGAlefHandle handle);
 char *cberg_interaction_result_screenshot_base64(CBERGAlefHandle handle);
 
 /**
+ * Get the `ssrf_refused_urls` field from a `InteractionResult`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_interaction_result_ssrf_refused_urls(CBERGAlefHandle handle);
+
+/**
  * Create a `JsonLdEntry` from a JSON string. Returns null on failure.
  * # Safety
  * JSON string must be valid UTF-8 and null-terminated.
@@ -3024,6 +3186,15 @@ void cberg_link_info_free(CBERGAlefHandle handle);
  * Pointer must be a valid handle returned by this library.
  */
 char *cberg_link_info_url(CBERGAlefHandle handle);
+
+/**
+ * Get the `original_url` field from a `LinkInfo`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_link_info_original_url(CBERGAlefHandle handle);
 
 /**
  * Get the `text` field from a `LinkInfo`.
@@ -3999,6 +4170,15 @@ CBERGAlefHandle cberg_scrape_result_downloaded_document(CBERGAlefHandle handle);
 CBERGAlefHandle cberg_scrape_result_browser(CBERGAlefHandle handle);
 
 /**
+ * Get the `ssrf_refused_urls` field from a `ScrapeResult`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_scrape_result_ssrf_refused_urls(CBERGAlefHandle handle);
+
+/**
  * Create a `SitemapUrl` from a JSON string. Returns null on failure.
  * # Safety
  * JSON string must be valid UTF-8 and null-terminated.
@@ -4097,6 +4277,15 @@ int32_t cberg_ssrf_policy_deny_private(CBERGAlefHandle handle);
 char *cberg_ssrf_policy_allowlist(CBERGAlefHandle handle);
 
 /**
+ * Get the `denylist` field from a `SsrfPolicy`.
+ * A non-null returned pointer is owned by the caller.
+ * It must be freed with `cberg_free_string`.
+ * # Safety
+ * Pointer must be a valid handle returned by this library.
+ */
+char *cberg_ssrf_policy_denylist(CBERGAlefHandle handle);
+
+/**
  * Get the `max_redirects` field from a `SsrfPolicy`.
  * # Safety
  * Pointer must be a valid handle returned by this library.
@@ -4133,15 +4322,14 @@ CBERGAlefHandle cberg_ssrf_policy_default(void);
  * - For testing and localhost access, the host's network sandbox is the
  * enforcing boundary.
  *
- * **Node.js caveat:** `deny_private` (whatever its value) has no effect on
+ * **Node.js caveat:** `deny_private` and `denylist` have no effect on
  * hostname-based requests under `wasm32`. There is no DNS resolution on this
  * target, so `validate_url` only ever checks a literal IP host; a domain name
  * falls straight through to `Ok(())`. In a browser this is covered by
  * same-origin/CORS. Node's `fetch` enforces no CORS, so a Node service
  * embedding this wasm module can be driven to internal hosts by domain name
- * even though `deny_private = true`. Do not rely on this policy to stop that in
- * Node â enforce egress restrictions (network policy, firewall, proxy
- * allowlist) outside the process.
+ * despite the policy. Enforce egress restrictions (network policy, firewall,
+ * proxy allowlist) outside the process.
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */
@@ -4667,12 +4855,75 @@ char *cberg_link_type_to_json(CBERGAlefHandle handle);
 char *cberg_link_type_to_string(CBERGAlefHandle handle);
 
 /**
+ * Allocate a cancel token.
+ *
+ * Pass the token to a `*_cancellable` export to make that blocking call
+ * abortable, then call `cberg_cancel_token_cancel` from any thread to abort it.
+ * The call returns with last-error code `Cancelled` and the underlying request
+ * is dropped. One token may be shared by several calls. A cancelled token stays
+ * cancelled.
+ *
+ * Returns `0` on failure (see `cberg_last_error_code`). The caller owns the
+ * handle and MUST release it with `cberg_cancel_token_free` once no call using
+ * it is still running.
+ *
+ * # Safety
+ * Caller must ensure all pointer arguments are valid or null.
+ * The returned handle is owned by the caller and must be freed with
+ * `cberg_cancel_token_free`.
+ */
+CBERGAlefHandle cberg_cancel_token_new(void);
+
+/**
+ * Trip a cancel token. Safe to call from any thread, repeatedly, and while a
+ * call using the token is blocked.
+ *
+ * Returns `0` on success and `-1` for an invalid, stale or wrong-typed handle
+ * (see `cberg_last_error_code`).
+ *
+ * # Safety
+ * Caller must ensure all pointer arguments are valid or null.
+ * This function does not allocate and returns no owned pointer.
+ */
+int32_t cberg_cancel_token_cancel(CBERGAlefHandle token);
+
+/**
+ * Free a cancel token created by `cberg_cancel_token_new`.
+ *
+ * Passing `0` is a no-op. The token must not be used afterwards, and no call
+ * using it may still be running.
+ *
+ * # Safety
+ * Caller must ensure all pointer arguments are valid or null.
+ * `token` must be `0` or a handle returned by `cberg_cancel_token_new` that has
+ * not been freed.
+ */
+void cberg_cancel_token_free(CBERGAlefHandle token);
+
+/**
  * Crawl multiple seed URLs concurrently, each following links to configured
  * depth.
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */
 CBERGAlefHandle cberg_batch_crawl(CBERGAlefHandle engine, const char *urls);
+
+/**
+ * Cancellable variant of `cberg_batch_crawl`.
+ *
+ * Takes a trailing `alef_cancel_token` created by `cberg_cancel_token_new`.
+ * Tripping it with `cberg_cancel_token_cancel` from any thread aborts the
+ * blocking call, which then fails with the `Cancelled` error code. Pass `0` for
+ * a call that is never cancelled.
+ *
+ * Crawl multiple seed URLs concurrently, each following links to configured
+ * depth.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ */
+CBERGAlefHandle
+cberg_batch_crawl_cancellable(CBERGAlefHandle engine, const char *urls,
+                              CBERGAlefHandle alef_cancel_token);
 
 /**
  * Scrape multiple URLs concurrently.
@@ -4682,12 +4933,44 @@ CBERGAlefHandle cberg_batch_crawl(CBERGAlefHandle engine, const char *urls);
 CBERGAlefHandle cberg_batch_scrape(CBERGAlefHandle engine, const char *urls);
 
 /**
+ * Cancellable variant of `cberg_batch_scrape`.
+ *
+ * Takes a trailing `alef_cancel_token` created by `cberg_cancel_token_new`.
+ * Tripping it with `cberg_cancel_token_cancel` from any thread aborts the
+ * blocking call, which then fails with the `Cancelled` error code. Pass `0` for
+ * a call that is never cancelled.
+ *
+ * Scrape multiple URLs concurrently.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ */
+CBERGAlefHandle
+cberg_batch_scrape_cancellable(CBERGAlefHandle engine, const char *urls,
+                               CBERGAlefHandle alef_cancel_token);
+
+/**
  * Crawl a website starting from `url`, following links up to the configured
  * depth.
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */
 CBERGAlefHandle cberg_crawl(CBERGAlefHandle engine, const char *url);
+
+/**
+ * Cancellable variant of `cberg_crawl`.
+ *
+ * Takes a trailing `alef_cancel_token` created by `cberg_cancel_token_new`.
+ * Tripping it with `cberg_cancel_token_cancel` from any thread aborts the
+ * blocking call, which then fails with the `Cancelled` error code. Pass `0` for
+ * a call that is never cancelled.
+ *
+ * Crawl a website starting from `url`, following links up to the configured
+ * depth.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ */
+CBERGAlefHandle cberg_crawl_cancellable(CBERGAlefHandle engine, const char *url,
+                                        CBERGAlefHandle alef_cancel_token);
 
 /**
  * Create a new crawl engine with the given configuration.
@@ -4719,6 +5002,22 @@ CBERGAlefHandle cberg_interact(CBERGAlefHandle engine, const char *url,
                                const char *actions);
 
 /**
+ * Cancellable variant of `cberg_interact`.
+ *
+ * Takes a trailing `alef_cancel_token` created by `cberg_cancel_token_new`.
+ * Tripping it with `cberg_cancel_token_cancel` from any thread aborts the
+ * blocking call, which then fails with the `Cancelled` error code. Pass `0` for
+ * a call that is never cancelled.
+ *
+ * Execute browser actions on a single page.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ */
+CBERGAlefHandle cberg_interact_cancellable(CBERGAlefHandle engine,
+                                           const char *url, const char *actions,
+                                           CBERGAlefHandle alef_cancel_token);
+
+/**
  * Discover all pages on a website by following links and sitemaps.
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
@@ -4726,10 +5025,42 @@ CBERGAlefHandle cberg_interact(CBERGAlefHandle engine, const char *url,
 CBERGAlefHandle cberg_map_urls(CBERGAlefHandle engine, const char *url);
 
 /**
+ * Cancellable variant of `cberg_map_urls`.
+ *
+ * Takes a trailing `alef_cancel_token` created by `cberg_cancel_token_new`.
+ * Tripping it with `cberg_cancel_token_cancel` from any thread aborts the
+ * blocking call, which then fails with the `Cancelled` error code. Pass `0` for
+ * a call that is never cancelled.
+ *
+ * Discover all pages on a website by following links and sitemaps.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ */
+CBERGAlefHandle cberg_map_urls_cancellable(CBERGAlefHandle engine,
+                                           const char *url,
+                                           CBERGAlefHandle alef_cancel_token);
+
+/**
  * Scrape a single URL, returning extracted page data.
  * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
  * Returned pointers must be freed with the appropriate free function.
  */
 CBERGAlefHandle cberg_scrape(CBERGAlefHandle engine, const char *url);
+
+/**
+ * Cancellable variant of `cberg_scrape`.
+ *
+ * Takes a trailing `alef_cancel_token` created by `cberg_cancel_token_new`.
+ * Tripping it with `cberg_cancel_token_cancel` from any thread aborts the
+ * blocking call, which then fails with the `Cancelled` error code. Pass `0` for
+ * a call that is never cancelled.
+ *
+ * Scrape a single URL, returning extracted page data.
+ * \note SAFETY: Caller must ensure all pointer arguments are valid or null.
+ * Returned pointers must be freed with the appropriate free function.
+ */
+CBERGAlefHandle cberg_scrape_cancellable(CBERGAlefHandle engine,
+                                         const char *url,
+                                         CBERGAlefHandle alef_cancel_token);
 
 #endif /* CBERG_H */

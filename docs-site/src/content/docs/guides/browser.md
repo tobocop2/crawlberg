@@ -96,7 +96,7 @@ let engine = CrawlEngineBuilder::new()
 
 Requires the `browser-native` Cargo feature.
 
-**Session affinity** keeps same-domain browser sessions alive across requests, preserving cookies and fingerprints. Enable via `BrowserConfig::session_affinity` (defaults to `true`). For custom session routing, use `BrowserSessionPool` (Rust-only):
+**Session affinity** keeps same-domain browser sessions alive across requests, preserving cookies and fingerprints. Enable via `BrowserConfig::session_affinity` (defaults to `true`). A shared `browser_session_pool` also retains cookies and solved challenges across successive crawls of the same engine. HTTP responses that replace or delete a cookie invalidate the matching cookie in retained browser pages before their next navigation. For custom session routing, use `BrowserSessionPool` (Rust-only):
 
 ```rust
 use crawlberg::BrowserSessionPool;
@@ -122,6 +122,57 @@ let config = CrawlConfig {
 ```
 
 This is the recommended pattern when running Chrome in a sidecar container or a remote debugging session. `endpoint` is rejected when `BrowserBackend::Native` is selected.
+
+## Choosing the Chrome binary and flags
+
+Set `chrome_path` to launch one specific Chrome or Chromium build, and `chrome_args` to add Chrome flags:
+
+```rust
+use crawlberg::{BrowserConfig, CrawlConfig};
+
+let config = CrawlConfig {
+    browser: BrowserConfig {
+        chrome_path: Some("/opt/chrome/chrome".into()),
+        chrome_args: vec!["--disable-gpu".into(), "--lang=fr".into()],
+        ..Default::default()
+    },
+    ..Default::default()
+};
+```
+
+When `chrome_path` is set, crawlberg launches only that binary. A missing or non-executable path is an error that names the path; crawlberg never falls back to another Chrome. When it is unset, crawlberg uses the `CHROME` environment variable, then searches for an installed Chrome, Chromium or Edge.
+
+Write each entry in `chrome_args` as `--flag` or `--flag=value`. Crawlberg rejects any other entry, so `["--user-agent", "x"]` fails instead of turning `x` into a flag. A flag that names one of crawlberg's default flags replaces that default: `--lang=fr` above replaces the default `--lang=en_US`. Crawlberg rejects a flag name with an uppercase letter, because Chrome lowercases flag names on Windows only, and it rejects a flag named twice. Crawlberg rejects `--headless`, `--remote-debugging-port` and `--user-data-dir` in `chrome_args`, because it sets them itself. Use `browser_profile` to choose the profile directory.
+
+The Rust `BrowserPoolConfig` applies the same rules to its own `chrome_args` when the pool launches Chrome. `BrowserPool::new` accepts any list; a refused entry makes `warm` and `acquire_page` return an error that names `BrowserPoolConfig.chrome_args`.
+
+Set `chrome_args` only from trusted configuration, as you would `proxy`. Flags such as `--proxy-server` and `--host-resolver-rules` send Chrome's traffic around the `ssrf` policy, and crawlberg does not refuse them.
+
+Both fields are ignored, with a warning, when `endpoint` is set or the native backend is in use, and crawlberg does not check them then. Scrapes and crawls that use a shared browser pool also ignore them with a warning, because the pool launches Chrome from its own config; `interact()` still launches Chrome from them, so crawlberg checks them.
+
+## Launching Chrome on a private pipe
+
+By default the Chrome that crawlberg launches gets a debugging port on 127.0.0.1, and crawlberg connects to it by WebSocket. Set `private_pipe` to `true` to launch Chrome on a private debugging pipe:
+
+```rust
+use crawlberg::{BrowserConfig, CrawlConfig};
+
+let config = CrawlConfig {
+    browser: BrowserConfig {
+        private_pipe: true,
+        ..Default::default()
+    },
+    ..Default::default()
+};
+```
+
+With the key on, the launched Chrome listens on no TCP port, so no other local process can drive it. It also ends when the last process that holds the pipe ends. The process that started Chrome holds the pipe, so Chrome ends when that process exits or is killed, including with SIGKILL. A process that the owner forked without `exec` holds a copy of the pipe: Chrome then runs until that process ends too.
+
+The key is in the Rust API and in a `CrawlConfig` that crawlberg reads as JSON. The language packages do not have it yet.
+
+The key works on Linux and macOS. On Windows it changes nothing. It is ignored, with a warning, when `endpoint` is set or the native backend is in use. A browser pool that the engine creates takes the key. The Rust `BrowserPoolConfig` has its own `private_pipe`: a browser pool that the caller supplies uses that setting for scrapes and crawls, and the key of the `CrawlConfig` is then ignored for them. A warning says so when the key is `true` and the launch options of the pool are different. `interact` launches its own Chrome and takes the key.
+
+The pipe is less reliable than the debugging port on a loaded machine. Under a load of 18 to 45 with 22 browser tests in parallel, the firewall test file passed in 2 of 10 runs on the pipe against 8 of 10 on the debugging port. The failed scrapes report `failed to open page after relaunch: browser: failed to create page: oneshot canceled`. Keep the default if the machine runs many browsers at once.
 
 ## Browser profiles
 

@@ -3,8 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::engine::CrawlEngine;
+use crate::engine::{CrawlEngine, Politeness};
+use crate::types::CrawlConfig;
 
+use super::error::ApiError;
 use super::jobs::JobRegistry;
 
 /// Default time-to-live for jobs (1 hour).
@@ -54,7 +56,7 @@ const DEFAULT_MAX_CONCURRENT_JOBS: usize = 50;
 /// Resolved from environment variables at startup via [`ApiSecurityConfig::from_env`].
 /// Tests construct this directly instead of mutating process environment, which keeps
 /// them independent and safe to run in parallel.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ApiSecurityConfig {
     /// Bearer token required in `Authorization: Bearer <token>`. `None` disables auth.
     pub auth_token: Option<Arc<str>>,
@@ -64,6 +66,27 @@ pub struct ApiSecurityConfig {
     pub max_batch_urls: usize,
     /// Hard ceiling on concurrently active (pending/in-progress) jobs.
     pub max_concurrent_jobs: usize,
+}
+
+impl std::fmt::Debug for ApiSecurityConfig {
+    /// Redacted: shows whether a bearer token is set, never the token itself.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            auth_token,
+            max_pages_ceiling,
+            max_batch_urls,
+            max_concurrent_jobs,
+        } = self;
+        f.debug_struct("ApiSecurityConfig")
+            .field(
+                "auth_token",
+                &auth_token.as_ref().map(|_| crate::net::redact::REDACTED_PLACEHOLDER),
+            )
+            .field("max_pages_ceiling", max_pages_ceiling)
+            .field("max_batch_urls", max_batch_urls)
+            .field("max_concurrent_jobs", max_concurrent_jobs)
+            .finish()
+    }
 }
 
 impl ApiSecurityConfig {
@@ -105,8 +128,12 @@ fn env_usize(var: &str, default: usize) -> usize {
 /// Shared state for all API handlers.
 #[derive(Clone)]
 pub struct ApiState {
-    /// The crawl engine used to execute scrape, crawl, and map operations.
-    pub engine: Arc<CrawlEngine>,
+    /// The crawl settings of the server. Private, so that a handler can only reach an engine
+    /// through [`ApiState::request_engine`].
+    config: CrawlConfig,
+    /// The rate limiter and the robots.txt cache of the server engine. Every request engine
+    /// shares them, so the per-host throttle holds across requests. They hold no cookie.
+    politeness: Politeness,
     /// Registry of asynchronous crawl and batch scrape jobs.
     pub jobs: Arc<JobRegistry>,
     /// Authentication and resource-limit configuration for this server instance.
@@ -114,8 +141,8 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    /// Create a new `ApiState` wrapping the given engine with explicit security
-    /// configuration.
+    /// Create a new `ApiState` from the configuration of the given engine, with explicit
+    /// security configuration.
     ///
     /// This also spawns a background task that periodically evicts expired jobs
     /// from the registry (default TTL: 1 hour). Callers resolve
@@ -125,13 +152,53 @@ impl ApiState {
     pub fn with_security(engine: Arc<CrawlEngine>, security: ApiSecurityConfig) -> Self {
         let jobs = Arc::new(JobRegistry::new());
         jobs.spawn_eviction_task(DEFAULT_JOB_MAX_AGE);
-        Self { engine, jobs, security }
+        Self {
+            config: engine.config.clone(),
+            politeness: engine.politeness(),
+            jobs,
+            security,
+        }
+    }
+
+    /// Build the engine for one request: the configuration of the server with the changes that
+    /// `configure` makes for this request.
+    ///
+    /// ~keep This is the only way a handler gets an engine. The state holds no engine, so every
+    /// ~keep request has its own cookie store and no route can send the cookies that another
+    /// ~keep request received (crawlberg#652). The engine shares the rate limiter and the robots
+    /// ~keep cache of the server, which hold no cookie.
+    pub(super) fn request_engine(
+        &self,
+        configure: impl FnOnce(&mut CrawlConfig) -> Result<(), ApiError>,
+    ) -> Result<CrawlEngine, ApiError> {
+        let mut config = self.config.clone();
+        configure(&mut config)?;
+        CrawlEngine::builder()
+            .config(config)
+            .politeness(self.politeness.clone())
+            .build()
+            .map_err(|e| ApiError::bad_request(format!("invalid config override: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_hides_the_auth_token() {
+        let config = ApiSecurityConfig {
+            auth_token: Some(Arc::from("sk-live-9f8e7d6c5b4a")),
+            ..ApiSecurityConfig::default()
+        };
+        for rendered in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!rendered.contains("sk-live-9f8e7d6c5b4a"), "token printed: {rendered}");
+        }
+        assert!(
+            format!("{config:?}").contains(r#"auth_token: Some("***")"#),
+            "unexpected: {config:?}"
+        );
+    }
 
     #[test]
     fn env_usize_falls_back_to_default_when_unset_or_invalid() {

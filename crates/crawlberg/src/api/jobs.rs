@@ -141,6 +141,11 @@ impl JobRegistry {
             .count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
     /// Spawn a background task that periodically evicts expired jobs.
     ///
     /// The task runs every 60 seconds and removes jobs older than `max_age`.

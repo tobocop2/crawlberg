@@ -1,0 +1,879 @@
+//! A Chrome render goes through the configured proxy and never direct, and Chrome refuses a
+//! proxy with credentials before it starts.
+//!
+//! The targets are `.test` hosts no resolver answers, so a direct connection cannot return a
+//! page: the only way a render gets one is through a proxy this test runs, and the marker in
+//! the page names which proxy. Requires a real Chrome binary and is gated behind
+//! the `browser` feature; skipped (not failed) when Chrome is unavailable, like the other
+//! browser tests.
+
+#![cfg(feature = "browser")]
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crawlberg::{
+    BrowserBackend, BrowserConfig, BrowserMode, BrowserPool, BrowserPoolConfig, BrowserSessionPool, CrawlConfig,
+    CrawlError, HostMatcher, PageAction, ProxyConfig, ScrapeResult, create_engine, interact, scrape,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+mod common;
+use common::{announce_chrome_skip, is_missing_chrome_message};
+
+const TARGET: &str = "http://render-target.test/";
+const MARKER: &str = "served-by-the-test-proxy";
+/// Each crawl on the shared pool renders its own host through its own proxy.
+const TARGET_A: &str = "http://crawl-a.test/";
+const TARGET_B: &str = "http://crawl-b.test/";
+
+/// What the proxy saw: each request line, in order.
+type Seen = Arc<Mutex<Vec<String>>>;
+
+/// An HTTP proxy that answers every request itself with [`MARKER`].
+async fn spawn_proxy() -> (String, Seen) {
+    spawn_named_proxy(MARKER).await
+}
+
+/// [`spawn_proxy`], answering with `marker` so a page shows which proxy served it.
+async fn spawn_named_proxy(marker: &'static str) -> (String, Seen) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the proxy");
+    let address = listener.local_addr().expect("proxy address").to_string();
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let record = Arc::clone(&record);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let request_line = head.lines().next().unwrap_or_default().to_owned();
+                record.lock().expect("record").push(request_line);
+                let body = format!("<html><body><p>{marker}</p></body></html>");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (address, seen)
+}
+
+fn render_config(browser_proxy: ProxyConfig) -> CrawlConfig {
+    let mut config = CrawlConfig {
+        browser: BrowserConfig {
+            backend: BrowserBackend::Chromiumoxide,
+            mode: BrowserMode::Always,
+            timeout: Duration::from_secs(20),
+            proxy: Some(browser_proxy),
+            ..BrowserConfig::default()
+        },
+        respect_robots_txt: false,
+        ..CrawlConfig::default()
+    };
+    for host in ["render-target.test", "crawl-a.test", "crawl-b.test"] {
+        config.ssrf.allowlist.push(HostMatcher::exact(host));
+    }
+    config
+}
+
+fn proxy_at(url: String, username: Option<&str>, password: Option<&str>) -> ProxyConfig {
+    ProxyConfig {
+        url,
+        username: username.map(Into::into),
+        password: password.map(Into::into),
+    }
+}
+
+/// Render [`TARGET`], or `None` when no usable Chrome exists on this host.
+async fn render(test_name: &str, config: CrawlConfig, seen: &Seen) -> Option<ScrapeResult> {
+    render_url(test_name, config, TARGET, seen).await
+}
+
+/// Render `url`, or `None` when no usable Chrome exists on this host.
+async fn render_url(test_name: &str, config: CrawlConfig, url: &str, seen: &Seen) -> Option<ScrapeResult> {
+    let engine = create_engine(Some(config)).expect("engine must build");
+    match tokio::time::timeout(Duration::from_secs(60), scrape(&engine, url))
+        .await
+        .expect("the render must finish within 60s")
+    {
+        Ok(result) => Some(result),
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip(test_name, &message);
+            None
+        }
+        Err(error) => panic!(
+            "{test_name}: the render must succeed through the proxy: {error:?}; the proxy saw {:?}",
+            seen.lock().expect("record")
+        ),
+    }
+}
+
+fn target_requests(seen: &Seen) -> Vec<String> {
+    requests_for(seen, TARGET)
+}
+
+fn requests_for(seen: &Seen, target: &str) -> Vec<String> {
+    seen.lock()
+        .expect("record")
+        .iter()
+        .filter(|line| line.starts_with(&format!("GET {target} ")))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_chrome_render_goes_through_the_browser_proxy() {
+    let (address, seen) = spawn_proxy().await;
+    let Some(result) = render(
+        "a_chrome_render_goes_through_the_browser_proxy",
+        render_config(proxy_at(address, None, None)),
+        &seen,
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(
+        result.html.contains(MARKER),
+        "the page must come from the proxy, got {}",
+        result.html
+    );
+    assert!(
+        !target_requests(&seen).is_empty(),
+        "the proxy must see the render's request, saw {:?}",
+        seen.lock().expect("record")
+    );
+}
+
+#[tokio::test]
+async fn two_crawls_on_one_pool_each_go_through_their_own_proxy() {
+    let (address_a, seen_a) = spawn_named_proxy("served-by-proxy-a").await;
+    let (address_b, seen_b) = spawn_named_proxy("served-by-proxy-b").await;
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let pooled = |address: String| {
+        let mut config = render_config(proxy_at(address, None, None));
+        config.browser.session_affinity = false;
+        config.browser_pool = Some(Arc::clone(&pool));
+        config
+    };
+    let name = "two_crawls_on_one_pool_each_go_through_their_own_proxy";
+    let (a, b) = tokio::join!(
+        render_url(name, pooled(address_a), TARGET_A, &seen_a),
+        render_url(name, pooled(address_b), TARGET_B, &seen_b),
+    );
+    pool.shutdown().await;
+    let (Some(a), Some(b)) = (a, b) else {
+        return;
+    };
+    assert!(
+        a.html.contains("served-by-proxy-a"),
+        "crawl A must go through proxy A, got {}",
+        a.html
+    );
+    assert!(
+        b.html.contains("served-by-proxy-b"),
+        "crawl B must go through proxy B, got {}",
+        b.html
+    );
+    assert!(!requests_for(&seen_a, TARGET_A).is_empty(), "proxy A must see crawl A");
+    assert!(!requests_for(&seen_b, TARGET_B).is_empty(), "proxy B must see crawl B");
+    assert!(
+        requests_for(&seen_a, TARGET_B).is_empty(),
+        "proxy A must not see crawl B"
+    );
+    assert!(
+        requests_for(&seen_b, TARGET_A).is_empty(),
+        "proxy B must not see crawl A"
+    );
+}
+
+#[tokio::test]
+async fn an_interact_session_goes_through_the_proxy() {
+    let (address, seen) = spawn_proxy().await;
+    let engine = create_engine(Some(render_config(proxy_at(address, None, None)))).expect("engine must build");
+    let result = match tokio::time::timeout(
+        Duration::from_secs(60),
+        interact(&engine, TARGET, vec![PageAction::Scrape]),
+    )
+    .await
+    .expect("the interact session must finish within 60s")
+    {
+        Ok(result) => result,
+        Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+            announce_chrome_skip("an_interact_session_goes_through_the_proxy", &message);
+            return;
+        }
+        Err(error) => panic!(
+            "the interact session must succeed through the proxy: {error:?}; the proxy saw {:?}",
+            seen.lock().expect("record")
+        ),
+    };
+    assert!(result.final_html.contains(MARKER), "got {}", result.final_html);
+    assert!(
+        !target_requests(&seen).is_empty(),
+        "the proxy must see the session's request"
+    );
+}
+
+#[tokio::test]
+async fn a_chrome_proxy_with_credentials_is_refused_before_chrome_starts() {
+    let (address, seen) = spawn_proxy().await;
+    for (label, crawl_proxy, browser_proxy) in [
+        (
+            "credentials in the browser proxy address",
+            None,
+            Some(proxy_at(format!("operator:s3cr3t@{address}"), None, None)),
+        ),
+        (
+            "credential fields on the browser proxy",
+            None,
+            Some(proxy_at(address.clone(), Some("operator"), Some("s3cr3t"))),
+        ),
+        (
+            "credentials on the crawl-wide proxy Chrome falls back to",
+            Some(proxy_at(format!("http://operator:s3cr3t@{address}"), None, None)),
+            None,
+        ),
+    ] {
+        let mut config = render_config(proxy_at(address.clone(), None, None));
+        config.proxy = crawl_proxy;
+        config.browser.proxy = browser_proxy;
+        let error = match create_engine(Some(config)) {
+            Err(error) => error,
+            Ok(engine) => match interact(&engine, TARGET, vec![PageAction::Scrape]).await {
+                Err(error) => error,
+                Ok(_) => panic!("{label}: Chrome cannot use a proxy with credentials"),
+            },
+        };
+        let shown = error.to_string();
+        assert!(shown.contains("username or password"), "{label}: got {shown}");
+        assert!(
+            !shown.contains("s3cr3t"),
+            "{label}: the password must not be shown, got {shown}"
+        );
+    }
+    assert!(
+        seen.lock().expect("record").is_empty(),
+        "a refused proxy must see no request"
+    );
+}
+
+#[tokio::test]
+async fn a_parked_page_is_not_reused_for_a_crawl_with_another_proxy() {
+    let (address_a, seen_a) = spawn_named_proxy("served-by-proxy-a").await;
+    let (address_b, seen_b) = spawn_named_proxy("served-by-proxy-b").await;
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let sessions = Arc::new(BrowserSessionPool::new());
+    let affine = |address: String| {
+        let mut config = render_config(proxy_at(address, None, None));
+        config.proxy = config.browser.proxy.take();
+        config.browser.session_affinity = true;
+        config.browser_pool = Some(Arc::clone(&pool));
+        config.browser_session_pool = Some(Arc::clone(&sessions));
+        config
+    };
+    let name = "a_parked_page_is_not_reused_for_a_crawl_with_another_proxy";
+    let Some(first) = render_url(name, affine(address_a), TARGET, &seen_a).await else {
+        return;
+    };
+    assert!(first.html.contains("served-by-proxy-a"), "got {}", first.html);
+    let Some(second) = render_url(name, affine(address_b), TARGET, &seen_b).await else {
+        return;
+    };
+    assert_eq!(
+        sessions.size().await,
+        2,
+        "each proxy must keep its own policy-scoped parked page"
+    );
+    sessions.shutdown().await;
+    pool.shutdown().await;
+    assert!(
+        second.html.contains("served-by-proxy-b"),
+        "the second crawl must go through its own proxy, got {}",
+        second.html
+    );
+    assert_eq!(
+        target_requests(&seen_a).len(),
+        1,
+        "proxy A must see the first crawl only"
+    );
+}
+
+#[tokio::test]
+async fn a_render_and_an_interact_session_on_a_connected_chrome_go_through_the_proxy() {
+    let name = "a_render_and_an_interact_session_on_a_connected_chrome_go_through_the_proxy";
+    let profile = tempfile::tempdir().expect("a temp profile directory");
+    let launched = chromiumoxide::BrowserConfig::builder()
+        .no_sandbox()
+        .new_headless_mode()
+        .user_data_dir(profile.path())
+        .build()
+        .map_err(|e| e.to_string());
+    let launched = match launched {
+        Ok(config) => chromiumoxide::Browser::launch(config).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    let Some((mut chrome, handler)) = common::expect_chrome_or_skip(name, launched) else {
+        return;
+    };
+    let handler = common::spawn_handler(handler);
+    let (address, seen) = spawn_proxy().await;
+    let mut config = render_config(proxy_at(address, None, None));
+    config.ssrf.deny_private = false;
+    config.browser.endpoint = Some(chrome.websocket_address().clone());
+    let engine = create_engine(Some(config)).expect("engine must build");
+
+    let rendered = scrape(&engine, TARGET).await;
+    let interacted = interact(&engine, TARGET, vec![PageAction::Scrape]).await;
+    let _ = chrome.close().await;
+    handler.abort();
+
+    let rendered = rendered.unwrap_or_else(|e| panic!("the render must go through the proxy: {e:?}"));
+    assert!(rendered.html.contains(MARKER), "render: got {}", rendered.html);
+    let interacted = interacted.unwrap_or_else(|e| panic!("the interact session must go through the proxy: {e:?}"));
+    assert!(
+        interacted.final_html.contains(MARKER),
+        "interact: got {}",
+        interacted.final_html
+    );
+    assert!(target_requests(&seen).len() >= 2, "the proxy must see both sessions");
+}
+
+/// A loopback address no server listens on: a direct request gets a refused connection, so the
+/// page can only come from the proxy.
+///
+/// ~keep A port bound and released, not a low fixed one: Chrome refuses ports such as 1 as
+/// ~keep unsafe before it consults any proxy.
+async fn loopback_target() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+    let port = listener.local_addr().expect("loopback address").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/loopback")
+}
+
+/// Chrome sends loopback requests direct unless told not to, for a launch flag and for a
+/// browser context alike.
+#[tokio::test]
+async fn a_loopback_page_goes_through_the_proxy_on_a_launch_and_in_a_pool() {
+    let name = "a_loopback_page_goes_through_the_proxy_on_a_launch_and_in_a_pool";
+    let (address, seen) = spawn_proxy().await;
+    let target = loopback_target().await;
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    for (label, pooled) in [("one-shot launch", false), ("shared pool", true)] {
+        let mut config = render_config(proxy_at(address.clone(), None, None));
+        config
+            .ssrf
+            .allowlist
+            .push(HostMatcher::cidr("127.0.0.1/32").expect("a valid CIDR"));
+        config.browser.session_affinity = false;
+        if pooled {
+            config.browser_pool = Some(Arc::clone(&pool));
+        }
+        let before = requests_for(&seen, &target).len();
+        let Some(result) = render_url(&format!("{name} ({label})"), config, &target, &seen).await else {
+            pool.shutdown().await;
+            return;
+        };
+        assert!(result.html.contains(MARKER), "{label}: got {}", result.html);
+        assert!(
+            requests_for(&seen, &target).len() > before,
+            "{label}: the proxy must see the loopback request"
+        );
+    }
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_chrome_render_with_only_the_crawl_wide_proxy_goes_through_it() {
+    let (address, seen) = spawn_proxy().await;
+    let mut config = render_config(proxy_at(address, None, None));
+    config.proxy = config.browser.proxy.take();
+    config.browser.session_affinity = false;
+    let Some(result) = render(
+        "a_chrome_render_with_only_the_crawl_wide_proxy_goes_through_it",
+        config,
+        &seen,
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(result.browser_used, "the page must come from a Chrome render");
+    assert!(
+        result.html.contains(MARKER),
+        "the one-shot Chrome launch must go through the crawl-wide proxy, got {}",
+        result.html
+    );
+    assert!(
+        !target_requests(&seen).is_empty(),
+        "the proxy must see the render's request, saw {:?}",
+        seen.lock().expect("record")
+    );
+}
+
+/// A loopback server the SSRF policy denies, with a count of the connections it accepted.
+async fn denied_listener() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the denied server");
+    let port = listener.local_addr().expect("denied server address").port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    (format!("http://127.0.0.1:{port}/secret"), accepted)
+}
+
+/// An HTTP proxy that answers every request itself, with [`MARKER`] and an image at `image`.
+async fn spawn_proxy_with_image(image: String) -> (String, Seen) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the proxy");
+    let address = listener.local_addr().expect("proxy address").to_string();
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let record = Arc::clone(&record);
+            let image = image.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0_u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let request_line = head.lines().next().unwrap_or_default().to_owned();
+                record.lock().expect("record").push(request_line);
+                let body = format!("<html><body><p>{MARKER}</p><img src={image:?}></body></html>");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (address, seen)
+}
+
+/// Assert that a page rendered in a proxy's browser context kept its content and had its
+/// request to the denied address refused: listed on the result, and seen by neither the proxy
+/// nor the denied server.
+fn assert_refused_in_the_proxy_context(
+    label: &str,
+    html: &str,
+    refused: &[String],
+    denied: &str,
+    seen: &Seen,
+    accepted: &std::sync::atomic::AtomicUsize,
+) {
+    assert!(
+        html.contains(MARKER),
+        "{label}: the page must come from the proxy, got {html}"
+    );
+    assert!(
+        !target_requests(seen).is_empty(),
+        "{label}: the proxy must see the render's request, saw {:?}",
+        seen.lock().expect("record")
+    );
+    assert_eq!(
+        refused.iter().filter(|url| url.as_str() == denied).count(),
+        1,
+        "{label}: the SSRF check must list the denied image exactly once, got {refused:?}"
+    );
+    assert!(
+        requests_for(seen, denied).is_empty(),
+        "{label}: the refused request must not reach the proxy, saw {:?}",
+        seen.lock().expect("record")
+    );
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "{label}: the denied server must see no connection"
+    );
+}
+
+/// A pooled page opens in a browser context made with the crawl's proxy, and the SSRF check
+/// still refuses its requests to a denied address.
+#[tokio::test]
+async fn the_ssrf_check_refuses_a_request_from_a_page_in_a_pooled_proxy_context() {
+    let name = "the_ssrf_check_refuses_a_request_from_a_page_in_a_pooled_proxy_context";
+    let (denied, accepted) = denied_listener().await;
+    let (address, seen) = spawn_proxy_with_image(denied.clone()).await;
+    let pool = BrowserPool::new(BrowserPoolConfig::default());
+    let mut config = render_config(proxy_at(address, None, None));
+    config.browser.session_affinity = false;
+    config.browser.extra_wait = Some(Duration::from_millis(500));
+    config.browser_pool = Some(Arc::clone(&pool));
+    let result = render(name, config, &seen).await;
+    pool.shutdown().await;
+    let Some(result) = result else {
+        return;
+    };
+    assert_refused_in_the_proxy_context(name, &result.html, &result.ssrf_refused_urls, &denied, &seen, &accepted);
+}
+
+/// ~keep A browser reached through `browser.endpoint` is rejected before its proxy or a denied
+/// ~keep address receives a request when the SSRF policy requires IP-level enforcement.
+#[tokio::test]
+async fn the_ssrf_check_rejects_a_connected_proxy_context_that_cannot_enforce_ip_denials() {
+    let (denied, accepted) = denied_listener().await;
+    let (address, seen) = spawn_proxy_with_image(denied.clone()).await;
+    let mut config = render_config(proxy_at(address, None, None));
+    config.browser.extra_wait = Some(Duration::from_millis(500));
+    config.browser.endpoint = Some("ws://127.0.0.1:9/devtools/browser/unreachable".to_owned());
+    let engine = create_engine(Some(config)).expect("engine must build");
+
+    let error = tokio::time::timeout(Duration::from_secs(60), scrape(&engine, TARGET))
+        .await
+        .expect("the render must finish within 60s")
+        .expect_err("an external browser cannot enforce IP-level denials");
+
+    assert_eq!(
+        error.to_string(),
+        "browser: browser.endpoint cannot be used when the SSRF policy enforces IP denials"
+    );
+    assert_eq!(
+        seen.lock().expect("record").len(),
+        0,
+        "the configured proxy must receive no request"
+    );
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the denied server must receive no connection"
+    );
+}
+
+/// Launch a Chrome for `browser.endpoint` with `flags`, or `None` when no usable Chrome exists.
+async fn launch_endpoint_chrome(
+    name: &str,
+    profile: &std::path::Path,
+    flags: &[String],
+) -> Option<(chromiumoxide::Browser, tokio::task::JoinHandle<()>)> {
+    let mut builder = chromiumoxide::BrowserConfig::builder()
+        .no_sandbox()
+        .new_headless_mode()
+        .user_data_dir(profile);
+    for flag in flags {
+        builder = builder.arg(flag.trim_start_matches("--"));
+    }
+    let launched = match builder.build() {
+        Ok(config) => chromiumoxide::Browser::launch(config).await.map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    common::expect_chrome_or_skip(name, launched).map(|(chrome, handler)| (chrome, common::spawn_handler(handler)))
+}
+
+/// A Chrome proxy switch in `chrome_args` (`--proxy-server`, `--proxy-bypass-list`,
+/// `--no-proxy-server`, `--proxy-pac-url` or `--proxy-auto-detect`) never replaces the configured
+/// proxy: every entry point sends a remote page and a loopback page through it.
+#[tokio::test]
+async fn a_caller_proxy_flag_never_replaces_the_configured_proxy() {
+    let name = "a_caller_proxy_flag_never_replaces_the_configured_proxy";
+    let (configured, seen) = spawn_named_proxy("served-by-the-configured-proxy").await;
+    let (caller, _) = spawn_named_proxy("served-by-the-caller-proxy").await;
+    let (direct, _) = spawn_named_proxy("served-direct").await;
+    let loopback = format!("http://{direct}/loopback");
+    for flag in [
+        format!("--proxy-server=http://{caller}"),
+        "--proxy-bypass-list=*.internal".to_owned(),
+        "--no-proxy-server".to_owned(),
+        format!("--proxy-pac-url=data:,function FindProxyForURL(u,h){{return \"PROXY {caller}\";}}"),
+        "--proxy-auto-detect".to_owned(),
+    ] {
+        for target in [TARGET, loopback.as_str()] {
+            for entry in [
+                "one-shot launch",
+                "interact launch",
+                "pool",
+                "endpoint render",
+                "endpoint interact",
+            ] {
+                let label = format!("{entry}, {flag}, {target}");
+                let mut config = render_config(proxy_at(configured.clone(), None, None));
+                config.browser.chrome_args = vec![flag.clone()];
+                config.browser.session_affinity = false;
+                config
+                    .ssrf
+                    .allowlist
+                    .push(HostMatcher::cidr("127.0.0.1/32").expect("a valid CIDR"));
+                let pool = (entry == "pool").then(|| {
+                    BrowserPool::new(BrowserPoolConfig {
+                        chrome_args: vec![flag.clone()],
+                        ..BrowserPoolConfig::default()
+                    })
+                });
+                config.browser_pool = pool.clone();
+                let profile = tempfile::tempdir().expect("a temp profile directory");
+                let mut endpoint = None;
+                if entry.starts_with("endpoint") {
+                    let Some((chrome, handler)) =
+                        launch_endpoint_chrome(name, profile.path(), std::slice::from_ref(&flag)).await
+                    else {
+                        return;
+                    };
+                    config.browser.endpoint = Some(chrome.websocket_address().clone());
+                    config.ssrf.deny_private = false;
+                    endpoint = Some((chrome, handler));
+                }
+                let engine = create_engine(Some(config)).expect("engine must build");
+                let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+                    if entry.contains("interact") {
+                        interact(&engine, target, vec![PageAction::Scrape])
+                            .await
+                            .map(|result| result.final_html)
+                    } else {
+                        scrape(&engine, target).await.map(|result| result.html)
+                    }
+                })
+                .await
+                .expect("the session must finish within 60s");
+                if let Some(pool) = pool {
+                    pool.shutdown().await;
+                }
+                if let Some((mut chrome, handler)) = endpoint {
+                    let _ = chrome.close().await;
+                    handler.abort();
+                }
+                let html = match outcome {
+                    Ok(html) => html,
+                    Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+                        announce_chrome_skip(name, &message);
+                        return;
+                    }
+                    Err(error) => panic!("{label}: the session must succeed through the proxy: {error:?}"),
+                };
+                assert!(
+                    html.contains("served-by-the-configured-proxy"),
+                    "{label}: the configured proxy must serve the page, got {html}; it saw {:?}",
+                    seen.lock().expect("record")
+                );
+            }
+        }
+    }
+}
+
+/// A launched Chrome, for a one-shot render and for an interact session, sends its pages
+/// through the proxy, and the SSRF check still refuses their requests to a denied address.
+#[tokio::test]
+async fn the_ssrf_check_refuses_a_request_from_a_launched_page_behind_the_proxy() {
+    let name = "the_ssrf_check_refuses_a_request_from_a_launched_page_behind_the_proxy";
+    for entry in ["one-shot launch", "interact launch"] {
+        let label = format!("{name} ({entry})");
+        let (denied, accepted) = denied_listener().await;
+        let (address, seen) = spawn_proxy_with_image(denied.clone()).await;
+        let mut config = render_config(proxy_at(address, None, None));
+        config.browser.session_affinity = false;
+        config.browser.extra_wait = Some(Duration::from_millis(500));
+        let (html, refused) = if entry == "one-shot launch" {
+            let Some(result) = render(&label, config, &seen).await else {
+                return;
+            };
+            (result.html, result.ssrf_refused_urls)
+        } else {
+            let engine = create_engine(Some(config)).expect("engine must build");
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                interact(&engine, TARGET, vec![PageAction::Scrape]),
+            )
+            .await
+            .expect("the interact session must finish within 60s")
+            {
+                Ok(result) => (result.final_html, result.ssrf_refused_urls),
+                Err(CrawlError::BrowserError { message, .. }) if is_missing_chrome_message(&message) => {
+                    announce_chrome_skip(&label, &message);
+                    return;
+                }
+                Err(error) => panic!("{label}: the interact session must succeed through the proxy: {error:?}"),
+            }
+        };
+        assert_refused_in_the_proxy_context(&label, &html, &refused, &denied, &seen, &accepted);
+    }
+}
+
+async fn open_and_close_foreign_tabs(
+    chrome: Arc<chromiumoxide::Browser>,
+    count: usize,
+) -> Vec<chromiumoxide::cdp::browser_protocol::target::TargetId> {
+    use chromiumoxide::cdp::browser_protocol::target::{CloseTargetParams, CreateTargetParams};
+    let mut closed = Vec::with_capacity(count);
+    for _ in 0..count {
+        let target = chrome
+            .execute(CreateTargetParams::new("about:blank"))
+            .await
+            .expect("foreign create");
+        chrome
+            .execute(CloseTargetParams::new(target.result.target_id.clone()))
+            .await
+            .expect("foreign close");
+        closed.push(target.result.target_id);
+    }
+    closed
+}
+
+#[tokio::test]
+async fn an_external_owners_tab_teardown_does_not_abort_a_proxy_interaction() {
+    const FOREIGN_TABS: usize = 200;
+    const INTERACTIONS: usize = 5;
+    let profile = tempfile::tempdir().expect("profile");
+    let Some((chrome, owner_handler)) = launch_endpoint_chrome(
+        "an_external_owners_tab_teardown_does_not_abort_a_proxy_interaction",
+        profile.path(),
+        &[],
+    )
+    .await
+    else {
+        return;
+    };
+    let chrome = Arc::new(chrome);
+    let churn = tokio::spawn(open_and_close_foreign_tabs(Arc::clone(&chrome), FOREIGN_TABS));
+    let (configured, seen) = spawn_named_proxy("served-by-the-configured-proxy").await;
+    let mut config = render_config(proxy_at(configured, None, None));
+    config.ssrf.deny_private = false;
+    config.browser.endpoint = Some(chrome.websocket_address().clone());
+    let engine = create_engine(Some(config)).expect("engine");
+    let mut outcomes = Vec::new();
+    for _ in 0..INTERACTIONS {
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            interact(&engine, TARGET, vec![PageAction::Scrape]),
+        )
+        .await;
+        let failed = !matches!(&result, Ok(Ok(_)));
+        outcomes.push(result);
+        if failed {
+            break;
+        }
+    }
+    let closed = churn.await.expect("churn task");
+    let removed = foreign_targets_are_absent(&chrome, &closed).await;
+    assert!(removed, "every acknowledged foreign close must remove its target");
+    assert_eq!(
+        outcomes.len(),
+        INTERACTIONS,
+        "every owned interaction must finish: {outcomes:?}"
+    );
+    for result in outcomes {
+        let html = result
+            .expect("interaction timeout")
+            .expect("external owner's unrelated tab teardown must not abort the owned page");
+        assert!(html.final_html.contains("served-by-the-configured-proxy"));
+    }
+    assert_eq!(
+        closed.len(),
+        FOREIGN_TABS,
+        "every foreign tab must be created and closed"
+    );
+    assert!(!target_requests(&seen).is_empty());
+    // ~keep The endpoint pool must release its connection before the fixture owner asks Chrome to exit.
+    crawlberg::shutdown_engine(engine).await;
+    chrome
+        .execute(chromiumoxide::cdp::browser_protocol::browser::GetVersionParams::default())
+        .await
+        .expect("engine shutdown must keep the external owner's Chrome running");
+    let mut chrome = Arc::try_unwrap(chrome).expect("only owner remains");
+    chrome.close().await.expect("the fixture owner must close Chrome");
+    // ~keep Chrome may acknowledge close before its platform cleanup ends. Only this fixture owns its child.
+    match tokio::time::timeout(Duration::from_secs(5), chrome.wait()).await {
+        Ok(waited) => {
+            waited.expect("wait for fixture Chrome");
+        }
+        Err(_) => {
+            tokio::time::timeout(Duration::from_secs(5), chrome.kill())
+                .await
+                .expect("the fixture kill must reap its child within the kill bound")
+                .expect("the fixture must retain its own launched child")
+                .expect("the fixture owner must reap Chrome after the close grace");
+        }
+    }
+    owner_handler.abort();
+}
+
+async fn foreign_targets_are_absent(
+    chrome: &chromiumoxide::Browser,
+    closed: &[chromiumoxide::cdp::browser_protocol::target::TargetId],
+) -> bool {
+    use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
+    // ~keep CloseTarget acknowledges the request before Chrome has necessarily destroyed the target.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let census = chrome
+                .execute(GetTargetsParams::default())
+                .await
+                .expect("target census");
+            if closed
+                .iter()
+                .all(|target| census.result.target_infos.iter().all(|info| &info.target_id != target))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn a_foreign_close_barrier_waits_for_the_target_to_disappear() {
+    use chromiumoxide::cdp::browser_protocol::target::{CloseTargetParams, CreateTargetParams};
+    let profile = tempfile::tempdir().expect("profile");
+    let Some((chrome, handler)) = launch_endpoint_chrome(
+        "a_foreign_close_barrier_waits_for_the_target_to_disappear",
+        profile.path(),
+        &[],
+    )
+    .await
+    else {
+        return;
+    };
+    let chrome = Arc::new(chrome);
+    let target = chrome
+        .execute(CreateTargetParams::new("about:blank"))
+        .await
+        .expect("create")
+        .result
+        .target_id;
+    let closer = Arc::clone(&chrome);
+    let target_to_close = target.clone();
+    let close = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        closer
+            .execute(CloseTargetParams::new(target_to_close))
+            .await
+            .expect("close");
+    });
+    let absent = foreign_targets_are_absent(&chrome, &[target]).await;
+    close.await.expect("closer");
+    let mut chrome = Arc::try_unwrap(chrome).expect("owner");
+    chrome.close().await.expect("close Chrome");
+    chrome.wait().await.expect("wait Chrome");
+    handler.abort();
+    assert!(
+        absent,
+        "the barrier must await actual destruction rather than one census"
+    );
+}

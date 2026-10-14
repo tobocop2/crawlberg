@@ -128,7 +128,14 @@ impl Page {
             let Some(src) = &script.src else {
                 continue;
             };
-            let full_url = self.resolve_subresource_url(src);
+            let Some(full_url) = self.resolve_subresource_url(src) else {
+                tracing::debug!(
+                    "skipping unparseable <script src>: page={} src_len={}",
+                    self.url_string(),
+                    src.len(),
+                );
+                continue;
+            };
 
             if !subresource_allowed(self.url.as_ref(), &full_url) {
                 // ~keep Block off-origin script schemes so an HTTP page cannot read local files as JS source.
@@ -153,15 +160,15 @@ impl Page {
         &self,
         scripts: &[ScriptInfo],
     ) -> std::collections::HashMap<usize, (String, String, Response)> {
-        let client = self.http_client.clone();
+        let page = self;
         let fetch_futures: Vec<_> = self
             .allowed_script_urls(scripts)
             .into_iter()
-            .map(|(index, url)| {
-                let client = client.clone();
+            .map(move |(index, url)| {
+                let page = page;
                 async move {
                     let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                    match client.fetch(&parsed).await {
+                    match page.do_fetch_subresource(&parsed).await {
                         Ok(response) => Some((index, url, response)),
                         Err(error) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, error);
@@ -215,10 +222,20 @@ impl Page {
     async fn run_module_scripts(&mut self, module_scripts: &[ScriptInfo]) {
         for module_script in module_scripts {
             if let Some(src) = &module_script.src {
-                let full_url = self.resolve_subresource_url(src);
+                let Some(full_url) = self.resolve_subresource_url(src) else {
+                    tracing::debug!(
+                        "skipping unparseable <script type=module src>: page={} src_len={}",
+                        self.url_string(),
+                        src.len(),
+                    );
+                    continue;
+                };
                 self.load_remote_module(&full_url).await;
             } else if !module_script.inline.is_empty() {
-                let base = self.url_string();
+                let base = self
+                    .document_base_url
+                    .as_ref()
+                    .map_or_else(|| self.url_string(), |url| url.as_str().to_owned());
                 if let Some(js) = &mut self.js
                     && let Err(error) = js.load_inline_module(&module_script.inline, &base).await
                 {

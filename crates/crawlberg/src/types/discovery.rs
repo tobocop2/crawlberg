@@ -14,7 +14,7 @@ pub enum LinkType {
     Internal,
     /// A link to a different domain.
     External,
-    /// A fragment-only link (e.g., `#section`).
+    /// A link into the page it is on: its address without the fragment is the page address (e.g., `#section`).
     Anchor,
     /// A link to a downloadable document (PDF, DOC, etc.).
     Document,
@@ -35,6 +35,12 @@ impl std::fmt::Display for LinkType {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
+// ~keep The constructor of v1.10.3: the generated bindings keep it, and every field after it is
+// ~keep optional there. Add a new field at the END of the struct and leave this list alone.
+#[cfg_attr(
+    alef,
+    alef(legacy_constructor_fields = ["url", "text", "link_type", "rel", "nofollow"])
+)]
 pub struct LinkInfo {
     /// The resolved URL of the link.
     pub url: String,
@@ -46,6 +52,11 @@ pub struct LinkInfo {
     pub rel: Option<String>,
     /// Whether the link has `rel="nofollow"`.
     pub nofollow: bool,
+    /// Link address resolved against the page's base without changing path spelling.
+    /// Percent escapes, Unicode, spaces, backslashes and dot segments are preserved.
+    /// URL credentials are removed. <!-- ~keep -->
+    #[serde(default)]
+    pub original_url: String,
 }
 
 /// The source of an image reference.
@@ -135,18 +146,83 @@ pub struct JsonLdEntry {
 }
 
 /// Information about an HTTP cookie received from a response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct CookieInfo {
     /// The cookie name.
     pub name: String,
     /// The cookie value.
+    #[cfg_attr(alef, alef(sensitive))]
     pub value: String,
     /// The cookie domain, if specified.
     pub domain: Option<String>,
     /// The cookie path, if specified.
     pub path: Option<String>,
+}
+
+/// A cookie carried between Chromiumoxide pages in one redirect chain.
+///
+/// This stays separate from [`CookieInfo`]: CDP's expiry, SameSite, partition and host-scope
+/// metadata are browser-jar state, while `CookieInfo` is the public response shape shared by
+/// every fetch backend. ~keep
+#[derive(Clone)]
+pub(crate) struct BrowserCookie {
+    #[cfg(feature = "browser")]
+    pub(crate) params: chromiumoxide::cdp::browser_protocol::network::CookieParam,
+}
+
+impl std::fmt::Debug for BrowserCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "browser")]
+        {
+            let mut debug = f.debug_struct("BrowserCookie");
+            debug
+                .field("name", &self.params.name)
+                .field(
+                    "value",
+                    &(!self.params.value.is_empty()).then_some(crate::net::redact::REDACTED_PLACEHOLDER),
+                )
+                .field("domain", &self.params.domain)
+                .field("path", &self.params.path)
+                .field("secure", &self.params.secure)
+                .field("http_only", &self.params.http_only)
+                .field("same_site", &self.params.same_site)
+                .field("partition_key", &self.params.partition_key);
+            debug.finish()
+        }
+        #[cfg(not(feature = "browser"))]
+        {
+            f.debug_struct("BrowserCookie").finish()
+        }
+    }
+}
+
+impl std::fmt::Debug for CookieInfo {
+    /// Redacted: a cookie value is often a session credential, and the engine sends
+    /// these cookies back on later browser fetches. Shows whether a value is set, never
+    /// the value itself.
+    // ~keep alef extracts public inherent AND trait-impl methods; `Formatter` has no
+    // binding representation, so without this the surface fails generation with
+    // lossy_sanitized_surface.
+    #[cfg_attr(alef, alef(skip))]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            value,
+            domain,
+            path,
+        } = self;
+        f.debug_struct("CookieInfo")
+            .field("name", name)
+            .field(
+                "value",
+                &(!value.is_empty()).then_some(crate::net::redact::REDACTED_PLACEHOLDER),
+            )
+            .field("domain", domain)
+            .field("path", path)
+            .finish()
+    }
 }
 
 /// A downloaded asset from a page.
